@@ -32,8 +32,9 @@ func Load(_ *config.Config) (*Registry, error) {
 		if name == "" || val == "" {
 			continue
 		}
-		if _, err := url.ParseRequestURI(val); err != nil {
-			return nil, fmt.Errorf("invalid URL for plugin %s: %w", name, err)
+		u, err := url.Parse(val)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("plugin %s: URL must be an absolute http or https URL, got %q", name, val)
 		}
 		plugins[name] = val
 	}

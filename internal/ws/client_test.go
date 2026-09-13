@@ -2,14 +2,15 @@ package ws_test
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"time"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/coder/websocket"
@@ -36,7 +37,7 @@ func newTestConfig(serverURL, keyFile string) *config.Config {
 // genPrivKey generates a fresh ML-DSA-65 key pair for tests.
 func genPrivKey(t *testing.T) *mldsa65.PrivateKey {
 	t.Helper()
-	_, priv, err := mldsa65.GenerateKey(nil)
+	_, priv, err := mldsa65.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}

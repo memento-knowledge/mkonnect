@@ -14,6 +14,10 @@ spec:
       labels:
         {{- include "mkonnect.selectorLabels" . | nindent 8 }}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
       serviceAccountName: {{ include "mkonnect.serviceAccountName" . }}
       containers:
         - name: mkonnect

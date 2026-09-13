@@ -44,7 +44,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 	return &Client{
 		cfg:       cfg,
 		keyStore:  keyStore,
-		workerSem: make(chan struct{}, 32), // max 32 concurrent plugin requests
+		workerSem: make(chan struct{}, 4), // 4 workers × 32 MiB max body ≈ 128 MiB, matching the default container memory limit
 	}
 }
 
@@ -88,18 +88,16 @@ func (c *Client) Run(ctx context.Context) {
 // It returns when the connection closes or ctx is cancelled.
 func (c *Client) Connect(ctx context.Context) error {
 	wsURL := strings.TrimRight(c.cfg.GatewayURL, "/")
-	// Convert ws:// → http:// so coder/websocket can dial it correctly.
-	httpURL := strings.ReplaceAll(wsURL, "ws://", "http://")
-	httpURL = strings.ReplaceAll(httpURL, "wss://", "https://")
-	httpURL += "/ws"
 
-	conn, _, err := websocket.Dial(ctx, httpURL, &websocket.DialOptions{
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{},
 	})
 	if err != nil {
 		return fmt.Errorf("ws dial: %w", err)
 	}
 	defer conn.CloseNow() //nolint:errcheck
+	// Allow messages up to 64 MiB (32 MiB body + ~33% base64/JSON overhead).
+	conn.SetReadLimit(64 << 20)
 
 	priv, found, err := c.keyStore.Load()
 	if err != nil {
@@ -117,6 +115,27 @@ func (c *Client) Connect(ctx context.Context) error {
 			return fmt.Errorf("reconnect: %w", err)
 		}
 	}
+
+	// Keepalive: detect silent TCP drops (NAT timeouts, LB node failures).
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				pingErr := conn.Ping(pingCtx)
+				cancel()
+				if pingErr != nil {
+					slog.Warn("keepalive ping failed, closing connection", "err", pingErr)
+					conn.CloseNow() //nolint:errcheck
+					return
+				}
+			}
+		}
+	}()
 
 	return c.runLoop(ctx, conn)
 }
@@ -235,7 +254,7 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 		var raw json.RawMessage
 		if err := wsjson.Read(ctx, conn, &raw); err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return nil // clean shutdown; backoff resets in Run
 			}
 			return fmt.Errorf("read: %w", err)
 		}
@@ -256,13 +275,14 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 			select {
 			case c.workerSem <- struct{}{}:
 			default:
-				// backpressure: drop request and send 429
-				go func(m proto.DataMsg) {
-					_ = c.writeMsg(ctx, conn, proto.ResponseMsg{
-						Type: "response", RequestID: m.RequestID,
-						StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
-					})
-				}(msg)
+				// Backpressure: write 429 synchronously. Spawning a goroutine here
+				// would create unbounded goroutines under load, defeating the semaphore.
+				if err := c.writeMsg(ctx, conn, proto.ResponseMsg{
+					Type: "response", RequestID: msg.RequestID,
+					StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
+				}); err != nil {
+					slog.Warn("failed to send 429", "request_id", msg.RequestID, "err", err)
+				}
 				continue
 			}
 			go func(m proto.DataMsg) {

@@ -1,9 +1,5 @@
-# Target registry: 758890152938.dkr.ecr.us-east-1.amazonaws.com/memento-connector
-# Build: docker build -t 758890152938.dkr.ecr.us-east-1.amazonaws.com/memento-connector:latest .
-# Do NOT push automatically; authenticate with ECR first.
-
 # Stage 1: build
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /src
 

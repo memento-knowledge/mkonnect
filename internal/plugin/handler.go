@@ -7,27 +7,22 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
-// hopByHopHeaders are headers that must not be forwarded to the upstream service.
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailers",
-	"Transfer-Encoding",
-	"Upgrade",
-}
-
 // Handler returns a closure that proxies DataMsg requests to the registered plugin services.
 func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (int, []byte, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		// Do not follow redirects; let the caller decide.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
 	return func(ctx context.Context, msg proto.DataMsg) (int, []byte, error) {
 		baseURL, ok := registry.Get(msg.Plugin)
@@ -36,29 +31,54 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 			return 404, body, nil
 		}
 
-		target := strings.TrimRight(baseURL, "/") + msg.Path
-
-		req, err := http.NewRequestWithContext(ctx, msg.Method, target, bytes.NewReader(msg.Body))
-		if err != nil {
-			return 0, nil, fmt.Errorf("build request: %w", err)
+		// Validate and normalise the HTTP method.
+		method := strings.ToUpper(strings.TrimSpace(msg.Method))
+		if method == "" {
+			method = http.MethodGet
+		}
+		switch method {
+		case "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT":
+			// allowed
+		default:
+			body, _ := json.Marshal(map[string]string{"error": "method not allowed"})
+			return 405, body, nil
 		}
 
-		// Strip hop-by-hop headers and add Via for proxy identification.
-		for _, h := range hopByHopHeaders {
-			req.Header.Del(h)
+		// Validate the path and resolve it against the configured base URL.
+		// Requiring a leading "/" prevents host-rewriting via "@" or "//".
+		if !strings.HasPrefix(msg.Path, "/") {
+			body, _ := json.Marshal(map[string]string{"error": "path must begin with /"})
+			return 400, body, nil
+		}
+		base, _ := url.Parse(baseURL) // validated at registry load time
+		target := base.ResolveReference(&url.URL{Path: msg.Path})
+		if target.Host != base.Host {
+			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
+			return 400, body, nil
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(msg.Body))
+		if err != nil {
+			return 0, nil, fmt.Errorf("build request: %w", err)
 		}
 		req.Header.Set("Via", "1.1 mkonnect")
 
 		resp, err := client.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return 0, nil, ctx.Err()
+			}
 			return 504, []byte(`{"error":"upstream timeout or connection error"}`), err
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
 		const maxBodyBytes = 32 << 20 // 32 MiB
-		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 		if err != nil {
 			return 0, nil, fmt.Errorf("read response: %w", err)
+		}
+		if len(respBody) > maxBodyBytes {
+			return 413, []byte(`{"error":"upstream response too large"}`), nil
 		}
 
 		return resp.StatusCode, respBody, nil

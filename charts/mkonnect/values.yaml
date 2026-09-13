@@ -1,9 +1,9 @@
 replicaCount: 1
 
 image:
-  repository: 758890152938.dkr.ecr.us-east-1.amazonaws.com/memento-connector
+  repository: public.ecr.aws/memento-knowledge/memento-connector
   pullPolicy: IfNotPresent
-  tag: ""  # defaults to Chart.appVersion
+  tag: "latest"
 
 config:
   gatewayUrl: ""           # required: wss://<customer-slug>.bridge.memento-platform.com/ws
