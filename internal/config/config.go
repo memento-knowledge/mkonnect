@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -45,6 +46,9 @@ func Load() (*Config, error) {
 
 	if cfg.GatewayURL == "" {
 		return nil, fmt.Errorf("GATEWAY_URL is required")
+	}
+	if !strings.HasPrefix(cfg.GatewayURL, "ws://") && !strings.HasPrefix(cfg.GatewayURL, "wss://") {
+		return nil, fmt.Errorf("GATEWAY_URL must start with ws:// or wss://")
 	}
 	if cfg.ConnectorID == "" {
 		return nil, fmt.Errorf("CONNECTOR_ID is required")
