@@ -10,11 +10,11 @@ Lightweight on-prem connector for the Memento Knowledge (mk) platform. It runs i
 Memento platform ── wss:// ──▶ Bridge Gateway ── WebSocket ──▶ mkonnect ── HTTP ──▶ Jenkins / Prometheus / ...
 ```
 
-1. **Connect.** mkonnect dials the Bridge Gateway over `wss://` and authenticates.
-   - **First run:** it sends a one-time `REGISTRATION_TOKEN`. The gateway responds with a freshly generated ML-DSA-65 private key, which mkonnect persists to disk (`KEY_FILE`, `0600` permissions).
-   - **Every reconnect after that:** mkonnect identifies itself by `CONNECTOR_ID`, the gateway sends a random challenge nonce, and mkonnect proves possession of its private key by signing it (ML-DSA-65, a post-quantum signature scheme). No long-lived secret crosses the wire again.
+1. **Connect.** mkonnect dials the Bridge Gateway over `wss://`. The gateway sends a random challenge nonce first, on every connection attempt.
+   - **First run:** mkonnect sends a one-time `REGISTRATION_TOKEN` (the challenge is unused on this path). The gateway responds with a freshly generated ML-DSA-65 private key, which mkonnect persists to disk (`KEY_FILE`, `0600` permissions).
+   - **Every reconnect after that:** mkonnect proves possession of its private key by signing the challenge (ML-DSA-65, a post-quantum signature scheme). No long-lived secret crosses the wire again.
 2. **Serve requests.** The platform sends `data` messages down the tunnel addressed to a named plugin (e.g. `jenkins`) with an HTTP method, path, and body. mkonnect resolves the plugin name against the `PLUGIN_*` registry, reverse-proxies the request to the corresponding internal service, and streams the response back over the same connection.
-3. **Stay alive.** A background ping every 30s detects silent TCP drops (NAT timeouts, load balancer failures). If the connection drops, mkonnect reconnects with exponential backoff (1s → 60s cap).
+3. **Stay alive.** A heartbeat every 30s — a WebSocket ping (detects silent TCP drops from NAT timeouts or load balancer failures) and an application-level health message (what the gateway actually uses to track connector liveness) — keeps the connection monitored from both sides. If the connection drops, mkonnect reconnects with exponential backoff (1s → 60s cap).
 
 Up to 4 requests are handled concurrently per connector; requests beyond that receive a `429` rather than queuing unbounded.
 
