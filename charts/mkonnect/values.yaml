@@ -1,7 +1,8 @@
 replicaCount: 1
 
 image:
-  repository: public.ecr.aws/memento-knowledge/memento-connector
+  # required: set to your published registry, e.g. public.ecr.aws/<alias>/memento-connector
+  repository: ""
   pullPolicy: IfNotPresent
   tag: "latest"
 

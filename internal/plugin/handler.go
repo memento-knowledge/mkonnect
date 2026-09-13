@@ -57,6 +57,11 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 			return 400, body, nil
 		}
 
+		const maxBodyBytes = 32 << 20 // 32 MiB — enforced on both request and response
+		if len(msg.Body) > maxBodyBytes {
+			return 413, []byte(`{"error":"request body too large"}`), nil
+		}
+
 		req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(msg.Body))
 		if err != nil {
 			return 0, nil, fmt.Errorf("build request: %w", err)
@@ -72,7 +77,6 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
-		const maxBodyBytes = 32 << 20 // 32 MiB
 		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 		if err != nil {
 			return 0, nil, fmt.Errorf("read response: %w", err)

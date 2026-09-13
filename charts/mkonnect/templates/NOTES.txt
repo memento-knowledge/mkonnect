@@ -1,6 +1,7 @@
 mkonnect is now deployed.
 
 Required configuration:
+  - image.repository: your published registry (e.g. public.ecr.aws/<alias>/memento-connector)
   - config.gatewayUrl: wss://<your-gateway>/ws
   - config.connectorId: UUID of this connector
 

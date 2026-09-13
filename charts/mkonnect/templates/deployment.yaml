@@ -21,7 +21,7 @@ spec:
       serviceAccountName: {{ include "mkonnect.serviceAccountName" . }}
       containers:
         - name: mkonnect
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: "{{ required "image.repository is required — set it to your published registry (e.g. public.ecr.aws/<alias>/memento-connector)" .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           envFrom:
             - secretRef:
