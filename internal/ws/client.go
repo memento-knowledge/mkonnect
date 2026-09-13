@@ -269,7 +269,9 @@ func (c *Client) readHandshakeResult(ctx context.Context, conn *websocket.Conn, 
 		return nil
 	case "handshake_error":
 		var msg proto.HandshakeErrorMsg
-		_ = json.Unmarshal(raw, &msg)
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return fmt.Errorf("parse handshake_error: %w", err)
+		}
 		return fmt.Errorf("gateway rejected handshake (%d): %s", msg.Code, msg.Reason)
 	default:
 		return fmt.Errorf("unexpected message type during handshake: %q", typed.Type)
