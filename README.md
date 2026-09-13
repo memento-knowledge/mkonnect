@@ -50,13 +50,23 @@ The container image is a distroless, non-root, statically linked binary — see 
 
 ### Kubernetes (Helm)
 
+`REGISTRATION_TOKEN` is only needed for the first-run handshake (see [How it works](#how-it-works)), but it's still a secret — pass it via a values file instead of `--set`/`--set-string`, which would otherwise leak it into your shell history and process list:
+
 ```bash
+cat > mkonnect-secrets.yaml <<EOF
+config:
+  registrationToken: "<token>"
+EOF
+
 helm install mkonnect charts/mkonnect \
+  -f mkonnect-secrets.yaml \
   --set image.repository=public.ecr.aws/<alias>/memento-connector \
   --set config.gatewayUrl=wss://<customer-slug>.bridge.memento-platform.com/ws \
   --set config.connectorId=<uuid> \
   --set plugins.jenkins=http://jenkins:8080
 ```
+
+`registrationToken` is written into a Kubernetes `Secret` (`charts/mkonnect/templates/secret.yaml`) alongside `gatewayUrl` and `connectorId`. Keep `mkonnect-secrets.yaml` out of version control and delete it once the connector has completed its first registration — subsequent reconnects use the persisted ML-DSA-65 key instead.
 
 The chart provisions a `PersistentVolumeClaim` so the ML-DSA-65 key survives pod restarts. See [charts/mkonnect/values.yaml](charts/mkonnect/values.yaml) for all options.
 
