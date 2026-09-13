@@ -1,0 +1,11 @@
+mkonnect is now deployed.
+
+Required configuration:
+  - image.repository: your published registry (e.g. public.ecr.aws/<alias>/memento-connector)
+  - config.gatewayUrl: wss://<your-gateway>/ws
+  - config.connectorId: UUID of this connector
+
+Register this connector via the Memento portal to receive a REGISTRATION_TOKEN,
+then upgrade: helm upgrade ... --set config.registrationToken=<token>
+
+After first connection, the connector stores its ML-DSA-65 key in the PVC at {{ .Values.config.keyFile }}.

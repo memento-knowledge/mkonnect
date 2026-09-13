@@ -1,0 +1,34 @@
+replicaCount: 1
+
+image:
+  # required: set to your published registry, e.g. public.ecr.aws/<alias>/memento-connector
+  repository: ""
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+config:
+  gatewayUrl: ""           # required: wss://<customer-slug>.bridge.memento-platform.com/ws
+  connectorId: ""          # required: UUID of this connector
+  protocolVersion: "v1"
+  keyFile: "/data/key"     # path inside container for ML-DSA-65 private key
+
+# PLUGIN_* env vars for on-prem services
+# Example: jenkins: "http://jenkins:8080"
+plugins: {}
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: ""
