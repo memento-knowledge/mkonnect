@@ -7,7 +7,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /mkonnect ./cmd/mkonnect
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/memento-knowledge/mkonnect/internal/version.Version=${VERSION}" -o /mkonnect ./cmd/mkonnect
 
 # Stage 2: runtime (distroless, non-root)
 FROM gcr.io/distroless/static:nonroot

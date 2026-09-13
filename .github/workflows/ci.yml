@@ -54,7 +54,7 @@ jobs:
           IMAGE_TAG_LATEST: latest
           IMAGE_TAG_SHA: sha-${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST .
+          docker build --build-arg VERSION=$IMAGE_TAG_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST .
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA

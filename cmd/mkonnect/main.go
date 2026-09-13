@@ -13,6 +13,7 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/plugin"
+	"github.com/memento-knowledge/mkonnect/internal/version"
 	"github.com/memento-knowledge/mkonnect/internal/ws"
 )
 
@@ -28,8 +29,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Printf("mkonnect starting — connector=%s gateway=%s protocol=%s",
-		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion)
+	log.Printf("mkonnect starting — connector=%s gateway=%s protocol=%s version=%s",
+		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion, version.Version)
 
 	reg, err := plugin.Load(cfg)
 	if err != nil {
