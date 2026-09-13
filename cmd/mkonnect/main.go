@@ -17,6 +17,11 @@ import (
 )
 
 func main() {
+	// Handle Kubernetes health probe
+	if len(os.Args) > 1 && os.Args[1] == "--health" {
+		os.Exit(0)
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mkonnect: configuration error: %v\n", err)
