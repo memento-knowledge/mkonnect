@@ -41,14 +41,35 @@ func (ks *KeyStore) Load() (*mldsa65.PrivateKey, bool, error) {
 
 // Save writes the private key to disk with 0600 permissions.
 // It creates parent directories as needed.
-func (ks *KeyStore) Save(priv *mldsa65.PrivateKey) error {
-	if err := os.MkdirAll(filepath.Dir(ks.path), 0700); err != nil {
-		return fmt.Errorf("creating key directory: %w", err)
+func (k *KeyStore) Save(priv *mldsa65.PrivateKey) error {
+	if err := os.MkdirAll(filepath.Dir(k.path), 0700); err != nil {
+		return fmt.Errorf("create key dir: %w", err)
 	}
-	var buf [mldsa65.PrivateKeySize]byte
-	priv.Pack(&buf)
-	if err := os.WriteFile(ks.path, buf[:], 0600); err != nil {
-		return fmt.Errorf("writing key file: %w", err)
+	data := make([]byte, mldsa65.PrivateKeySize)
+	priv.Pack((*[mldsa65.PrivateKeySize]byte)(data))
+
+	// Write to temp file then rename for atomicity
+	dir := filepath.Dir(k.path)
+	tmp, err := os.CreateTemp(dir, ".key-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp key file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		tmp.Close()
+		os.Remove(tmpName) // no-op if rename succeeded
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return fmt.Errorf("set key file permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write key data: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp key file: %w", err)
+	}
+	if err := os.Rename(tmpName, k.path); err != nil {
+		return fmt.Errorf("install key file: %w", err)
 	}
 	return nil
 }

@@ -120,6 +120,14 @@ func TestKeyStoreRoundTrip(t *testing.T) {
 		t.Fatalf("expected 0600 perms, got %o", perm)
 	}
 
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0700 {
+		t.Errorf("dir perms: got %o, want 0700", dirInfo.Mode().Perm())
+	}
+
 	loaded, exists, err := ks.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
