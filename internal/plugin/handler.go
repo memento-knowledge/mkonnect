@@ -26,10 +26,10 @@ var hopByHopHeaders = []string{
 }
 
 // Handler returns a closure that proxies DataMsg requests to the registered plugin services.
-func Handler(registry *Registry) func(msg proto.DataMsg) (int, []byte, error) {
+func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (int, []byte, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	return func(msg proto.DataMsg) (int, []byte, error) {
+	return func(ctx context.Context, msg proto.DataMsg) (int, []byte, error) {
 		baseURL, ok := registry.Get(msg.Plugin)
 		if !ok {
 			body, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("plugin %q not found", msg.Plugin)})
@@ -38,16 +38,16 @@ func Handler(registry *Registry) func(msg proto.DataMsg) (int, []byte, error) {
 
 		target := strings.TrimRight(baseURL, "/") + msg.Path
 
-		req, err := http.NewRequestWithContext(context.Background(), msg.Method, target, bytes.NewReader(msg.Body))
+		req, err := http.NewRequestWithContext(ctx, msg.Method, target, bytes.NewReader(msg.Body))
 		if err != nil {
 			return 0, nil, fmt.Errorf("build request: %w", err)
 		}
 
-		// Strip hop-by-hop headers and add X-Forwarded-For.
+		// Strip hop-by-hop headers and add Via for proxy identification.
 		for _, h := range hopByHopHeaders {
 			req.Header.Del(h)
 		}
-		req.Header.Set("X-Forwarded-For", "mkonnect/0.1.0")
+		req.Header.Set("Via", "1.1 mkonnect")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -55,7 +55,8 @@ func Handler(registry *Registry) func(msg proto.DataMsg) (int, []byte, error) {
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
-		respBody, err := io.ReadAll(resp.Body)
+		const maxBodyBytes = 32 << 20 // 32 MiB
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 		if err != nil {
 			return 0, nil, fmt.Errorf("read response: %w", err)
 		}

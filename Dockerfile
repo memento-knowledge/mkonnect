@@ -19,7 +19,7 @@ FROM gcr.io/distroless/static:nonroot
 LABEL org.opencontainers.image.title="mkonnect" \
       org.opencontainers.image.description="Memento on-prem connector — bridges customer-internal tools to the Memento platform" \
       org.opencontainers.image.source="https://github.com/memento-knowledge/mkonnect" \
-      org.opencontainers.image.licenses="Proprietary"
+      org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /mkonnect /mkonnect
 

@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +31,7 @@ func TestHandlerRoutesToPlugin(t *testing.T) {
 		Path:   "/health",
 	}
 
-	status, body, err := h(msg)
+	status, body, err := h(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -52,7 +53,7 @@ func TestHandlerUnknownPlugin(t *testing.T) {
 		Path:   "/",
 	}
 
-	status, body, err := h(msg)
+	status, body, err := h(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,7 +81,7 @@ func TestHandlerTimeout(t *testing.T) {
 		Path:   "/",
 	}
 
-	status, _, err := h(msg)
+	status, _, err := h(context.Background(), msg)
 	if err == nil {
 		t.Errorf("expected error on timeout, got nil")
 	}

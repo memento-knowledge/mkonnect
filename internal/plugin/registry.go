@@ -2,6 +2,8 @@
 package plugin
 
 import (
+	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -26,10 +28,14 @@ func Load(_ *config.Config) (*Registry, error) {
 			continue
 		}
 		name := strings.ToLower(strings.TrimPrefix(parts[0], "PLUGIN_"))
-		if name == "" || parts[1] == "" {
+		val := parts[1]
+		if name == "" || val == "" {
 			continue
 		}
-		plugins[name] = parts[1]
+		if _, err := url.ParseRequestURI(val); err != nil {
+			return nil, fmt.Errorf("invalid URL for plugin %s: %w", name, err)
+		}
+		plugins[name] = val
 	}
 	return &Registry{plugins: plugins}, nil
 }

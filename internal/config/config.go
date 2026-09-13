@@ -50,6 +50,9 @@ func Load() (*Config, error) {
 	if !strings.HasPrefix(cfg.GatewayURL, "ws://") && !strings.HasPrefix(cfg.GatewayURL, "wss://") {
 		return nil, fmt.Errorf("GATEWAY_URL must start with ws:// or wss://")
 	}
+	if strings.HasPrefix(cfg.GatewayURL, "ws://") {
+		fmt.Fprintln(os.Stderr, "WARNING: GATEWAY_URL uses ws:// (plaintext). Use wss:// in production — private keys are transmitted over this connection.")
+	}
 	if cfg.ConnectorID == "" {
 		return nil, fmt.Errorf("CONNECTOR_ID is required")
 	}

@@ -20,7 +20,7 @@ import (
 )
 
 // PluginHandler processes an inbound DataMsg and returns a status code and body.
-type PluginHandler func(proto.DataMsg) (statusCode int, body []byte, err error)
+type PluginHandler func(context.Context, proto.DataMsg) (statusCode int, body []byte, err error)
 
 // Client connects mkonnect to the Bridge Gateway over WebSocket.
 type Client struct {
@@ -28,6 +28,7 @@ type Client struct {
 	keyStore      *auth.KeyStore
 	pluginHandler PluginHandler
 	writeMu       sync.Mutex
+	workerSem     chan struct{}
 }
 
 // writeMsg serialises v as JSON and writes it to conn under a mutex,
@@ -41,8 +42,9 @@ func (c *Client) writeMsg(ctx context.Context, conn *websocket.Conn, v any) erro
 // NewClient creates a new Client.
 func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 	return &Client{
-		cfg:      cfg,
-		keyStore: keyStore,
+		cfg:       cfg,
+		keyStore:  keyStore,
+		workerSem: make(chan struct{}, 32), // max 32 concurrent plugin requests
 	}
 }
 
@@ -208,9 +210,21 @@ func (c *Client) reconnect(ctx context.Context, conn *websocket.Conn, privKey *m
 		return fmt.Errorf("send signed hello: %w", err)
 	}
 
-	// Step 4: await ack (read and discard handshake_ok).
+	// Step 4: await ack and validate.
 	if err := wsjson.Read(ctx, conn, &raw); err != nil {
 		return fmt.Errorf("read reconnect ack: %w", err)
+	}
+	var ack proto.TypedMessage
+	if err := json.Unmarshal(raw, &ack); err != nil {
+		return fmt.Errorf("unmarshal reconnect ack: %w", err)
+	}
+	if ack.Type == "error" {
+		var errMsg proto.ErrorMsg
+		_ = json.Unmarshal(raw, &errMsg)
+		return fmt.Errorf("gateway rejected reconnect: %s: %s", errMsg.Code, errMsg.Message)
+	}
+	if ack.Type != "handshake_ok" {
+		return fmt.Errorf("unexpected message type on reconnect ack: %s", ack.Type)
 	}
 	return nil
 }
@@ -239,7 +253,22 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				slog.Warn("malformed data message", "err", err)
 				continue
 			}
-			go c.handleData(ctx, conn, msg)
+			select {
+			case c.workerSem <- struct{}{}:
+			default:
+				// backpressure: drop request and send 429
+				go func(m proto.DataMsg) {
+					_ = c.writeMsg(ctx, conn, proto.ResponseMsg{
+						Type: "response", RequestID: m.RequestID,
+						StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
+					})
+				}(msg)
+				continue
+			}
+			go func(m proto.DataMsg) {
+				defer func() { <-c.workerSem }()
+				c.handleData(ctx, conn, m)
+			}(msg)
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
@@ -252,7 +281,7 @@ func (c *Client) handleData(ctx context.Context, conn *websocket.Conn, msg proto
 
 	if c.pluginHandler != nil {
 		var err error
-		statusCode, body, err = c.pluginHandler(msg)
+		statusCode, body, err = c.pluginHandler(ctx, msg)
 		if err != nil {
 			slog.Warn("plugin handler error", "request_id", msg.RequestID, "err", err)
 			if statusCode == 0 {
