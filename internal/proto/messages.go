@@ -26,7 +26,7 @@ type HelloMsg struct {
 // PrivateKey contains the ML-DSA-65 private key bytes to persist locally.
 type HandshakeOkMsg struct {
 	Type       string `json:"type"`
-	PrivateKey []byte `json:"private_key"`
+	PrivateKey []byte `json:"private_key,omitempty"`
 }
 
 // ChallengeMsg is sent by the gateway on reconnect to authenticate the connector.

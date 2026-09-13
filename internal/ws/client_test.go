@@ -157,6 +157,12 @@ func TestReconnectHandshake(t *testing.T) {
 		}
 		defer conn.CloseNow() //nolint:errcheck
 
+		// Read identify hello (no token, no signature)
+		var identHello proto.HelloMsg
+		if err := wsjson.Read(r.Context(), conn, &identHello); err != nil {
+			t.Errorf("read identify hello: %v", err)
+			return
+		}
 		// Send challenge
 		challenge := proto.ChallengeMsg{
 			Type:  "challenge",

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -26,6 +27,15 @@ type Client struct {
 	cfg           *config.Config
 	keyStore      *auth.KeyStore
 	pluginHandler PluginHandler
+	writeMu       sync.Mutex
+}
+
+// writeMsg serialises v as JSON and writes it to conn under a mutex,
+// preventing concurrent writes that coder/websocket does not allow.
+func (c *Client) writeMsg(ctx context.Context, conn *websocket.Conn, v any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return wsjson.Write(ctx, conn, v)
 }
 
 // NewClient creates a new Client.
@@ -77,8 +87,8 @@ func (c *Client) Run(ctx context.Context) {
 func (c *Client) Connect(ctx context.Context) error {
 	wsURL := strings.TrimRight(c.cfg.GatewayURL, "/")
 	// Convert ws:// → http:// so coder/websocket can dial it correctly.
-	httpURL := strings.Replace(wsURL, "ws://", "http://", 1)
-	httpURL = strings.Replace(httpURL, "wss://", "https://", 1)
+	httpURL := strings.ReplaceAll(wsURL, "ws://", "http://")
+	httpURL = strings.ReplaceAll(httpURL, "wss://", "https://")
 	httpURL += "/ws"
 
 	conn, _, err := websocket.Dial(ctx, httpURL, &websocket.DialOptions{
@@ -117,7 +127,7 @@ func (c *Client) register(ctx context.Context, conn *websocket.Conn) error {
 		ProtocolVersion: c.cfg.ProtocolVersion,
 		Token:           c.cfg.RegistrationToken,
 	}
-	if err := wsjson.Write(ctx, conn, hello); err != nil {
+	if err := c.writeMsg(ctx, conn, hello); err != nil {
 		return fmt.Errorf("send hello: %w", err)
 	}
 
@@ -155,59 +165,52 @@ func (c *Client) register(ctx context.Context, conn *websocket.Conn) error {
 }
 
 // reconnect performs the challenge-response flow for an already-registered connector.
-func (c *Client) reconnect(ctx context.Context, conn *websocket.Conn, priv *mldsa65.PrivateKey) error {
-	// The gateway sends a ChallengeMsg first.
+func (c *Client) reconnect(ctx context.Context, conn *websocket.Conn, privKey *mldsa65.PrivateKey) error {
+	// Step 1: identify connector so gateway can look up our public key.
+	if err := c.writeMsg(ctx, conn, proto.HelloMsg{
+		Type:            "hello",
+		ConnectorID:     c.cfg.ConnectorID,
+		ProtocolVersion: c.cfg.ProtocolVersion,
+	}); err != nil {
+		return fmt.Errorf("reconnect identify: %w", err)
+	}
+
+	// Step 2: receive challenge.
 	var raw json.RawMessage
 	if err := wsjson.Read(ctx, conn, &raw); err != nil {
 		return fmt.Errorf("read challenge: %w", err)
 	}
-
-	var typed proto.TypedMessage
-	if err := json.Unmarshal(raw, &typed); err != nil {
-		return fmt.Errorf("parse message type: %w", err)
+	var tm proto.TypedMessage
+	if err := json.Unmarshal(raw, &tm); err != nil {
+		return fmt.Errorf("unmarshal challenge type: %w", err)
 	}
-	if typed.Type == "error" {
+	if tm.Type == "error" {
 		var msg proto.ErrorMsg
 		_ = json.Unmarshal(raw, &msg)
 		return fmt.Errorf("gateway error %s: %s", msg.Code, msg.Message)
 	}
-	if typed.Type != "challenge" {
-		return fmt.Errorf("expected challenge, got %q", typed.Type)
+	if tm.Type != "challenge" {
+		return fmt.Errorf("expected challenge, got %s", tm.Type)
 	}
-
 	var challenge proto.ChallengeMsg
 	if err := json.Unmarshal(raw, &challenge); err != nil {
-		return fmt.Errorf("parse challenge: %w", err)
+		return fmt.Errorf("unmarshal challenge: %w", err)
 	}
 
-	sig := auth.Sign(priv, challenge.Nonce, c.cfg.ConnectorID)
-
-	hello := proto.HelloMsg{
+	// Step 3: sign and respond.
+	sig := auth.Sign(privKey, challenge.Nonce, c.cfg.ConnectorID)
+	if err := c.writeMsg(ctx, conn, proto.HelloMsg{
 		Type:            "hello",
 		ConnectorID:     c.cfg.ConnectorID,
 		ProtocolVersion: c.cfg.ProtocolVersion,
 		Signature:       sig,
-	}
-	if err := wsjson.Write(ctx, conn, hello); err != nil {
-		return fmt.Errorf("send hello with signature: %w", err)
+	}); err != nil {
+		return fmt.Errorf("send signed hello: %w", err)
 	}
 
-	// Read the handshake_ok acknowledgement.
-	var raw2 json.RawMessage
-	if err := wsjson.Read(ctx, conn, &raw2); err != nil {
+	// Step 4: await ack (read and discard handshake_ok).
+	if err := wsjson.Read(ctx, conn, &raw); err != nil {
 		return fmt.Errorf("read reconnect ack: %w", err)
-	}
-	var typed2 proto.TypedMessage
-	if err := json.Unmarshal(raw2, &typed2); err != nil {
-		return fmt.Errorf("parse reconnect ack type: %w", err)
-	}
-	if typed2.Type == "error" {
-		var msg proto.ErrorMsg
-		_ = json.Unmarshal(raw2, &msg)
-		return fmt.Errorf("gateway error %s: %s", msg.Code, msg.Message)
-	}
-	if typed2.Type != "handshake_ok" {
-		return fmt.Errorf("expected handshake_ok, got %q", typed2.Type)
 	}
 	return nil
 }
@@ -267,7 +270,7 @@ func (c *Client) handleData(ctx context.Context, conn *websocket.Conn, msg proto
 		StatusCode: statusCode,
 		Body:       body,
 	}
-	if err := wsjson.Write(ctx, conn, resp); err != nil {
+	if err := c.writeMsg(ctx, conn, resp); err != nil {
 		slog.Warn("failed to send response", "request_id", msg.RequestID, "err", err)
 	}
 }
