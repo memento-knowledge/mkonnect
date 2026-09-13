@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -285,6 +286,266 @@ func TestReconnectHandshake(t *testing.T) {
 	copy(msg[32:], "test-connector")
 	if !mldsa65.Verify(pubKey, msg, nil, sigBytes) {
 		t.Error("signature verification failed")
+	}
+}
+
+// TestHandshakeErrorRejectsRegistration verifies a handshake_error response during
+// registration surfaces the gateway's code and reason, and does not save a key. The mock
+// mirrors the gateway's actual reject() (registration.go): write the error frame, then
+// close with the numeric status code and reason — not just CloseNow().
+func TestHandshakeErrorRejectsRegistration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		const code, reason = 4001, "invalid registration token"
+		errMsg := gatewayHandshakeErrorMsg{Type: "handshake_error", Code: code, Reason: reason}
+		if err := wsjson.Write(r.Context(), conn, errMsg); err != nil {
+			t.Errorf("write handshake_error: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusCode(code), reason)
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	keyStore := auth.NewKeyStore(keyFile)
+	client := ws.NewClient(cfg, keyStore)
+
+	err := client.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid registration token") {
+		t.Errorf("error = %v, want it to contain the gateway's reason", err)
+	}
+	if _, found, _ := keyStore.Load(); found {
+		t.Error("key was saved despite a handshake_error response")
+	}
+}
+
+// TestHandshakeErrorRejectsReconnect covers the reconnect path — an unregistered or
+// signature-mismatched connector is the more common production failure mode than a bad
+// registration token (registration only happens once).
+func TestHandshakeErrorRejectsReconnect(t *testing.T) {
+	existingKey := genPrivKey(t)
+	keyFile := filepath.Join(t.TempDir(), "key")
+	keyStore := auth.NewKeyStore(keyFile)
+	if err := keyStore.Save(existingKey); err != nil {
+		t.Fatalf("save existing key: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		const code, reason = 4001, "connector not registered"
+		errMsg := gatewayHandshakeErrorMsg{Type: "handshake_error", Code: code, Reason: reason}
+		if err := wsjson.Write(r.Context(), conn, errMsg); err != nil {
+			t.Errorf("write handshake_error: %v", err)
+			return
+		}
+		_ = conn.Close(websocket.StatusCode(code), reason)
+	}))
+	defer srv.Close()
+
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, keyStore)
+
+	err := client.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "connector not registered") {
+		t.Errorf("error = %v, want it to contain the gateway's reason", err)
+	}
+}
+
+// TestDeprecationNoticeIsNonFatal verifies a deprecation_notice in handshake_ok does not
+// fail the connection — it's a warning, not a rejection (ADR-063 §10). Uses the same
+// keySent-then-poll pattern as TestRegistrationHandshake rather than an arbitrary sleep, so
+// it doesn't burn wall-clock time and doesn't need to distinguish "no error yet" from "no
+// error ever" via a timeout race.
+func TestDeprecationNoticeIsNonFatal(t *testing.T) {
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+	keySent := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:              "handshake_ok",
+			DeprecationNotice: "protocol_version v1 deprecated, update by 2026-12-01",
+			PrivateKey:        base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+		close(keySent)
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	keyStore := auth.NewKeyStore(keyFile)
+	client := ws.NewClient(cfg, keyStore)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- client.Connect(ctx) }()
+
+	<-keySent
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, found, _ := keyStore.Load(); found {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, found, _ := keyStore.Load(); !found {
+		t.Fatal("key was not saved despite a deprecation_notice-only (non-fatal) handshake_ok")
+	}
+	cancel()
+	<-connectDone
+}
+
+// TestCriticalPatchRequiredSuspendsDispatch verifies that once the gateway sets
+// critical_patch_required in handshake_ok, inbound "data" messages get a 503 instead of
+// being forwarded to the plugin handler (ADR-063 §7.4). This exercises mkonnect-internal
+// behavior only: a real gateway can't currently deliver "data" or read "response" at all
+// (its inboundAllowlist expects http_response) until #2212 replaces DataMsg/ResponseMsg —
+// see the NOTE on this code path in client.go.
+func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	var receivedResponse proto.ResponseMsg
+	responseReceived := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type: "handshake_ok", CriticalPatch: true,
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+
+		if err := wsjson.Write(r.Context(), conn, proto.DataMsg{
+			Type: "data", RequestID: "req-1", Plugin: "jenkins", Method: "GET", Path: "/",
+		}); err != nil {
+			t.Errorf("write data: %v", err)
+			return
+		}
+		if err := wsjson.Read(r.Context(), conn, &receivedResponse); err != nil {
+			t.Errorf("read response: %v", err)
+			return
+		}
+		close(responseReceived)
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	keyStore := auth.NewKeyStore(keyFile)
+	client := ws.NewClient(cfg, keyStore)
+
+	var pluginHandlerCalled atomic.Bool
+	client.SetPluginHandler(func(_ context.Context, _ proto.DataMsg) (int, []byte, error) {
+		pluginHandlerCalled.Store(true)
+		return 200, []byte("ok"), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- client.Connect(ctx) }()
+
+	select {
+	case <-responseReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for response")
+	}
+	cancel()
+	<-connectDone
+
+	if pluginHandlerCalled.Load() {
+		t.Error("plugin handler was called despite critical_patch_required")
+	}
+	if receivedResponse.StatusCode != 503 {
+		t.Errorf("status code = %d, want 503", receivedResponse.StatusCode)
+	}
+	if receivedResponse.RequestID != "req-1" {
+		t.Errorf("request_id = %q, want %q", receivedResponse.RequestID, "req-1")
 	}
 }
 
