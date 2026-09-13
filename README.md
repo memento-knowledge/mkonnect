@@ -68,6 +68,8 @@ helm install mkonnect charts/mkonnect \
 
 `registrationToken` is written into a Kubernetes `Secret` (`charts/mkonnect/templates/secret.yaml`) alongside `gatewayUrl` and `connectorId`. Keep `mkonnect-secrets.yaml` out of version control and delete it once the connector has completed its first registration — subsequent reconnects use the persisted ML-DSA-65 key instead.
 
+Note that deleting the local file does *not* remove the token from the cluster: it remains in the deployed `Secret` and in Helm's release metadata. Restrict access to both (RBAC on `secrets` and on `helm get values`/release objects in the target namespace), and if the token is no longer needed, rotate or clear it explicitly via `helm upgrade --set config.registrationToken=""` (or a values file) rather than relying on local file deletion alone.
+
 The chart provisions a `PersistentVolumeClaim` so the ML-DSA-65 key survives pod restarts. See [charts/mkonnect/values.yaml](charts/mkonnect/values.yaml) for all options.
 
 ### From source
