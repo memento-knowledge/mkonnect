@@ -81,8 +81,10 @@ func TestHandlerTimeout(t *testing.T) {
 	}
 
 	status, _, err := h(msg)
-	// Expect either an error or a 504 gateway timeout.
-	if err == nil && status != 504 {
-		t.Fatalf("expected timeout error or 504, got status=%d err=%v", status, err)
+	if err == nil {
+		t.Errorf("expected error on timeout, got nil")
+	}
+	if status != 504 {
+		t.Errorf("expected status 504, got %d", status)
 	}
 }

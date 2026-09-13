@@ -10,8 +10,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
-	"github.com/memento-knowledge/mkonnect/internal/gateway"
+	"github.com/memento-knowledge/mkonnect/internal/plugin"
+	"github.com/memento-knowledge/mkonnect/internal/ws"
 )
 
 func main() {
@@ -24,10 +26,15 @@ func main() {
 	log.Printf("mkonnect starting — connector=%s gateway=%s protocol=%s",
 		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion)
 
+	reg, err := plugin.Load(cfg)
+	if err != nil {
+		log.Fatalf("mkonnect: plugin registry load failed: %v", err)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := gateway.Connect(ctx, cfg); err != nil {
-		log.Fatalf("mkonnect: gateway connection failed: %v", err)
-	}
+	client := ws.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile))
+	client.SetPluginHandler(plugin.Handler(reg))
+	client.Run(ctx)
 }

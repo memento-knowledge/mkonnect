@@ -47,7 +47,7 @@ func Handler(registry *Registry) func(msg proto.DataMsg) (int, []byte, error) {
 		for _, h := range hopByHopHeaders {
 			req.Header.Del(h)
 		}
-		req.Header.Set("X-Forwarded-For", "mkonnect")
+		req.Header.Set("X-Forwarded-For", "mkonnect/0.1.0")
 
 		resp, err := client.Do(req)
 		if err != nil {
