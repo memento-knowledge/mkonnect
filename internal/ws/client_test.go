@@ -549,6 +549,190 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 	}
 }
 
+// TestHeartbeatSendsHealthMessage verifies the connector sends an application-level
+// {"type":"health"} message on the heartbeat tick — the only thing the gateway's Route()
+// loop actually reads to refresh last_health_at (a WebSocket ping/pong control frame is
+// invisible to it; the server's wsjson.Read here only ever sees the health text frame,
+// since coder/websocket handles ping/pong transparently beneath it). Shortens the
+// interval via SetHeartbeatIntervalForTest rather than waiting the real 30s.
+func TestHeartbeatSendsHealthMessage(t *testing.T) {
+	restore := ws.SetHeartbeatIntervalForTest(20 * time.Millisecond)
+	defer restore()
+
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	healthReceived := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+
+		// The first message the client sends after the handshake should be a heartbeat.
+		var raw json.RawMessage
+		if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+			t.Errorf("read heartbeat: %v", err)
+			return
+		}
+		var typed proto.TypedMessage
+		if err := json.Unmarshal(raw, &typed); err != nil {
+			t.Errorf("unmarshal heartbeat type: %v", err)
+			return
+		}
+		if typed.Type != "health" {
+			t.Errorf("first post-handshake message type = %q, want %q", typed.Type, "health")
+		}
+		close(healthReceived)
+
+		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "going_away"}); err != nil {
+			t.Errorf("write going_away: %v", err)
+			return
+		}
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	keyStore := auth.NewKeyStore(keyFile)
+	client := ws.NewClient(cfg, keyStore)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- client.Connect(ctx) }()
+
+	select {
+	case <-healthReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a health heartbeat message")
+	}
+
+	select {
+	case err := <-connectDone:
+		if err != nil {
+			t.Errorf("Connect returned an error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Connect to return after going_away")
+	}
+}
+
+// TestGoingAwayDrainsInFlightRequest verifies that a going_away disconnect waits for an
+// in-flight handleData call to finish and write its response before the connection is
+// torn down, instead of dropping it.
+func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	var receivedResponse proto.ResponseMsg
+	responseReceived := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+
+		// Send a data message, then going_away immediately after — before the plugin
+		// handler (which sleeps briefly) has had a chance to respond. If the drain works,
+		// the response still arrives; if going_away just tore the connection down, this
+		// read would time out or error instead.
+		if err := wsjson.Write(r.Context(), conn, proto.DataMsg{
+			Type: "data", RequestID: "req-1", Plugin: "jenkins", Method: "GET", Path: "/",
+		}); err != nil {
+			t.Errorf("write data: %v", err)
+			return
+		}
+		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "going_away"}); err != nil {
+			t.Errorf("write going_away: %v", err)
+			return
+		}
+
+		if err := wsjson.Read(r.Context(), conn, &receivedResponse); err != nil {
+			t.Errorf("read response: %v", err)
+			return
+		}
+		close(responseReceived)
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	keyStore := auth.NewKeyStore(keyFile)
+	client := ws.NewClient(cfg, keyStore)
+	client.SetPluginHandler(func(_ context.Context, _ proto.DataMsg) (int, []byte, error) {
+		time.Sleep(100 * time.Millisecond) // simulate a slow downstream call
+		return 200, []byte(`{"ok":true}`), nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	connectDone := make(chan error, 1)
+	go func() { connectDone <- client.Connect(ctx) }()
+
+	select {
+	case <-responseReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the in-flight response to be drained through")
+	}
+	<-connectDone
+
+	if receivedResponse.StatusCode != 200 {
+		t.Errorf("status code = %d, want 200 (in-flight request should have completed, not been dropped)", receivedResponse.StatusCode)
+	}
+	if receivedResponse.RequestID != "req-1" {
+		t.Errorf("request_id = %q, want %q", receivedResponse.RequestID, "req-1")
+	}
+}
+
 // TestNonceMarshal verifies the Nonce type round-trips through JSON correctly.
 func TestNonceMarshal(t *testing.T) {
 	var n proto.Nonce

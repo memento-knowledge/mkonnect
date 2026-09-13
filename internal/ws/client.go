@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ type Client struct {
 	pluginHandler         PluginHandler
 	writeMu               sync.Mutex
 	workerSem             chan struct{}
+	inFlight              sync.WaitGroup
 	criticalPatchRequired atomic.Bool
 }
 
@@ -84,7 +86,22 @@ func (c *Client) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// A brief jittered pause before reconnecting avoids immediately bouncing back onto
+		// a gateway pod that just told us it's draining (going_away): the pod keeps
+		// accepting new connections until its own GracefulDrainSecs window elapses, so an
+		// instant reconnect can land right back on it and get force-closed again.
+		select {
+		case <-time.After(reconnectPause()):
+		case <-ctx.Done():
+			return
+		}
 	}
+}
+
+// reconnectPause returns a small jittered delay (500ms-2s) applied after a clean
+// disconnect before reconnecting.
+func reconnectPause() time.Duration {
+	return 500*time.Millisecond + rand.N(1500*time.Millisecond)
 }
 
 // handshakeTimeout mirrors the gateway's own handshakeTimeout (registration.go) — the gateway
@@ -92,9 +109,30 @@ func (c *Client) Run(ctx context.Context) {
 // (and therefore Run's reconnect backoff) forever on a stuck read.
 const handshakeTimeout = 30 * time.Second
 
+// heartbeatInterval is a var, not a const, so export_test.go can shorten it for tests that
+// need to observe a heartbeat without waiting 30s of real time.
+var heartbeatInterval = 30 * time.Second
+
+// drainTimeout bounds how long a going_away disconnect waits for in-flight handleData
+// goroutines to finish and write their responses before the connection is torn down.
+const drainTimeout = 10 * time.Second
+
 // Connect dials the gateway, performs the handshake, and runs the message loop.
 // It returns when the connection closes or ctx is cancelled.
 func (c *Client) Connect(ctx context.Context) error {
+	priv, found, err := c.keyStore.Load()
+	if err != nil {
+		return fmt.Errorf("load key: %w", err)
+	}
+	if !found && c.cfg.RegistrationToken == "" {
+		// Checked before dialing: without this, HelloMsg would carry neither a token nor a
+		// signature; the gateway would take the reconnect path and reject with "connector
+		// not registered" — a confusing error for what's actually a missing
+		// REGISTRATION_TOKEN, and one a misconfigured connector would redial the gateway
+		// for on every backoff cycle just to receive.
+		return fmt.Errorf("no saved key and REGISTRATION_TOKEN is not set — cannot register or reconnect")
+	}
+
 	wsURL := strings.TrimRight(c.cfg.GatewayURL, "/")
 
 	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
@@ -106,17 +144,6 @@ func (c *Client) Connect(ctx context.Context) error {
 	defer conn.CloseNow() //nolint:errcheck
 	// Allow messages up to 64 MiB (32 MiB body + ~33% base64/JSON overhead).
 	conn.SetReadLimit(64 << 20)
-
-	priv, found, err := c.keyStore.Load()
-	if err != nil {
-		return fmt.Errorf("load key: %w", err)
-	}
-	if !found && c.cfg.RegistrationToken == "" {
-		// Without this check, HelloMsg would carry neither a token nor a signature; the
-		// gateway would take the reconnect path and reject with "connector not registered" —
-		// a confusing error for what's actually a missing REGISTRATION_TOKEN.
-		return fmt.Errorf("no saved key and REGISTRATION_TOKEN is not set — cannot register or reconnect")
-	}
 
 	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelHandshake()
@@ -150,7 +177,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -297,7 +324,8 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 
 		switch typed.Type {
 		case "going_away":
-			slog.Info("gateway is draining for a rolling update, disconnecting to reconnect elsewhere")
+			slog.Info("gateway is draining for a rolling update, waiting for in-flight requests before disconnecting")
+			c.waitForInFlight(drainTimeout)
 			return nil
 		case "data":
 			var msg proto.DataMsg
@@ -318,13 +346,31 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				}
 				continue
 			}
+			c.inFlight.Add(1)
 			go func(m proto.DataMsg) {
+				defer c.inFlight.Done()
 				defer func() { <-c.workerSem }()
 				c.handleData(ctx, conn, m)
 			}(msg)
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
+	}
+}
+
+// waitForInFlight blocks until all in-flight handleData goroutines finish (so their
+// responses get written while conn is still open) or timeout elapses, whichever comes
+// first — a going_away drain should not hang indefinitely on a stuck downstream call.
+func (c *Client) waitForInFlight(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		c.inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("timed out waiting for in-flight requests to finish before drain disconnect", "timeout", timeout)
 	}
 }
 
