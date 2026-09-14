@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -466,7 +467,7 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
 	if err != nil {
 		result.Status = "unreachable"
-		result.Diagnostic = err.Error()
+		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
 	if credAuth == "bearer" && credToken != "" {
@@ -489,7 +490,7 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		} else {
 			result.Status = "unreachable"
 		}
-		result.Diagnostic = err.Error()
+		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
 	defer resp.Body.Close() //nolint:errcheck
@@ -508,6 +509,39 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
 	}
 	return result
+}
+
+// safeDiagnostic maps a probe error to a short, address-free description safe to send to
+// the platform. Raw net/http error strings embed the target host:port (and DNS errors the
+// hostname), so returning err.Error() verbatim would leak the customer's internal network
+// topology to Memento's cloud via test_result/connection_status — directly against the
+// connector's premise that internal details never leave the network. We surface only the
+// failure class. The status field (connected/auth_failure/unreachable/timeout) already
+// carries the actionable signal.
+func safeDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return "connection timed out"
+	}
+	// DNS errors' Error() includes the hostname being resolved — never surface it.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "DNS resolution failed"
+	}
+	// os.SyscallError (e.g. connect: ECONNREFUSED) stringifies to the errno text alone
+	// ("connection refused", "no route to host") with no address.
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) && syscallErr.Err != nil {
+		return syscallErr.Err.Error()
+	}
+	// net.OpError.Error() embeds the address, but its wrapped cause (.Err) does not.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Err != nil {
+		return opErr.Err.Error()
+	}
+	return "connection failed"
 }
 
 // updatePluginStatus maps a TestResultMsg to a PluginStatus and stores it in the cache.
