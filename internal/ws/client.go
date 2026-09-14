@@ -26,14 +26,10 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/version"
 )
 
-// PluginHandler processes an inbound DataMsg and returns a status code and body.
-type PluginHandler func(context.Context, proto.DataMsg) (statusCode int, body []byte, err error)
-
 // Client connects mkonnect to the Bridge Gateway over WebSocket.
 type Client struct {
 	cfg                   *config.Config
 	keyStore              *auth.KeyStore
-	pluginHandler         PluginHandler
 	writeMu               sync.Mutex
 	workerSem             chan struct{}
 	inFlight              sync.WaitGroup
@@ -63,11 +59,6 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 		statusCache: make(map[string]proto.PluginStatus),
 		statusCh:    make(chan struct{}, 1),
 	}
-}
-
-// SetPluginHandler sets the function that handles inbound DataMsg requests.
-func (c *Client) SetPluginHandler(fn PluginHandler) {
-	c.pluginHandler = fn
 }
 
 // SetHTTPPluginHandler sets the handler for inbound http_request messages.
@@ -149,7 +140,7 @@ const handshakeTimeout = 30 * time.Second
 // need to observe a heartbeat without waiting 30s of real time.
 var heartbeatInterval = 30 * time.Second
 
-// drainTimeout bounds how long a going_away disconnect waits for in-flight handleData
+// drainTimeout bounds how long a going_away disconnect waits for in-flight request
 // goroutines to finish and write their responses before the connection is torn down.
 const drainTimeout = 10 * time.Second
 
@@ -362,7 +353,7 @@ func (c *Client) readHandshakeResult(ctx context.Context, conn *websocket.Conn, 
 	}
 }
 
-// runLoop reads DataMsg messages and dispatches them to the plugin handler.
+// runLoop reads inbound gateway messages and dispatches them to the appropriate handler.
 func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
 		var raw json.RawMessage
@@ -384,31 +375,6 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 			slog.Info("gateway is draining for a rolling update, waiting for in-flight requests before disconnecting")
 			c.waitForInFlight(drainTimeout)
 			return nil
-		case "data":
-			var msg proto.DataMsg
-			if err := json.Unmarshal(raw, &msg); err != nil {
-				slog.Warn("malformed data message", "err", err)
-				continue
-			}
-			select {
-			case c.workerSem <- struct{}{}:
-			default:
-				// Backpressure: write 429 synchronously. Spawning a goroutine here
-				// would create unbounded goroutines under load, defeating the semaphore.
-				if err := c.writeMsg(ctx, conn, proto.ResponseMsg{
-					Type: "response", RequestID: msg.RequestID,
-					StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
-				}); err != nil {
-					slog.Warn("failed to send 429", "request_id", msg.RequestID, "err", err)
-				}
-				continue
-			}
-			c.inFlight.Add(1)
-			go func(m proto.DataMsg) {
-				defer c.inFlight.Done()
-				defer func() { <-c.workerSem }()
-				c.handleData(ctx, conn, m)
-			}(msg)
 		case "http_request":
 			var msg proto.HTTPRequestMsg
 			if err := json.Unmarshal(raw, &msg); err != nil {
@@ -618,7 +584,7 @@ func (c *Client) emitConnectionStatus(ctx context.Context, conn *websocket.Conn)
 	}
 }
 
-// waitForInFlight blocks until all in-flight handleData goroutines finish (so their
+// waitForInFlight blocks until all in-flight request goroutines finish (so their
 // responses get written while conn is still open) or timeout elapses, whichever comes
 // first — a going_away drain should not hang indefinitely on a stuck downstream call.
 func (c *Client) waitForInFlight(timeout time.Duration) {
@@ -676,51 +642,5 @@ func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, ms
 	}
 	if err := c.writeMsg(ctx, conn, resp); err != nil {
 		slog.Warn("failed to send http_response", "request_id", msg.RequestID, "err", err)
-	}
-}
-
-func (c *Client) handleData(ctx context.Context, conn *websocket.Conn, msg proto.DataMsg) {
-	if c.criticalPatchRequired.Load() {
-		// NOTE: this 503 path is presently unreachable against the real gateway — the
-		// gateway forwards "data"/DataMsg-shaped traffic nowhere (its inboundAllowlist
-		// expects http_response, not response) until #2212 replaces DataMsg/ResponseMsg
-		// with http_request/http_response. The flag and gate are still correct and
-		// reusable as-is; #2212 should keep this check and just change the response shape
-		// to match spec §7.4's tool_unavailable.
-		resp := proto.ResponseMsg{
-			Type: "response", RequestID: msg.RequestID,
-			StatusCode: 503, Body: []byte(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
-		}
-		if err := c.writeMsg(ctx, conn, resp); err != nil {
-			slog.Warn("failed to send critical-patch 503", "request_id", msg.RequestID, "err", err)
-		}
-		return
-	}
-
-	var statusCode int
-	var body []byte
-
-	if c.pluginHandler != nil {
-		var err error
-		statusCode, body, err = c.pluginHandler(ctx, msg)
-		if err != nil {
-			slog.Warn("plugin handler error", "request_id", msg.RequestID, "err", err)
-			if statusCode == 0 {
-				statusCode = 500
-			}
-		}
-	} else {
-		statusCode = 501
-		body = []byte(`{"error":"no plugin handler configured"}`)
-	}
-
-	resp := proto.ResponseMsg{
-		Type:       "response",
-		RequestID:  msg.RequestID,
-		StatusCode: statusCode,
-		Body:       body,
-	}
-	if err := c.writeMsg(ctx, conn, resp); err != nil {
-		slog.Warn("failed to send response", "request_id", msg.RequestID, "err", err)
 	}
 }
