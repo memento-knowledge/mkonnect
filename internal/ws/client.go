@@ -214,8 +214,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	// due to a read error unrelated to ctx cancellation).
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
+	hbInterval := heartbeatInterval // snapshot before goroutine; avoids data race with SetHeartbeatIntervalForTest
 	go func() {
-		ticker := time.NewTicker(heartbeatInterval)
+		ticker := time.NewTicker(hbInterval)
 		defer ticker.Stop()
 		for {
 			select {
