@@ -443,7 +443,16 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				slog.Warn("malformed test_connection", "err", err)
 				continue
 			}
+			// Use the same semaphore as http_request so probes cannot create unbounded
+			// goroutines that make outbound HTTP calls to the customer's internal network.
+			select {
+			case c.workerSem <- struct{}{}:
+			default:
+				slog.Warn("test_connection dropped: too many concurrent requests", "provider_key", msg.ProviderKey)
+				continue
+			}
 			go func(key string) {
+				defer func() { <-c.workerSem }()
 				probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 				defer cancel()
 				result := c.probePlugin(probeCtx, key)

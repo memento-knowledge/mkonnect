@@ -51,8 +51,17 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 			body, _ := json.Marshal(map[string]string{"error": "path must begin with /"})
 			return 400, body, nil
 		}
-		base, _ := url.Parse(baseURL) // validated at registry load time
-		target := base.ResolveReference(&url.URL{Path: msg.Path})
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			return 500, []byte(`{"error":"invalid base URL"}`), nil
+		}
+		// Preserve the base path prefix (confinement) and parse path+query from msg.Path.
+		reqRef, err := url.Parse(msg.Path)
+		if err != nil {
+			return 400, []byte(`{"error":"invalid path"}`), nil
+		}
+		reqRef.Path = base.Path + reqRef.Path
+		target := base.ResolveReference(reqRef)
 		if target.Host != base.Host {
 			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
 			return 400, body, nil
@@ -132,7 +141,8 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 405, nil, errBody(`{"error":"method not allowed"}`), nil
 		}
 
-		// Validate path and resolve against base URL.
+		// Validate path and resolve against base URL, preserving the base path prefix
+		// (confinement) and any query string supplied by the caller.
 		if !strings.HasPrefix(msg.Path, "/") {
 			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
 		}
@@ -140,7 +150,15 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if err != nil {
 			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
 		}
-		target := base.ResolveReference(&url.URL{Path: msg.Path, RawQuery: base.RawQuery})
+		// url.Parse correctly splits path and raw query from msg.Path (e.g. "/api?k=v").
+		reqRef, err := url.Parse(msg.Path)
+		if err != nil {
+			return 400, nil, errBody(`{"error":"invalid path"}`), nil
+		}
+		// Prepend the base path so a base URL of https://host/api/v1 + /jobs stays confined
+		// under /api/v1/ and doesn't resolve to /jobs on the root.
+		reqRef.Path = base.Path + reqRef.Path
+		target := base.ResolveReference(reqRef)
 		if target.Host != base.Host {
 			return 400, nil, errBody(`{"error":"invalid path"}`), nil
 		}
