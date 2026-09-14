@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"sort"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 )
@@ -77,6 +78,9 @@ func runConfigSet(args []string, w io.Writer) error {
 	if *auth != "" && *auth != "bearer" {
 		return fmt.Errorf("unsupported auth type: %q (only 'bearer' is supported)", *auth)
 	}
+	if *token != "" && *auth != "bearer" {
+		fmt.Fprintf(w, "Warning: --token is set but --auth is %q; token will be stored but not used.\n", *auth)
+	}
 
 	store, err := creds.New(credsPath())
 	if err != nil {
@@ -104,7 +108,13 @@ func runConfigList(w io.Writer) error {
 		return nil
 	}
 	fmt.Fprintf(w, "%-20s  %-40s  %s\n", "PLUGIN", "BASE URL", "AUTH")
-	for name, cred := range list {
+	names := make([]string, 0, len(list))
+	for name := range list {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		cred := list[name]
 		auth := "(none)"
 		if cred.Auth == "bearer" {
 			auth = "bearer ***"
@@ -140,7 +150,13 @@ func runStatus(_ []string, w io.Writer) error {
 	if len(list) == 0 {
 		fmt.Fprintln(w, "  (none)")
 	}
-	for name, cred := range list {
+	names := make([]string, 0, len(list))
+	for name := range list {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		cred := list[name]
 		authDesc := "no auth"
 		if cred.Auth == "bearer" {
 			authDesc = "bearer"

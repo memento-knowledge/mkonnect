@@ -289,9 +289,9 @@ func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
 	h := HTTPHandler(reg, store)
 
 	cases := []string{
-		"/../../etc/passwd",   // literal dots
-		"/%2e%2e/etc/passwd",  // percent-encoded single dot-dot
-		"/%2e%2e/%2e%2e/etc",  // double-encoded
+		"/../../etc/passwd",  // literal dots
+		"/%2e%2e/etc/passwd", // percent-encoded single dot-dot
+		"/%2e%2e/%2e%2e/etc", // double-encoded
 	}
 	for _, p := range cases {
 		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
