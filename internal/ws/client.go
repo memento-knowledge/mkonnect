@@ -4,10 +4,12 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
+	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 	"github.com/memento-knowledge/mkonnect/internal/version"
 )
@@ -34,6 +38,12 @@ type Client struct {
 	workerSem             chan struct{}
 	inFlight              sync.WaitGroup
 	criticalPatchRequired atomic.Bool
+	httpHandler           plugin.HTTPPluginHandler
+	credsStore            *creds.Store
+	pluginReg             *plugin.Registry
+	statusCache           map[string]proto.PluginStatus
+	statusMu              sync.RWMutex
+	statusCh              chan struct{}
 }
 
 // writeMsg serialises v as JSON and writes it to conn under a mutex,
@@ -47,15 +57,41 @@ func (c *Client) writeMsg(ctx context.Context, conn *websocket.Conn, v any) erro
 // NewClient creates a new Client.
 func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 	return &Client{
-		cfg:       cfg,
-		keyStore:  keyStore,
-		workerSem: make(chan struct{}, 4), // 4 workers × 32 MiB max body ≈ 128 MiB, matching the default container memory limit
+		cfg:         cfg,
+		keyStore:    keyStore,
+		workerSem:   make(chan struct{}, 4), // 4 workers × 32 MiB max body ≈ 128 MiB, matching the default container memory limit
+		statusCache: make(map[string]proto.PluginStatus),
+		statusCh:    make(chan struct{}, 1),
 	}
 }
 
 // SetPluginHandler sets the function that handles inbound DataMsg requests.
 func (c *Client) SetPluginHandler(fn PluginHandler) {
 	c.pluginHandler = fn
+}
+
+// SetHTTPPluginHandler sets the handler for inbound http_request messages.
+func (c *Client) SetHTTPPluginHandler(fn plugin.HTTPPluginHandler) {
+	c.httpHandler = fn
+}
+
+// SetCredsStore provides the credential store used for connection_status and connectivity tests.
+func (c *Client) SetCredsStore(s *creds.Store) {
+	c.credsStore = s
+}
+
+// SetPluginRegistry provides the registry used to enumerate known plugins for connection_status.
+func (c *Client) SetPluginRegistry(r *plugin.Registry) {
+	c.pluginReg = r
+}
+
+// SignalStatusPush queues an immediate connection_status push to the gateway.
+// Safe to call from any goroutine; non-blocking (drops if already pending).
+func (c *Client) SignalStatusPush() {
+	select {
+	case c.statusCh <- struct{}{}:
+	default:
+	}
 }
 
 // Run connects to the gateway and maintains the connection with exponential backoff.
@@ -166,6 +202,8 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
+	c.emitConnectionStatus(ctx, conn)
+
 	// Heartbeat: a WebSocket-level ping (waits for a pong; this is what actually detects a
 	// half-open/zombie TCP connection the gateway has stopped reading from — e.g. router.go's
 	// SQS-init-failure path returns without ever reading again, so only a pong-requiring ping
@@ -176,8 +214,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	// due to a read error unrelated to ctx cancellation).
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
+	hbInterval := heartbeatInterval // snapshot before goroutine; avoids data race with SetHeartbeatIntervalForTest
 	go func() {
-		ticker := time.NewTicker(heartbeatInterval)
+		ticker := time.NewTicker(hbInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -190,12 +229,30 @@ func (c *Client) Connect(ctx context.Context) error {
 				if pingErr == nil {
 					healthErr = c.writeMsg(tickCtx, conn, proto.HealthMsg{Type: "health"})
 				}
+				var statusErr error
+				if pingErr == nil && healthErr == nil {
+					statusErr = c.writeMsg(tickCtx, conn, c.buildConnectionStatus())
+				}
 				cancel()
-				if pingErr != nil || healthErr != nil {
-					slog.Warn("heartbeat failed, closing connection", "ping_err", pingErr, "health_err", healthErr)
+				if pingErr != nil || healthErr != nil || statusErr != nil {
+					slog.Warn("heartbeat failed, closing connection",
+						"ping_err", pingErr, "health_err", healthErr, "status_err", statusErr)
 					conn.CloseNow() //nolint:errcheck
 					return
 				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-c.statusCh:
+				pushCtx, cancel := context.WithTimeout(heartbeatCtx, 10*time.Second)
+				c.emitConnectionStatus(pushCtx, conn)
+				cancel()
 			}
 		}
 	}()
@@ -352,9 +409,212 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				defer func() { <-c.workerSem }()
 				c.handleData(ctx, conn, m)
 			}(msg)
+		case "http_request":
+			var msg proto.HTTPRequestMsg
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				slog.Warn("malformed http_request message", "err", err)
+				continue
+			}
+			select {
+			case c.workerSem <- struct{}{}:
+			default:
+				s := `{"error":"too many concurrent requests"}`
+				if err := c.writeMsg(ctx, conn, proto.HTTPResponseMsg{
+					Type: "http_response", RequestID: msg.RequestID, ResponderID: msg.ResponderID,
+					StatusCode: 429, Body: &s,
+				}); err != nil {
+					slog.Warn("failed to send 429 http_response", "request_id", msg.RequestID, "err", err)
+				}
+				continue
+			}
+			c.inFlight.Add(1)
+			go func(m proto.HTTPRequestMsg) {
+				defer c.inFlight.Done()
+				defer func() { <-c.workerSem }()
+				c.handleHTTPRequest(ctx, conn, m)
+			}(msg)
+		case "status_request":
+			go func() {
+				c.emitConnectionStatus(ctx, conn)
+			}()
+
+		case "test_connection":
+			var msg proto.TestConnectionMsg
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				slog.Warn("malformed test_connection", "err", err)
+				continue
+			}
+			// Use the same semaphore as http_request so probes cannot create unbounded
+			// goroutines that make outbound HTTP calls to the customer's internal network.
+			select {
+			case c.workerSem <- struct{}{}:
+			default:
+				slog.Warn("test_connection dropped: too many concurrent requests", "provider_key", msg.ProviderKey)
+				continue
+			}
+			go func(key string) {
+				defer func() { <-c.workerSem }()
+				probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				result := c.probePlugin(probeCtx, key)
+				c.updatePluginStatus(result)
+				if err := c.writeMsg(ctx, conn, result); err != nil {
+					slog.Warn("failed to send test_result", "err", err)
+				}
+				c.SignalStatusPush()
+			}(msg.ProviderKey)
+
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
+	}
+}
+
+// probePlugin performs a real HTTP connectivity test for the given plugin.
+func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.TestResultMsg {
+	result := proto.TestResultMsg{
+		Type:        "test_result",
+		ProviderKey: providerKey,
+	}
+
+	// Resolve base URL: creds store first, then registry (mirrors HTTPHandler).
+	var baseURL, credAuth, credToken string
+	if c.credsStore != nil {
+		if cred, ok := c.credsStore.Get(providerKey); ok {
+			baseURL = cred.BaseURL
+			credAuth = cred.Auth
+			credToken = cred.Token
+		}
+	}
+	if baseURL == "" && c.pluginReg != nil {
+		baseURL, _ = c.pluginReg.Get(providerKey)
+	}
+	if baseURL == "" {
+		result.Status = "unreachable"
+		result.Diagnostic = "not configured"
+		return result
+	}
+
+	probeURL := strings.TrimRight(baseURL, "/") + "/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
+	if err != nil {
+		result.Status = "unreachable"
+		result.Diagnostic = err.Error()
+		return result
+	}
+	if credAuth == "bearer" && credToken != "" {
+		req.Header.Set("Authorization", "Bearer "+credToken)
+	}
+
+	// Do not follow redirects: a redirect to an auth page (e.g. SSO) would succeed
+	// with a 200 and hide an auth_failure, and following redirects could forward the
+	// bearer token to a third-party host.
+	probeClient := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := probeClient.Do(req)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || os.IsTimeout(err) {
+			result.Status = "timeout"
+		} else {
+			result.Status = "unreachable"
+		}
+		result.Diagnostic = err.Error()
+		return result
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	code := resp.StatusCode
+	switch {
+	case code == 401 || code == 403:
+		result.Status = "auth_failure"
+		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
+	case code >= 200 && code < 400 || code == 404 || code == 405:
+		// 404: server answered (plugin is reachable, path just doesn't exist at root)
+		// 405: server answered HEAD but doesn't allow it — still reachable
+		result.Status = "connected"
+	default:
+		result.Status = "unreachable"
+		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
+	}
+	return result
+}
+
+// updatePluginStatus maps a TestResultMsg to a PluginStatus and stores it in the cache.
+func (c *Client) updatePluginStatus(result proto.TestResultMsg) {
+	var status string
+	switch result.Status {
+	case "connected":
+		status = "configured_connected"
+	case "auth_failure", "unreachable", "timeout":
+		status = "configured_error"
+	default:
+		status = "not_configured"
+	}
+	ps := proto.PluginStatus{
+		ProviderKey:  result.ProviderKey,
+		Status:       status,
+		LastTestedAt: time.Now().UTC().Format(time.RFC3339),
+		ErrorDetail:  result.Diagnostic,
+	}
+	c.statusMu.Lock()
+	c.statusCache[result.ProviderKey] = ps
+	c.statusMu.Unlock()
+}
+
+// allPluginKeys returns the union of plugin names from the registry and the creds store.
+func (c *Client) allPluginKeys() []string {
+	seen := make(map[string]struct{})
+	var keys []string
+	if c.pluginReg != nil {
+		for _, k := range c.pluginReg.Plugins() {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
+		}
+	}
+	if c.credsStore != nil {
+		for k := range c.credsStore.List() {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys
+}
+
+// cachedPluginStatus returns the cached probe result for a plugin, or a conservative
+// "not_configured" initial state if no probe has run yet. The platform should send
+// test_connection to obtain the real connectivity status.
+func (c *Client) cachedPluginStatus(key string) proto.PluginStatus {
+	c.statusMu.RLock()
+	s, ok := c.statusCache[key]
+	c.statusMu.RUnlock()
+	if ok {
+		return s
+	}
+	return proto.PluginStatus{ProviderKey: key, Status: "not_configured"}
+}
+
+// buildConnectionStatus assembles the current connection_status message.
+func (c *Client) buildConnectionStatus() proto.ConnectionStatusMsg {
+	keys := c.allPluginKeys()
+	plugins := make([]proto.PluginStatus, 0, len(keys))
+	for _, k := range keys {
+		plugins = append(plugins, c.cachedPluginStatus(k))
+	}
+	return proto.ConnectionStatusMsg{Type: "connection_status", Plugins: plugins}
+}
+
+// emitConnectionStatus writes the current connection_status to conn.
+func (c *Client) emitConnectionStatus(ctx context.Context, conn *websocket.Conn) {
+	if err := c.writeMsg(ctx, conn, c.buildConnectionStatus()); err != nil {
+		slog.Warn("failed to send connection_status", "err", err)
 	}
 }
 
@@ -371,6 +631,51 @@ func (c *Client) waitForInFlight(timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 		slog.Warn("timed out waiting for in-flight requests to finish before drain disconnect", "timeout", timeout)
+	}
+}
+
+func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, msg proto.HTTPRequestMsg) {
+	strPtr := func(s string) *string { return &s }
+
+	if c.criticalPatchRequired.Load() {
+		resp := proto.HTTPResponseMsg{
+			Type: "http_response", RequestID: msg.RequestID, ResponderID: msg.ResponderID,
+			StatusCode: 503, Body: strPtr(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
+		}
+		if err := c.writeMsg(ctx, conn, resp); err != nil {
+			slog.Warn("failed to send critical-patch 503", "request_id", msg.RequestID, "err", err)
+		}
+		return
+	}
+
+	var statusCode int
+	var headers map[string]string
+	var body *string
+
+	if c.httpHandler != nil {
+		var err error
+		statusCode, headers, body, err = c.httpHandler(ctx, msg)
+		if err != nil {
+			slog.Warn("http_request handler error", "request_id", msg.RequestID, "err", err)
+			if statusCode == 0 {
+				statusCode = 500
+			}
+		}
+	} else {
+		statusCode = 501
+		body = strPtr(`{"error":"no http handler configured"}`)
+	}
+
+	resp := proto.HTTPResponseMsg{
+		Type:        "http_response",
+		RequestID:   msg.RequestID,
+		ResponderID: msg.ResponderID,
+		StatusCode:  statusCode,
+		Headers:     headers,
+		Body:        body,
+	}
+	if err := c.writeMsg(ctx, conn, resp); err != nil {
+		slog.Warn("failed to send http_response", "request_id", msg.RequestID, "err", err)
 	}
 }
 

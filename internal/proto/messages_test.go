@@ -135,3 +135,46 @@ func TestHealthMsgType(t *testing.T) {
 		t.Errorf("type = %v, want %q", m["type"], "health")
 	}
 }
+
+func TestHTTPRequestMsgRoundtrip(t *testing.T) {
+	body := `{"q":1}`
+	orig := proto.HTTPRequestMsg{
+		Type:        "http_request",
+		RequestID:   "req-1",
+		ResponderID: "replica-uuid-42",
+		ProviderKey: "jenkins",
+		Method:      "GET",
+		Path:        "/api/json",
+		Headers:     map[string]string{"X-Foo": "bar"},
+		Body:        &body,
+	}
+	b, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got proto.HTTPRequestMsg
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ProviderKey != "jenkins" || got.ResponderID != "replica-uuid-42" || got.Headers["X-Foo"] != "bar" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+func TestConnectionStatusMsgRoundtrip(t *testing.T) {
+	orig := proto.ConnectionStatusMsg{
+		Type: "connection_status",
+		Plugins: []proto.PluginStatus{
+			{ProviderKey: "jenkins", Status: "configured_connected", LastTestedAt: "2026-09-14T00:00:00Z"},
+			{ProviderKey: "prom", Status: "not_configured"},
+		},
+	}
+	b, _ := json.Marshal(orig)
+	var got proto.ConnectionStatusMsg
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Plugins) != 2 || got.Plugins[0].Status != "configured_connected" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}

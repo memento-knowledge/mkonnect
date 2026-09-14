@@ -46,3 +46,12 @@ func (r *Registry) Get(name string) (string, bool) {
 	v, ok := r.plugins[name]
 	return v, ok
 }
+
+// Plugins returns all known plugin names (from env-var configuration).
+func (r *Registry) Plugins() []string {
+	names := make([]string, 0, len(r.plugins))
+	for k := range r.plugins {
+		names = append(names, k)
+	}
+	return names
+}

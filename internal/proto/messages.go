@@ -93,3 +93,66 @@ type ResponseMsg struct {
 	StatusCode int    `json:"status_code"`
 	Body       []byte `json:"body,omitempty"`
 }
+
+// HTTPRequestMsg is an inbound proxied HTTP request delivered by the gateway.
+// ProviderKey identifies which plugin backend to forward to.
+// ResponderID is the UUID of the platform worker replica that sent this request and must be
+// echoed back verbatim in the matching HTTPResponseMsg — the bridge gateway uses it as the
+// SQS MessageGroupId so the response routes to the correct replica. Omitting it causes the
+// platform to silently drop the response and time out after 30 s.
+// Body is plain UTF-8 text (or nil), NOT base64 — use *string, not []byte.
+type HTTPRequestMsg struct {
+	Type        string            `json:"type"`
+	RequestID   string            `json:"request_id"`
+	ResponderID string            `json:"responder_id"`
+	ProviderKey string            `json:"provider_key"`
+	Method      string            `json:"method"`
+	Path        string            `json:"path"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        *string           `json:"body"`
+}
+
+// HTTPResponseMsg is the outbound reply to an HTTPRequestMsg.
+// ResponderID must be copied verbatim from the matching HTTPRequestMsg.
+// Body is plain UTF-8 text (or nil), NOT base64.
+type HTTPResponseMsg struct {
+	Type        string            `json:"type"`
+	RequestID   string            `json:"request_id"`
+	ResponderID string            `json:"responder_id"`
+	StatusCode  int               `json:"status_code"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        *string           `json:"body"`
+}
+
+// PluginStatus reports the connection state of one plugin as known to the connector.
+type PluginStatus struct {
+	ProviderKey  string `json:"provider_key"`
+	Status       string `json:"status"` // "configured_connected" | "configured_error" | "not_configured"
+	LastTestedAt string `json:"last_tested_at,omitempty"`
+	ErrorDetail  string `json:"error_detail,omitempty"`
+}
+
+// ConnectionStatusMsg is emitted by the connector on connect, config change, and heartbeat.
+type ConnectionStatusMsg struct {
+	Type    string         `json:"type"` // "connection_status"
+	Plugins []PluginStatus `json:"plugins"`
+}
+
+// StatusRequestMsg is sent by the platform to request an immediate ConnectionStatusMsg push.
+type StatusRequestMsg struct {
+	Type string `json:"type"` // "status_request"
+}
+
+// TestConnectionMsg is sent by the platform to trigger a live connectivity test for one plugin.
+type TestConnectionMsg struct {
+	Type        string `json:"type"` // "test_connection"
+	ProviderKey string `json:"provider_key"`
+}
+
+// TestResultMsg is the connector's reply after running a connectivity test.
+type TestResultMsg struct {
+	Type        string `json:"type"` // "test_result"
+	ProviderKey string `json:"provider_key"`
+	Status      string `json:"status"` // "connected" | "auth_failure" | "unreachable" | "timeout"
+	Diagnostic  string `json:"diagnostic,omitempty"`
+}
