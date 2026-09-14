@@ -267,17 +267,16 @@ func TestCredentialsNeverInHTTPResponseMsg(t *testing.T) {
 	}
 }
 
-// TestHTTPHandlerPathTraversalBlocked verifies that ".." segments in msg.Path cannot
-// escape the configured base path prefix on the upstream service.
+// TestHTTPHandlerPathTraversalBlocked verifies that ".." segments in msg.Path, including
+// percent-encoded variants (%2e%2e), cannot escape the configured base path prefix.
 func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
-	called := false
+	var calledPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+		calledPath = r.URL.Path
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
 
-	// Base URL includes a path prefix that should confine requests.
 	baseWithPrefix := srv.URL + "/api/v1"
 	reg := newRegistry("svc", baseWithPrefix)
 	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
@@ -289,14 +288,21 @@ func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
 	}
 	h := HTTPHandler(reg, store)
 
-	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
-		ProviderKey: "svc", Method: "GET", Path: "/../../etc/passwd",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	cases := []string{
+		"/../../etc/passwd",   // literal dots
+		"/%2e%2e/etc/passwd",  // percent-encoded single dot-dot
+		"/%2e%2e/%2e%2e/etc",  // double-encoded
 	}
-	if code != 400 {
-		t.Fatalf("expected 400 for traversal attempt, got %d (called upstream: %v)", code, called)
+	for _, p := range cases {
+		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: "GET", Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 400 {
+			t.Fatalf("path %q: expected 400, got %d (upstream saw path: %q)", p, code, calledPath)
+		}
 	}
 }
 

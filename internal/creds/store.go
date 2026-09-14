@@ -3,6 +3,7 @@ package creds
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,8 +34,15 @@ func New(path string) (*Store, error) {
 		}
 		return s, nil
 	}
-	// Correct permissions on an existing file regardless of how it was created.
-	_ = os.Chmod(path, 0600)
+	// Ensure the credentials file is not readable by group or others.
+	// If chmod fails, verify the existing mode is already safe before continuing;
+	// an unreadable-by-others file is acceptable, a world-readable one is not.
+	if err := os.Chmod(path, 0600); err != nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("credentials file %s has unsafe permissions and chmod failed: %w", path, err)
+		}
+	}
 	return s, nil
 }
 

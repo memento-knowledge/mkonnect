@@ -78,15 +78,19 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 		}
 		reqRef.Path = base.Path + reqRef.Path
 		target := base.ResolveReference(reqRef)
+		// Clear RawPath so the outbound request always uses the decoded, normalized path.
+		// Without this, url.Parse preserves encoded segments (e.g. %2e%2e) in RawPath, and
+		// target.String() emits them verbatim — an upstream that decodes %2e%2e to ".."
+		// would then resolve outside the configured prefix even if our check passed.
+		target.RawPath = ""
+		target.Path = path.Clean(target.Path)
 		if target.Host != base.Host {
 			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
 			return 400, body, nil
 		}
 		// Verify the normalized path still starts with the configured base path prefix.
-		// path.Clean collapses ".." so /api/v1/../../admin becomes /admin, which would
-		// escape the configured prefix.
 		if base.Path != "" && base.Path != "/" {
-			if !strings.HasPrefix(path.Clean(target.Path)+"/", strings.TrimRight(base.Path, "/")+"/") {
+			if !strings.HasPrefix(target.Path+"/", strings.TrimRight(base.Path, "/")+"/") {
 				return 400, []byte(`{"error":"path traversal not allowed"}`), nil
 			}
 		}
@@ -183,12 +187,18 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		// under /api/v1/ and doesn't resolve to /jobs on the root.
 		reqRef.Path = base.Path + reqRef.Path
 		target := base.ResolveReference(reqRef)
+		// Clear RawPath so the outbound request always uses the decoded, normalized path.
+		// url.Parse preserves encoded segments (e.g. %2e%2e) in RawPath; target.String()
+		// emits them verbatim, letting an upstream that decodes %2e%2e to ".." escape the
+		// configured prefix even after our traversal check.
+		target.RawPath = ""
+		target.Path = path.Clean(target.Path)
 		if target.Host != base.Host {
 			return 400, nil, errBody(`{"error":"invalid path"}`), nil
 		}
-		// Verify that ".." segments in msg.Path do not escape the configured base path prefix.
+		// Verify that the normalized path still starts with the configured base path prefix.
 		if base.Path != "" && base.Path != "/" {
-			if !strings.HasPrefix(path.Clean(target.Path)+"/", strings.TrimRight(base.Path, "/")+"/") {
+			if !strings.HasPrefix(target.Path+"/", strings.TrimRight(base.Path, "/")+"/") {
 				return 400, nil, errBody(`{"error":"path traversal not allowed"}`), nil
 			}
 		}
