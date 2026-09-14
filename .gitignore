@@ -1,1 +1,3 @@
+# Agent/session working directories — never belong in this public repo.
 .claude/
+docs/superpowers/
