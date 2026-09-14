@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
@@ -66,6 +67,9 @@ func runConfigSet(args []string, w io.Writer) error {
 	}
 	if *baseURL == "" {
 		return errors.New("--base-url is required")
+	}
+	if u, err := url.Parse(*baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("--base-url must be an absolute http or https URL, got %q", *baseURL)
 	}
 	if *auth == "bearer" && *token == "" {
 		return errors.New("--token is required when --auth bearer")

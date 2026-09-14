@@ -4,6 +4,7 @@ package creds
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -23,11 +24,17 @@ type Store struct {
 
 // New loads or creates a credential store at path.
 // If the file does not exist, an empty store is returned (not an error).
+// If the file exists, its permissions are corrected to 0600.
 func New(path string) (*Store, error) {
 	s := &Store{path: path, data: make(map[string]Credential)}
-	if err := s.load(); err != nil && !os.IsNotExist(err) {
-		return nil, err
+	if err := s.load(); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		return s, nil
 	}
+	// Correct permissions on an existing file regardless of how it was created.
+	_ = os.Chmod(path, 0600)
 	return s, nil
 }
 
@@ -90,15 +97,42 @@ func (s *Store) load() error {
 	return nil
 }
 
-// save writes the in-memory map to disk atomically via a .tmp rename. Caller must hold s.mu.
+// save writes the in-memory map to disk atomically via a temp-file rename.
+// Uses os.CreateTemp (O_EXCL, unique name) to prevent symlink attacks, explicitly
+// chmods to 0600 regardless of umask or stale temp-file permissions, and syncs
+// before rename so a crash does not leave a truncated credentials file.
+// Caller must hold s.mu.
 func (s *Store) save() error {
 	data, err := json.MarshalIndent(s.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(s.path), ".credentials-*.tmp")
+	if err != nil {
 		return err
 	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(tmp) //nolint:errcheck
+		}
+	}()
+	if err := os.Chmod(tmp, 0600); err != nil {
+		f.Close() //nolint:errcheck
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close() //nolint:errcheck
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close() //nolint:errcheck
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	ok = true
 	return os.Rename(tmp, s.path)
 }

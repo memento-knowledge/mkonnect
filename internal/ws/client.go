@@ -476,16 +476,18 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		ProviderKey: providerKey,
 	}
 
-	// Determine base URL and auth from creds store, falling back to registry.
-	var baseURL, auth, token string
+	// Resolve base URL: creds store first, then registry (mirrors HTTPHandler).
+	var baseURL, credAuth, credToken string
 	if c.credsStore != nil {
 		if cred, ok := c.credsStore.Get(providerKey); ok {
 			baseURL = cred.BaseURL
-			auth = cred.Auth
-			token = cred.Token
+			credAuth = cred.Auth
+			credToken = cred.Token
 		}
 	}
-
+	if baseURL == "" && c.pluginReg != nil {
+		baseURL, _ = c.pluginReg.Get(providerKey)
+	}
 	if baseURL == "" {
 		result.Status = "unreachable"
 		result.Diagnostic = "not configured"
@@ -499,12 +501,20 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = err.Error()
 		return result
 	}
-	if auth == "bearer" && token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	if credAuth == "bearer" && credToken != "" {
+		req.Header.Set("Authorization", "Bearer "+credToken)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	// Do not follow redirects: a redirect to an auth page (e.g. SSO) would succeed
+	// with a 200 and hide an auth_failure, and following redirects could forward the
+	// bearer token to a third-party host.
+	probeClient := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) || os.IsTimeout(err) {
 			result.Status = "timeout"
@@ -521,7 +531,9 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	case code == 401 || code == 403:
 		result.Status = "auth_failure"
 		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
-	case code >= 200 && code < 400 || code == 404:
+	case code >= 200 && code < 400 || code == 404 || code == 405:
+		// 404: server answered (plugin is reachable, path just doesn't exist at root)
+		// 405: server answered HEAD but doesn't allow it — still reachable
 		result.Status = "connected"
 	default:
 		result.Status = "unreachable"
@@ -575,21 +587,15 @@ func (c *Client) allPluginKeys() []string {
 	return keys
 }
 
-// cachedPluginStatus returns the cached status for a plugin. If no cached result,
-// derives an initial status: configured_connected if a local credential exists,
-// not_configured otherwise.
+// cachedPluginStatus returns the cached probe result for a plugin, or a conservative
+// "not_configured" initial state if no probe has run yet. The platform should send
+// test_connection to obtain the real connectivity status.
 func (c *Client) cachedPluginStatus(key string) proto.PluginStatus {
 	c.statusMu.RLock()
-	if s, ok := c.statusCache[key]; ok {
-		c.statusMu.RUnlock()
-		return s
-	}
+	s, ok := c.statusCache[key]
 	c.statusMu.RUnlock()
-
-	if c.credsStore != nil {
-		if cred, ok := c.credsStore.Get(key); ok && cred.BaseURL != "" {
-			return proto.PluginStatus{ProviderKey: key, Status: "configured_connected"}
-		}
+	if ok {
+		return s
 	}
 	return proto.PluginStatus{ProviderKey: key, Status: "not_configured"}
 }

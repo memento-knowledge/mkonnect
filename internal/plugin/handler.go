@@ -8,12 +8,28 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
+
+// hopByHopHeaders are headers that describe a single transport hop and must not be
+// forwarded to the upstream service. Forwarding Connection/Transfer-Encoding in
+// particular enables HTTP request-smuggling (CL.TE) attacks.
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Proxy-Connection":    true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
 
 // Handler returns a closure that proxies DataMsg requests to the registered plugin services.
 func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (int, []byte, error) {
@@ -65,6 +81,14 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 		if target.Host != base.Host {
 			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
 			return 400, body, nil
+		}
+		// Verify the normalized path still starts with the configured base path prefix.
+		// path.Clean collapses ".." so /api/v1/../../admin becomes /admin, which would
+		// escape the configured prefix.
+		if base.Path != "" && base.Path != "/" {
+			if !strings.HasPrefix(path.Clean(target.Path)+"/", strings.TrimRight(base.Path, "/")+"/") {
+				return 400, []byte(`{"error":"path traversal not allowed"}`), nil
+			}
 		}
 
 		const maxBodyBytes = 32 << 20 // 32 MiB — enforced on both request and response
@@ -162,6 +186,12 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if target.Host != base.Host {
 			return 400, nil, errBody(`{"error":"invalid path"}`), nil
 		}
+		// Verify that ".." segments in msg.Path do not escape the configured base path prefix.
+		if base.Path != "" && base.Path != "/" {
+			if !strings.HasPrefix(path.Clean(target.Path)+"/", strings.TrimRight(base.Path, "/")+"/") {
+				return 400, nil, errBody(`{"error":"path traversal not allowed"}`), nil
+			}
+		}
 
 		const maxBodyBytes = 32 << 20
 
@@ -181,9 +211,12 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 0, nil, nil, fmt.Errorf("build request: %w", err)
 		}
 
-		// Forward inbound headers from the gateway (cloud-side credentials arrive here).
+		// Forward inbound headers from the gateway (cloud-side credentials arrive here),
+		// excluding hop-by-hop headers that must not be forwarded (CL.TE smuggling risk).
 		for k, v := range msg.Headers {
-			req.Header.Set(k, v)
+			if !hopByHopHeaders[http.CanonicalHeaderKey(k)] {
+				req.Header.Set(k, v)
+			}
 		}
 
 		req.Header.Set("Via", "1.1 mkonnect")
