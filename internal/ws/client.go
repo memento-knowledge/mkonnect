@@ -200,6 +200,8 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
+	c.emitConnectionStatus(ctx, conn)
+
 	// Heartbeat: a WebSocket-level ping (waits for a pong; this is what actually detects a
 	// half-open/zombie TCP connection the gateway has stopped reading from — e.g. router.go's
 	// SQS-init-failure path returns without ever reading again, so only a pong-requiring ping
@@ -224,12 +226,30 @@ func (c *Client) Connect(ctx context.Context) error {
 				if pingErr == nil {
 					healthErr = c.writeMsg(tickCtx, conn, proto.HealthMsg{Type: "health"})
 				}
+				var statusErr error
+				if pingErr == nil && healthErr == nil {
+					statusErr = c.writeMsg(tickCtx, conn, c.buildConnectionStatus())
+				}
 				cancel()
-				if pingErr != nil || healthErr != nil {
-					slog.Warn("heartbeat failed, closing connection", "ping_err", pingErr, "health_err", healthErr)
+				if pingErr != nil || healthErr != nil || statusErr != nil {
+					slog.Warn("heartbeat failed, closing connection",
+						"ping_err", pingErr, "health_err", healthErr, "status_err", statusErr)
 					conn.CloseNow() //nolint:errcheck
 					return
 				}
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-c.statusCh:
+				pushCtx, cancel := context.WithTimeout(heartbeatCtx, 10*time.Second)
+				c.emitConnectionStatus(pushCtx, conn)
+				cancel()
 			}
 		}
 	}()
@@ -412,6 +432,65 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
+	}
+}
+
+// allPluginKeys returns the union of plugin names from the registry and the creds store.
+func (c *Client) allPluginKeys() []string {
+	seen := make(map[string]struct{})
+	var keys []string
+	if c.pluginReg != nil {
+		for _, k := range c.pluginReg.Plugins() {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
+		}
+	}
+	if c.credsStore != nil {
+		for k := range c.credsStore.List() {
+			if _, ok := seen[k]; !ok {
+				seen[k] = struct{}{}
+				keys = append(keys, k)
+			}
+		}
+	}
+	return keys
+}
+
+// cachedPluginStatus returns the cached status for a plugin. If no cached result,
+// derives an initial status: configured_connected if a local credential exists,
+// not_configured otherwise.
+func (c *Client) cachedPluginStatus(key string) proto.PluginStatus {
+	c.statusMu.RLock()
+	if s, ok := c.statusCache[key]; ok {
+		c.statusMu.RUnlock()
+		return s
+	}
+	c.statusMu.RUnlock()
+
+	if c.credsStore != nil {
+		if cred, ok := c.credsStore.Get(key); ok && cred.BaseURL != "" {
+			return proto.PluginStatus{ProviderKey: key, Status: "configured_connected"}
+		}
+	}
+	return proto.PluginStatus{ProviderKey: key, Status: "not_configured"}
+}
+
+// buildConnectionStatus assembles the current connection_status message.
+func (c *Client) buildConnectionStatus() proto.ConnectionStatusMsg {
+	keys := c.allPluginKeys()
+	plugins := make([]proto.PluginStatus, 0, len(keys))
+	for _, k := range keys {
+		plugins = append(plugins, c.cachedPluginStatus(k))
+	}
+	return proto.ConnectionStatusMsg{Type: "connection_status", Plugins: plugins}
+}
+
+// emitConnectionStatus writes the current connection_status to conn.
+func (c *Client) emitConnectionStatus(ctx context.Context, conn *websocket.Conn) {
+	if err := c.writeMsg(ctx, conn, c.buildConnectionStatus()); err != nil {
+		slog.Warn("failed to send connection_status", "err", err)
 	}
 }
 

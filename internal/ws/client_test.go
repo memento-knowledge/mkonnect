@@ -507,9 +507,23 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 			t.Errorf("write data: %v", err)
 			return
 		}
-		if err := wsjson.Read(r.Context(), conn, &receivedResponse); err != nil {
-			t.Errorf("read response: %v", err)
-			return
+		// Read messages until we see the "response" (connector also sends connection_status).
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				t.Errorf("read response: %v", err)
+				return
+			}
+			var tm proto.TypedMessage
+			if err := json.Unmarshal(raw, &tm); err != nil {
+				continue
+			}
+			if tm.Type == "response" {
+				if err := json.Unmarshal(raw, &receivedResponse); err != nil {
+					t.Errorf("unmarshal response: %v", err)
+				}
+				break
+			}
 		}
 		close(responseReceived)
 		_, _, _ = conn.Read(r.Context())
@@ -594,21 +608,25 @@ func TestHeartbeatSendsHealthMessage(t *testing.T) {
 			return
 		}
 
-		// The first message the client sends after the handshake should be a heartbeat.
-		var raw json.RawMessage
-		if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
-			t.Errorf("read heartbeat: %v", err)
-			return
+		// The connector emits connection_status right after the handshake, then sends health
+		// messages on the heartbeat tick. Read until we see "health".
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				t.Errorf("read heartbeat: %v", err)
+				return
+			}
+			var typed proto.TypedMessage
+			if err := json.Unmarshal(raw, &typed); err != nil {
+				t.Errorf("unmarshal heartbeat type: %v", err)
+				return
+			}
+			if typed.Type == "health" {
+				close(healthReceived)
+				break
+			}
+			// Skip connection_status and any other interleaved messages.
 		}
-		var typed proto.TypedMessage
-		if err := json.Unmarshal(raw, &typed); err != nil {
-			t.Errorf("unmarshal heartbeat type: %v", err)
-			return
-		}
-		if typed.Type != "health" {
-			t.Errorf("first post-handshake message type = %q, want %q", typed.Type, "health")
-		}
-		close(healthReceived)
 
 		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "going_away"}); err != nil {
 			t.Errorf("write going_away: %v", err)
@@ -697,9 +715,23 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 			return
 		}
 
-		if err := wsjson.Read(r.Context(), conn, &receivedResponse); err != nil {
-			t.Errorf("read response: %v", err)
-			return
+		// Read messages until we see "response" (connector may also send connection_status).
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				t.Errorf("read response: %v", err)
+				return
+			}
+			var tm proto.TypedMessage
+			if err := json.Unmarshal(raw, &tm); err != nil {
+				continue
+			}
+			if tm.Type == "response" {
+				if err := json.Unmarshal(raw, &receivedResponse); err != nil {
+					t.Errorf("unmarshal response: %v", err)
+				}
+				break
+			}
 		}
 		close(responseReceived)
 		_, _, _ = conn.Read(r.Context())
@@ -842,6 +874,111 @@ func TestRunLoopDispatchesHTTPRequest(t *testing.T) {
 	}
 	if gotResponse.StatusCode != 200 {
 		t.Fatalf("expected status 200, got %d", gotResponse.StatusCode)
+	}
+}
+
+// TestConnectionStatusEmittedOnConnect verifies that the connector sends a connection_status
+// message after the handshake, and that a credential stored in the creds store appears in
+// the plugins list.
+func TestConnectionStatusEmittedOnConnect(t *testing.T) {
+	store, err := creds.New(t.TempDir() + "/credentials.json")
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "tok"}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	var gotStatus proto.ConnectionStatusMsg
+	done := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+
+		// Read messages until we see connection_status
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				return
+			}
+			var tm proto.TypedMessage
+			if err := json.Unmarshal(raw, &tm); err != nil {
+				continue
+			}
+			if tm.Type == "connection_status" {
+				if err := json.Unmarshal(raw, &gotStatus); err != nil {
+					t.Logf("unmarshal connection_status: %v", err)
+				}
+				close(done)
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	reg, err := plugin.Load(&config.Config{})
+	if err != nil {
+		t.Fatalf("plugin.Load: %v", err)
+	}
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+	client.SetCredsStore(store)
+	client.SetPluginRegistry(reg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go client.Connect(ctx) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for connection_status")
+	}
+	cancel()
+
+	if gotStatus.Type != "connection_status" {
+		t.Fatalf("unexpected type: %q", gotStatus.Type)
+	}
+	// Jenkins is in creds store → should appear in the plugin list
+	found := false
+	for _, p := range gotStatus.Plugins {
+		if p.ProviderKey == "jenkins" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected jenkins in connection_status plugins, got %+v", gotStatus.Plugins)
 	}
 }
 
