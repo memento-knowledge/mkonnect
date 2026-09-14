@@ -151,8 +151,8 @@ type TestConnectionMsg struct {
 
 // TestResultMsg is the connector's reply after running a connectivity test.
 type TestResultMsg struct {
-	Type       string `json:"type"` // "test_result"
+	Type        string `json:"type"` // "test_result"
 	ProviderKey string `json:"provider_key"`
 	Status      string `json:"status"` // "connected" | "auth_failure" | "unreachable" | "timeout"
-	Diagnostic string `json:"diagnostic,omitempty"`
+	Diagnostic  string `json:"diagnostic,omitempty"`
 }

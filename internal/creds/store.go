@@ -11,7 +11,7 @@ import (
 // Credential holds a plugin's base URL and optional bearer auth.
 type Credential struct {
 	BaseURL string `json:"base_url"`
-	Auth    string `json:"auth,omitempty"`   // "bearer" or ""
+	Auth    string `json:"auth,omitempty"` // "bearer" or ""
 	Token   string `json:"token,omitempty"`
 }
 
