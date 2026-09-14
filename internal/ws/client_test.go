@@ -19,6 +19,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
+	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 	"github.com/memento-knowledge/mkonnect/internal/ws"
 )
@@ -730,6 +732,116 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 	}
 	if receivedResponse.RequestID != "req-1" {
 		t.Errorf("request_id = %q, want %q", receivedResponse.RequestID, "req-1")
+	}
+}
+
+// TestRunLoopDispatchesHTTPRequest verifies that an inbound http_request message is
+// forwarded to the HTTPPluginHandler and the http_response is sent back with the correct
+// request_id and status_code.
+func TestRunLoopDispatchesHTTPRequest(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`pong`)) //nolint:errcheck
+	}))
+	defer upstream.Close()
+
+	store, err := creds.New(t.TempDir() + "/credentials.json")
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("svc", creds.Credential{BaseURL: upstream.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	var gotResponse proto.HTTPResponseMsg
+	done := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+
+		// Send http_request after handshake.
+		if err := wsjson.Write(r.Context(), conn, proto.HTTPRequestMsg{
+			Type: "http_request", RequestID: "r42",
+			ProviderKey: "svc", Method: "GET", Path: "/",
+		}); err != nil {
+			t.Logf("write http_request: %v", err)
+			return
+		}
+		// Read messages until we get http_response.
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				return
+			}
+			var tm proto.TypedMessage
+			if err := json.Unmarshal(raw, &tm); err != nil {
+				continue
+			}
+			if tm.Type == "http_response" {
+				if err := json.Unmarshal(raw, &gotResponse); err != nil {
+					t.Logf("unmarshal http_response: %v", err)
+				}
+				close(done)
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	reg, err := plugin.Load(&config.Config{})
+	if err != nil {
+		t.Fatalf("plugin.Load: %v", err)
+	}
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go client.Connect(ctx) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for http_response")
+	}
+	cancel()
+
+	if gotResponse.RequestID != "r42" {
+		t.Fatalf("expected request_id r42, got %q", gotResponse.RequestID)
+	}
+	if gotResponse.StatusCode != 200 {
+		t.Fatalf("expected status 200, got %d", gotResponse.StatusCode)
 	}
 }
 

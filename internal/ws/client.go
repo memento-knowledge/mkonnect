@@ -18,6 +18,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
+	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 	"github.com/memento-knowledge/mkonnect/internal/version"
 )
@@ -34,6 +36,12 @@ type Client struct {
 	workerSem             chan struct{}
 	inFlight              sync.WaitGroup
 	criticalPatchRequired atomic.Bool
+	httpHandler           plugin.HTTPPluginHandler
+	credsStore            *creds.Store
+	pluginReg             *plugin.Registry
+	statusCache           map[string]proto.PluginStatus
+	statusMu              sync.RWMutex
+	statusCh              chan struct{}
 }
 
 // writeMsg serialises v as JSON and writes it to conn under a mutex,
@@ -47,15 +55,41 @@ func (c *Client) writeMsg(ctx context.Context, conn *websocket.Conn, v any) erro
 // NewClient creates a new Client.
 func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 	return &Client{
-		cfg:       cfg,
-		keyStore:  keyStore,
-		workerSem: make(chan struct{}, 4), // 4 workers × 32 MiB max body ≈ 128 MiB, matching the default container memory limit
+		cfg:         cfg,
+		keyStore:    keyStore,
+		workerSem:   make(chan struct{}, 4), // 4 workers × 32 MiB max body ≈ 128 MiB, matching the default container memory limit
+		statusCache: make(map[string]proto.PluginStatus),
+		statusCh:    make(chan struct{}, 1),
 	}
 }
 
 // SetPluginHandler sets the function that handles inbound DataMsg requests.
 func (c *Client) SetPluginHandler(fn PluginHandler) {
 	c.pluginHandler = fn
+}
+
+// SetHTTPPluginHandler sets the handler for inbound http_request messages.
+func (c *Client) SetHTTPPluginHandler(fn plugin.HTTPPluginHandler) {
+	c.httpHandler = fn
+}
+
+// SetCredsStore provides the credential store used for connection_status and connectivity tests.
+func (c *Client) SetCredsStore(s *creds.Store) {
+	c.credsStore = s
+}
+
+// SetPluginRegistry provides the registry used to enumerate known plugins for connection_status.
+func (c *Client) SetPluginRegistry(r *plugin.Registry) {
+	c.pluginReg = r
+}
+
+// SignalStatusPush queues an immediate connection_status push to the gateway.
+// Safe to call from any goroutine; non-blocking (drops if already pending).
+func (c *Client) SignalStatusPush() {
+	select {
+	case c.statusCh <- struct{}{}:
+	default:
+	}
 }
 
 // Run connects to the gateway and maintains the connection with exponential backoff.
@@ -352,6 +386,29 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				defer func() { <-c.workerSem }()
 				c.handleData(ctx, conn, m)
 			}(msg)
+		case "http_request":
+			var msg proto.HTTPRequestMsg
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				slog.Warn("malformed http_request message", "err", err)
+				continue
+			}
+			select {
+			case c.workerSem <- struct{}{}:
+			default:
+				if err := c.writeMsg(ctx, conn, proto.HTTPResponseMsg{
+					Type: "http_response", RequestID: msg.RequestID,
+					StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
+				}); err != nil {
+					slog.Warn("failed to send 429 http_response", "request_id", msg.RequestID, "err", err)
+				}
+				continue
+			}
+			c.inFlight.Add(1)
+			go func(m proto.HTTPRequestMsg) {
+				defer c.inFlight.Done()
+				defer func() { <-c.workerSem }()
+				c.handleHTTPRequest(ctx, conn, m)
+			}(msg)
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
@@ -371,6 +428,48 @@ func (c *Client) waitForInFlight(timeout time.Duration) {
 	case <-done:
 	case <-time.After(timeout):
 		slog.Warn("timed out waiting for in-flight requests to finish before drain disconnect", "timeout", timeout)
+	}
+}
+
+func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, msg proto.HTTPRequestMsg) {
+	if c.criticalPatchRequired.Load() {
+		resp := proto.HTTPResponseMsg{
+			Type: "http_response", RequestID: msg.RequestID,
+			StatusCode: 503, Body: []byte(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
+		}
+		if err := c.writeMsg(ctx, conn, resp); err != nil {
+			slog.Warn("failed to send critical-patch 503", "request_id", msg.RequestID, "err", err)
+		}
+		return
+	}
+
+	var statusCode int
+	var headers map[string]string
+	var body []byte
+
+	if c.httpHandler != nil {
+		var err error
+		statusCode, headers, body, err = c.httpHandler(ctx, msg)
+		if err != nil {
+			slog.Warn("http_request handler error", "request_id", msg.RequestID, "err", err)
+			if statusCode == 0 {
+				statusCode = 500
+			}
+		}
+	} else {
+		statusCode = 501
+		body = []byte(`{"error":"no http handler configured"}`)
+	}
+
+	resp := proto.HTTPResponseMsg{
+		Type:       "http_response",
+		RequestID:  msg.RequestID,
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       body,
+	}
+	if err := c.writeMsg(ctx, conn, resp); err != nil {
+		slog.Warn("failed to send http_response", "request_id", msg.RequestID, "err", err)
 	}
 }
 
