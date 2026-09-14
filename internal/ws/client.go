@@ -400,9 +400,10 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				c.handleHTTPRequest(ctx, conn, m)
 			}(msg)
 		case "status_request":
-			go func() {
-				c.emitConnectionStatus(ctx, conn)
-			}()
+			// Handled inline (no goroutine): building status is a cache read and the write
+			// is already serialized by writeMu, so spawning a goroutine per request would
+			// only add an unbounded-goroutine vector for a flood of status_requests.
+			c.emitConnectionStatus(ctx, conn)
 
 		case "test_connection":
 			var msg proto.TestConnectionMsg

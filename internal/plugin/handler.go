@@ -49,9 +49,13 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	errBody := func(s string) *string { return &s }
 
 	return func(ctx context.Context, msg proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
+		// Resolve the credential once and reuse it for both base-URL resolution and
+		// Authorization injection below (avoids a second store lock per request).
+		cred, haveCred := store.Get(msg.ProviderKey)
+
 		// Resolve base URL: creds store takes priority over registry.
 		var baseURL string
-		if cred, ok := store.Get(msg.ProviderKey); ok && cred.BaseURL != "" {
+		if haveCred && cred.BaseURL != "" {
 			baseURL = cred.BaseURL
 		} else if u, ok := registry.Get(msg.ProviderKey); ok {
 			baseURL = u
@@ -135,7 +139,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		req.Header.Set("Via", "1.1 mkonnect")
 
 		// Inject local bearer credential if configured (local-side mode).
-		if cred, ok := store.Get(msg.ProviderKey); ok && cred.Auth == "bearer" && cred.Token != "" {
+		if haveCred && cred.Auth == "bearer" && cred.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+cred.Token)
 		}
 
