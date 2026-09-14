@@ -91,8 +91,8 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 }
 
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
-// body, and any transport-level error.
-type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body []byte, err error)
+// body (plain text, nil for empty), and any transport-level error.
+type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
 
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
@@ -106,7 +106,9 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		},
 	}
 
-	return func(ctx context.Context, msg proto.HTTPRequestMsg) (int, map[string]string, []byte, error) {
+	errBody := func(s string) *string { return &s }
+
+	return func(ctx context.Context, msg proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
 		// Resolve base URL: creds store takes priority over registry.
 		var baseURL string
 		if cred, ok := store.Get(msg.ProviderKey); ok && cred.BaseURL != "" {
@@ -114,8 +116,9 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		} else if u, ok := registry.Get(msg.ProviderKey); ok {
 			baseURL = u
 		} else {
-			body, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("provider %q not found", msg.ProviderKey)})
-			return 404, nil, body, nil
+			b, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("provider %q not found", msg.ProviderKey)})
+			s := string(b)
+			return 404, nil, &s, nil
 		}
 
 		// Validate method.
@@ -126,28 +129,36 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		switch method {
 		case "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT":
 		default:
-			body, _ := json.Marshal(map[string]string{"error": "method not allowed"})
-			return 405, nil, body, nil
+			return 405, nil, errBody(`{"error":"method not allowed"}`), nil
 		}
 
 		// Validate path and resolve against base URL.
 		if !strings.HasPrefix(msg.Path, "/") {
-			body, _ := json.Marshal(map[string]string{"error": "path must begin with /"})
-			return 400, nil, body, nil
+			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
 		}
-		base, _ := url.Parse(baseURL)
-		target := base.ResolveReference(&url.URL{Path: msg.Path})
+		base, err := url.Parse(baseURL)
+		if err != nil {
+			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
+		}
+		target := base.ResolveReference(&url.URL{Path: msg.Path, RawQuery: base.RawQuery})
 		if target.Host != base.Host {
-			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
-			return 400, nil, body, nil
+			return 400, nil, errBody(`{"error":"invalid path"}`), nil
 		}
 
 		const maxBodyBytes = 32 << 20
-		if len(msg.Body) > maxBodyBytes {
-			return 413, nil, []byte(`{"error":"request body too large"}`), nil
+
+		// Build the request body reader from the plain-text string field.
+		var reqBodyReader *strings.Reader
+		if msg.Body != nil {
+			if len(*msg.Body) > maxBodyBytes {
+				return 413, nil, errBody(`{"error":"request body too large"}`), nil
+			}
+			reqBodyReader = strings.NewReader(*msg.Body)
+		} else {
+			reqBodyReader = strings.NewReader("")
 		}
 
-		req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(msg.Body))
+		req, err := http.NewRequestWithContext(ctx, method, target.String(), reqBodyReader)
 		if err != nil {
 			return 0, nil, nil, fmt.Errorf("build request: %w", err)
 		}
@@ -169,16 +180,16 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			if ctx.Err() != nil {
 				return 0, nil, nil, ctx.Err()
 			}
-			return 504, nil, []byte(`{"error":"upstream timeout or connection error"}`), err
+			return 504, nil, errBody(`{"error":"upstream timeout or connection error"}`), err
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
-		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		respBytes, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
 		if err != nil {
 			return 0, nil, nil, fmt.Errorf("read response: %w", err)
 		}
-		if len(respBody) > maxBodyBytes {
-			return 413, nil, []byte(`{"error":"upstream response too large"}`), nil
+		if len(respBytes) > maxBodyBytes {
+			return 413, nil, errBody(`{"error":"upstream response too large"}`), nil
 		}
 
 		// Collect response headers (first value per header name).
@@ -189,6 +200,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			}
 		}
 
-		return resp.StatusCode, respHeaders, respBody, nil
+		s := string(respBytes)
+		return resp.StatusCode, respHeaders, &s, nil
 	}
 }

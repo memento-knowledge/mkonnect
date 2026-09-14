@@ -417,9 +417,10 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 			select {
 			case c.workerSem <- struct{}{}:
 			default:
+				s := `{"error":"too many concurrent requests"}`
 				if err := c.writeMsg(ctx, conn, proto.HTTPResponseMsg{
-					Type: "http_response", RequestID: msg.RequestID,
-					StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
+					Type: "http_response", RequestID: msg.RequestID, ResponderID: msg.ResponderID,
+					StatusCode: 429, Body: &s,
 				}); err != nil {
 					slog.Warn("failed to send 429 http_response", "request_id", msg.RequestID, "err", err)
 				}
@@ -618,10 +619,12 @@ func (c *Client) waitForInFlight(timeout time.Duration) {
 }
 
 func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, msg proto.HTTPRequestMsg) {
+	strPtr := func(s string) *string { return &s }
+
 	if c.criticalPatchRequired.Load() {
 		resp := proto.HTTPResponseMsg{
-			Type: "http_response", RequestID: msg.RequestID,
-			StatusCode: 503, Body: []byte(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
+			Type: "http_response", RequestID: msg.RequestID, ResponderID: msg.ResponderID,
+			StatusCode: 503, Body: strPtr(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
 		}
 		if err := c.writeMsg(ctx, conn, resp); err != nil {
 			slog.Warn("failed to send critical-patch 503", "request_id", msg.RequestID, "err", err)
@@ -631,7 +634,7 @@ func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, ms
 
 	var statusCode int
 	var headers map[string]string
-	var body []byte
+	var body *string
 
 	if c.httpHandler != nil {
 		var err error
@@ -644,15 +647,16 @@ func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, ms
 		}
 	} else {
 		statusCode = 501
-		body = []byte(`{"error":"no http handler configured"}`)
+		body = strPtr(`{"error":"no http handler configured"}`)
 	}
 
 	resp := proto.HTTPResponseMsg{
-		Type:       "http_response",
-		RequestID:  msg.RequestID,
-		StatusCode: statusCode,
-		Headers:    headers,
-		Body:       body,
+		Type:        "http_response",
+		RequestID:   msg.RequestID,
+		ResponderID: msg.ResponderID,
+		StatusCode:  statusCode,
+		Headers:     headers,
+		Body:        body,
 	}
 	if err := c.writeMsg(ctx, conn, resp); err != nil {
 		slog.Warn("failed to send http_response", "request_id", msg.RequestID, "err", err)

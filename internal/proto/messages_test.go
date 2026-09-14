@@ -137,14 +137,16 @@ func TestHealthMsgType(t *testing.T) {
 }
 
 func TestHTTPRequestMsgRoundtrip(t *testing.T) {
+	body := `{"q":1}`
 	orig := proto.HTTPRequestMsg{
 		Type:        "http_request",
 		RequestID:   "req-1",
+		ResponderID: "replica-uuid-42",
 		ProviderKey: "jenkins",
 		Method:      "GET",
 		Path:        "/api/json",
 		Headers:     map[string]string{"X-Foo": "bar"},
-		Body:        []byte(`{"q":1}`),
+		Body:        &body,
 	}
 	b, err := json.Marshal(orig)
 	if err != nil {
@@ -154,7 +156,7 @@ func TestHTTPRequestMsgRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.ProviderKey != "jenkins" || got.Headers["X-Foo"] != "bar" {
+	if got.ProviderKey != "jenkins" || got.ResponderID != "replica-uuid-42" || got.Headers["X-Foo"] != "bar" {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 }

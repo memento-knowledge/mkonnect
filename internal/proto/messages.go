@@ -96,23 +96,32 @@ type ResponseMsg struct {
 
 // HTTPRequestMsg is an inbound proxied HTTP request delivered by the gateway.
 // ProviderKey identifies which plugin backend to forward to.
+// ResponderID is the UUID of the platform worker replica that sent this request and must be
+// echoed back verbatim in the matching HTTPResponseMsg — the bridge gateway uses it as the
+// SQS MessageGroupId so the response routes to the correct replica. Omitting it causes the
+// platform to silently drop the response and time out after 30 s.
+// Body is plain UTF-8 text (or nil), NOT base64 — use *string, not []byte.
 type HTTPRequestMsg struct {
 	Type        string            `json:"type"`
 	RequestID   string            `json:"request_id"`
+	ResponderID string            `json:"responder_id"`
 	ProviderKey string            `json:"provider_key"`
 	Method      string            `json:"method"`
 	Path        string            `json:"path"`
 	Headers     map[string]string `json:"headers,omitempty"`
-	Body        []byte            `json:"body,omitempty"`
+	Body        *string           `json:"body"`
 }
 
 // HTTPResponseMsg is the outbound reply to an HTTPRequestMsg.
+// ResponderID must be copied verbatim from the matching HTTPRequestMsg.
+// Body is plain UTF-8 text (or nil), NOT base64.
 type HTTPResponseMsg struct {
-	Type       string            `json:"type"`
-	RequestID  string            `json:"request_id"`
-	StatusCode int               `json:"status_code"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Body       []byte            `json:"body,omitempty"`
+	Type        string            `json:"type"`
+	RequestID   string            `json:"request_id"`
+	ResponderID string            `json:"responder_id"`
+	StatusCode  int               `json:"status_code"`
+	Headers     map[string]string `json:"headers,omitempty"`
+	Body        *string           `json:"body"`
 }
 
 // PluginStatus reports the connection state of one plugin as known to the connector.
