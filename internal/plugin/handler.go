@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/memento-knowledge/mkonnect/internal/creds"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
@@ -86,5 +87,107 @@ func Handler(registry *Registry) func(ctx context.Context, msg proto.DataMsg) (i
 		}
 
 		return resp.StatusCode, respBody, nil
+	}
+}
+
+// HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
+// body, and any transport-level error.
+type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body []byte, err error)
+
+// HTTPHandler returns an HTTPPluginHandler that:
+//  1. Resolves the plugin's base URL from the creds store first, then the registry.
+//  2. Injects an Authorization: Bearer header if a local bearer credential is configured.
+//  3. Forwards the HTTP request and returns status, headers, and body.
+func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	return func(ctx context.Context, msg proto.HTTPRequestMsg) (int, map[string]string, []byte, error) {
+		// Resolve base URL: creds store takes priority over registry.
+		var baseURL string
+		if cred, ok := store.Get(msg.ProviderKey); ok && cred.BaseURL != "" {
+			baseURL = cred.BaseURL
+		} else if u, ok := registry.Get(msg.ProviderKey); ok {
+			baseURL = u
+		} else {
+			body, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("provider %q not found", msg.ProviderKey)})
+			return 404, nil, body, nil
+		}
+
+		// Validate method.
+		method := strings.ToUpper(strings.TrimSpace(msg.Method))
+		if method == "" {
+			method = http.MethodGet
+		}
+		switch method {
+		case "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT":
+		default:
+			body, _ := json.Marshal(map[string]string{"error": "method not allowed"})
+			return 405, nil, body, nil
+		}
+
+		// Validate path and resolve against base URL.
+		if !strings.HasPrefix(msg.Path, "/") {
+			body, _ := json.Marshal(map[string]string{"error": "path must begin with /"})
+			return 400, nil, body, nil
+		}
+		base, _ := url.Parse(baseURL)
+		target := base.ResolveReference(&url.URL{Path: msg.Path})
+		if target.Host != base.Host {
+			body, _ := json.Marshal(map[string]string{"error": "invalid path"})
+			return 400, nil, body, nil
+		}
+
+		const maxBodyBytes = 32 << 20
+		if len(msg.Body) > maxBodyBytes {
+			return 413, nil, []byte(`{"error":"request body too large"}`), nil
+		}
+
+		req, err := http.NewRequestWithContext(ctx, method, target.String(), bytes.NewReader(msg.Body))
+		if err != nil {
+			return 0, nil, nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Via", "1.1 mkonnect")
+
+		// Forward inbound headers from the gateway (cloud-side credentials arrive here).
+		for k, v := range msg.Headers {
+			req.Header.Set(k, v)
+		}
+
+		// Inject local bearer credential if configured (local-side mode).
+		if cred, ok := store.Get(msg.ProviderKey); ok && cred.Auth == "bearer" && cred.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+cred.Token)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, nil, nil, ctx.Err()
+			}
+			return 504, nil, []byte(`{"error":"upstream timeout or connection error"}`), err
+		}
+		defer resp.Body.Close() //nolint:errcheck
+
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+		if err != nil {
+			return 0, nil, nil, fmt.Errorf("read response: %w", err)
+		}
+		if len(respBody) > maxBodyBytes {
+			return 413, nil, []byte(`{"error":"upstream response too large"}`), nil
+		}
+
+		// Collect response headers (first value per header name).
+		respHeaders := make(map[string]string, len(resp.Header))
+		for k, vs := range resp.Header {
+			if len(vs) > 0 {
+				respHeaders[k] = vs[0]
+			}
+		}
+
+		return resp.StatusCode, respHeaders, respBody, nil
 	}
 }
