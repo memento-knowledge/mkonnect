@@ -151,12 +151,13 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if err != nil {
 			return 0, nil, nil, fmt.Errorf("build request: %w", err)
 		}
-		req.Header.Set("Via", "1.1 mkonnect")
 
 		// Forward inbound headers from the gateway (cloud-side credentials arrive here).
 		for k, v := range msg.Headers {
 			req.Header.Set(k, v)
 		}
+
+		req.Header.Set("Via", "1.1 mkonnect")
 
 		// Inject local bearer credential if configured (local-side mode).
 		if cred, ok := store.Get(msg.ProviderKey); ok && cred.Auth == "bearer" && cred.Token != "" {
