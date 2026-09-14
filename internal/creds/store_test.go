@@ -28,8 +28,13 @@ func TestStoreSetAndGet(t *testing.T) {
 
 func TestStorePersistsAcrossReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
-	s, _ := creds.New(path)
-	_ = s.Set("prom", creds.Credential{BaseURL: "http://prom:9090"})
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("prom", creds.Credential{BaseURL: "http://prom:9090"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
 	s2, err := creds.New(path)
 	if err != nil {
@@ -43,8 +48,13 @@ func TestStorePersistsAcrossReload(t *testing.T) {
 
 func TestStoreRemove(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
-	s, _ := creds.New(path)
-	_ = s.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080"})
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 	if err := s.Remove("jenkins"); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
@@ -55,12 +65,22 @@ func TestStoreRemove(t *testing.T) {
 
 func TestStoreReload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
-	s, _ := creds.New(path)
-	_ = s.Set("a", creds.Credential{BaseURL: "http://a:1"})
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("a", creds.Credential{BaseURL: "http://a:1"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
 	// Simulate external write (another CLI invocation)
-	s2, _ := creds.New(path)
-	_ = s2.Set("b", creds.Credential{BaseURL: "http://b:2"})
+	s2, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s2.Set("b", creds.Credential{BaseURL: "http://b:2"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
 
 	if err := s.Reload(); err != nil {
 		t.Fatalf("Reload: %v", err)

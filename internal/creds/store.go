@@ -83,6 +83,9 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
+	if m == nil {
+		m = make(map[string]Credential)
+	}
 	s.data = m
 	return nil
 }
