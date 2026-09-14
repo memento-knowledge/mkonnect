@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
@@ -14,6 +15,42 @@ import (
 
 func newRegistry(name, url string) *Registry {
 	return &Registry{plugins: map[string]string{name: url}}
+}
+
+// mustStore returns an empty credential store backed by a temp file.
+func mustStore(t *testing.T) *creds.Store {
+	t.Helper()
+	s, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	return s
+}
+
+func TestHTTPHandlerUpstreamTimeout(t *testing.T) {
+	// Shorten the per-request timeout so the slow upstream trips it quickly.
+	orig := upstreamTimeout
+	upstreamTimeout = 20 * time.Millisecond
+	defer func() { upstreamTimeout = orig }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	reg := newRegistry("slow", srv.URL)
+	h := HTTPHandler(reg, mustStore(t))
+
+	status, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "slow", Method: http.MethodGet, Path: "/",
+	})
+	if err == nil {
+		t.Error("expected a transport error on upstream timeout, got nil")
+	}
+	if status != 504 {
+		t.Errorf("status = %d, want 504", status)
+	}
 }
 
 func TestHTTPHandlerInjectsBearerToken(t *testing.T) {

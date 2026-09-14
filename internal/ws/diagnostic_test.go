@@ -69,6 +69,40 @@ func TestSafeDiagnosticDNSHidesHostname(t *testing.T) {
 	}
 }
 
+// TestSafeDiagnosticAddrErrorHidesAddress covers a net.AddrError (e.g. an invalid port),
+// whose Error() embeds the address — it must not surface via the OpError chain.
+func TestSafeDiagnosticAddrErrorHidesAddress(t *testing.T) {
+	_, doErr := (&http.Client{}).Head("http://jenkins.internal:99999/")
+	if doErr == nil {
+		t.Fatal("expected an invalid-port error, got nil")
+	}
+	diag := ws.SafeDiagnosticForTest(doErr)
+	if strings.Contains(diag, "99999") || strings.Contains(diag, "jenkins.internal") {
+		t.Errorf("diagnostic %q leaks the address from an AddrError", diag)
+	}
+}
+
+// TestSafeDiagnosticTLSHidesHost verifies a TLS verification failure (self-signed cert on
+// an internal service) reports only the class, not the hostname the x509 error carries.
+func TestSafeDiagnosticTLSHidesHost(t *testing.T) {
+	// httptest TLS server presents a cert a default client won't trust.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+
+	_, doErr := (&http.Client{}).Head(srv.URL)
+	if doErr == nil {
+		t.Fatal("expected a TLS verification error, got nil")
+	}
+	diag := ws.SafeDiagnosticForTest(doErr)
+	u, _ := url.Parse(srv.URL)
+	if strings.Contains(diag, u.Host) || strings.Contains(diag, u.Hostname()) {
+		t.Errorf("diagnostic %q leaks the TLS host", diag)
+	}
+	if diag != "TLS certificate verification failed" {
+		t.Errorf("diagnostic = %q, want %q", diag, "TLS certificate verification failed")
+	}
+}
+
 // TestSafeDiagnosticNil confirms a nil error yields an empty diagnostic.
 func TestSafeDiagnosticNil(t *testing.T) {
 	if got := ws.SafeDiagnosticForTest(nil); got != "" {

@@ -34,13 +34,17 @@ var hopByHopHeaders = map[string]bool{
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
 
+// upstreamTimeout bounds a single proxied request to an internal service. It is a var (not a
+// const) so tests can shorten it to exercise the timeout path without a real wait.
+var upstreamTimeout = 10 * time.Second
+
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
 //  2. Injects an Authorization: Bearer header if a local bearer credential is configured.
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: upstreamTimeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},

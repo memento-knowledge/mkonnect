@@ -3,6 +3,7 @@ package ws
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -403,8 +404,12 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 		case "status_request":
 			// Handled inline (no goroutine): building status is a cache read and the write
 			// is already serialized by writeMu, so spawning a goroutine per request would
-			// only add an unbounded-goroutine vector for a flood of status_requests.
-			c.emitConnectionStatus(ctx, conn)
+			// only add an unbounded-goroutine vector for a flood of status_requests. The
+			// 10s bound keeps a stuck write from stalling the read loop (and thus delaying
+			// going_away handling) indefinitely — the heartbeat ping is the backstop.
+			sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			c.emitConnectionStatus(sctx, conn)
+			cancel()
 
 		case "test_connection":
 			var msg proto.TestConnectionMsg
@@ -530,17 +535,21 @@ func safeDiagnostic(err error) string {
 	if errors.As(err, &dnsErr) {
 		return "DNS resolution failed"
 	}
+	// TLS verification failures are common with internal/self-signed certs. Report the
+	// class only — the wrapped x509 error can embed the hostname.
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return "TLS certificate verification failed"
+	}
 	// os.SyscallError (e.g. connect: ECONNREFUSED) stringifies to the errno text alone
 	// ("connection refused", "no route to host") with no address.
 	var syscallErr *os.SyscallError
 	if errors.As(err, &syscallErr) && syscallErr.Err != nil {
 		return syscallErr.Err.Error()
 	}
-	// net.OpError.Error() embeds the address, but its wrapped cause (.Err) does not.
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Err != nil {
-		return opErr.Err.Error()
-	}
+	// Anything else — including *net.OpError and *net.AddrError, whose Error()/wrapped
+	// cause can embed the target address or hostname — collapses to a fixed class. The
+	// address-free causes worth surfacing (errno, DNS, timeout, TLS) are all matched above.
 	return "connection failed"
 }
 

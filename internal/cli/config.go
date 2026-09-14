@@ -96,12 +96,14 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		}
 	}
 
+	// An inline --token is exposed via the process list / shell history regardless of
+	// --auth; warn whenever it's used.
+	if *token != "" {
+		fmt.Fprintln(w, "Warning: --token is visible in the process list and shell history; prefer --token-stdin.")
+	}
 	switch {
 	case *auth == "bearer" && tokenVal == "":
 		return errors.New("a token is required when --auth bearer (use --token-stdin, or --token)")
-	case *auth == "bearer" && *token != "":
-		// Warn but proceed: inline tokens leak into the process list and shell history.
-		fmt.Fprintln(w, "Warning: --token is visible in the process list and shell history; prefer --token-stdin.")
 	case tokenVal != "" && *auth != "bearer":
 		fmt.Fprintf(w, "Warning: a token was provided but --auth is %q; it will be stored but not used.\n", *auth)
 	}
