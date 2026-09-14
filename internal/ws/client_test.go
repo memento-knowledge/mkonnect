@@ -982,6 +982,216 @@ func TestConnectionStatusEmittedOnConnect(t *testing.T) {
 	}
 }
 
+// newFakeGateway is a helper that starts a fake WebSocket gateway server.
+// It performs the registration handshake and then calls afterHandshake with the open conn.
+func newFakeGateway(t *testing.T, afterHandshake func(ctx context.Context, conn *websocket.Conn)) *httptest.Server {
+	t.Helper()
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		ok := gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+		afterHandshake(r.Context(), conn)
+	}))
+}
+
+// readNextOfType reads from conn, skipping any messages not matching wantType.
+func readNextOfType(ctx context.Context, t *testing.T, conn *websocket.Conn, wantType string) json.RawMessage {
+	t.Helper()
+	for {
+		var raw json.RawMessage
+		if err := wsjson.Read(ctx, conn, &raw); err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var tm proto.TypedMessage
+		if err := json.Unmarshal(raw, &tm); err != nil {
+			continue
+		}
+		if tm.Type == wantType {
+			return raw
+		}
+	}
+}
+
+// TestStatusRequestTriggersEmission verifies that a status_request from the gateway
+// causes the connector to reply with a connection_status message.
+func TestStatusRequestTriggersEmission(t *testing.T) {
+	store, err := creds.New(t.TempDir() + "/credentials.json")
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("svc", creds.Credential{BaseURL: "http://svc:9000"}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	var gotStatus proto.ConnectionStatusMsg
+	done := make(chan struct{})
+
+	srv := newFakeGateway(t, func(ctx context.Context, conn *websocket.Conn) {
+		// Drain the initial connection_status emitted right after handshake.
+		readNextOfType(ctx, t, conn, "connection_status")
+
+		// Send status_request.
+		if err := wsjson.Write(ctx, conn, map[string]string{"type": "status_request"}); err != nil {
+			t.Errorf("write status_request: %v", err)
+			return
+		}
+
+		// Expect another connection_status in response.
+		raw := readNextOfType(ctx, t, conn, "connection_status")
+		if err := json.Unmarshal(raw, &gotStatus); err != nil {
+			t.Errorf("unmarshal connection_status: %v", err)
+		}
+		close(done)
+		_, _, _ = conn.Read(ctx)
+	})
+	defer srv.Close()
+
+	reg, err := plugin.Load(&config.Config{})
+	if err != nil {
+		t.Fatalf("plugin.Load: %v", err)
+	}
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+	client.SetCredsStore(store)
+	client.SetPluginRegistry(reg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go client.Connect(ctx) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for connection_status after status_request")
+	}
+
+	if gotStatus.Type != "connection_status" {
+		t.Errorf("type = %q, want connection_status", gotStatus.Type)
+	}
+	found := false
+	for _, p := range gotStatus.Plugins {
+		if p.ProviderKey == "svc" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected svc in plugins, got %+v", gotStatus.Plugins)
+	}
+}
+
+// TestTestConnectionProbesPlugin verifies that a test_connection message triggers a real
+// HTTP probe and produces a test_result followed by a connection_status update.
+func TestTestConnectionProbesPlugin(t *testing.T) {
+	// Start a real upstream HTTP server so the probe actually succeeds.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	store, err := creds.New(t.TempDir() + "/credentials.json")
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("svc", creds.Credential{BaseURL: upstream.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	var gotResult proto.TestResultMsg
+	var gotStatus proto.ConnectionStatusMsg
+	done := make(chan struct{})
+
+	srv := newFakeGateway(t, func(ctx context.Context, conn *websocket.Conn) {
+		// Drain the initial connection_status.
+		readNextOfType(ctx, t, conn, "connection_status")
+
+		// Send test_connection for our plugin.
+		if err := wsjson.Write(ctx, conn, proto.TestConnectionMsg{
+			Type:        "test_connection",
+			ProviderKey: "svc",
+		}); err != nil {
+			t.Errorf("write test_connection: %v", err)
+			return
+		}
+
+		// Expect test_result.
+		rawResult := readNextOfType(ctx, t, conn, "test_result")
+		if err := json.Unmarshal(rawResult, &gotResult); err != nil {
+			t.Errorf("unmarshal test_result: %v", err)
+		}
+
+		// Expect connection_status emitted after the test.
+		rawStatus := readNextOfType(ctx, t, conn, "connection_status")
+		if err := json.Unmarshal(rawStatus, &gotStatus); err != nil {
+			t.Errorf("unmarshal connection_status: %v", err)
+		}
+		close(done)
+		_, _, _ = conn.Read(ctx)
+	})
+	defer srv.Close()
+
+	reg, err := plugin.Load(&config.Config{})
+	if err != nil {
+		t.Fatalf("plugin.Load: %v", err)
+	}
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+	client.SetCredsStore(store)
+	client.SetPluginRegistry(reg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go client.Connect(ctx) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(9 * time.Second):
+		t.Fatal("timed out waiting for test_result and connection_status")
+	}
+
+	if gotResult.Type != "test_result" {
+		t.Errorf("test_result type = %q, want test_result", gotResult.Type)
+	}
+	if gotResult.ProviderKey != "svc" {
+		t.Errorf("provider_key = %q, want svc", gotResult.ProviderKey)
+	}
+	if gotResult.Status != "connected" {
+		t.Errorf("status = %q, want connected (diagnostic: %q)", gotResult.Status, gotResult.Diagnostic)
+	}
+	if gotStatus.Type != "connection_status" {
+		t.Errorf("connection_status type = %q, want connection_status", gotStatus.Type)
+	}
+}
+
 // TestNonceMarshal verifies the Nonce type round-trips through JSON correctly.
 func TestNonceMarshal(t *testing.T) {
 	var n proto.Nonce

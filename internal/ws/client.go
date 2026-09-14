@@ -4,10 +4,12 @@ package ws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -429,10 +431,115 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				defer func() { <-c.workerSem }()
 				c.handleHTTPRequest(ctx, conn, m)
 			}(msg)
+		case "status_request":
+			go func() {
+				c.emitConnectionStatus(ctx, conn)
+			}()
+
+		case "test_connection":
+			var msg proto.TestConnectionMsg
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				slog.Warn("malformed test_connection", "err", err)
+				continue
+			}
+			go func(key string) {
+				probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				result := c.probePlugin(probeCtx, key)
+				c.updatePluginStatus(result)
+				if err := c.writeMsg(ctx, conn, result); err != nil {
+					slog.Warn("failed to send test_result", "err", err)
+				}
+				c.SignalStatusPush()
+			}(msg.ProviderKey)
+
 		default:
 			slog.Debug("ignoring message", "type", typed.Type)
 		}
 	}
+}
+
+// probePlugin performs a real HTTP connectivity test for the given plugin.
+func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.TestResultMsg {
+	result := proto.TestResultMsg{
+		Type:        "test_result",
+		ProviderKey: providerKey,
+	}
+
+	// Determine base URL and auth from creds store, falling back to registry.
+	var baseURL, auth, token string
+	if c.credsStore != nil {
+		if cred, ok := c.credsStore.Get(providerKey); ok {
+			baseURL = cred.BaseURL
+			auth = cred.Auth
+			token = cred.Token
+		}
+	}
+
+	if baseURL == "" {
+		result.Status = "unreachable"
+		result.Diagnostic = "not configured"
+		return result
+	}
+
+	probeURL := strings.TrimRight(baseURL, "/") + "/"
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
+	if err != nil {
+		result.Status = "unreachable"
+		result.Diagnostic = err.Error()
+		return result
+	}
+	if auth == "bearer" && token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || os.IsTimeout(err) {
+			result.Status = "timeout"
+		} else {
+			result.Status = "unreachable"
+		}
+		result.Diagnostic = err.Error()
+		return result
+	}
+	defer resp.Body.Close() //nolint:errcheck
+
+	code := resp.StatusCode
+	switch {
+	case code == 401 || code == 403:
+		result.Status = "auth_failure"
+		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
+	case code >= 200 && code < 400 || code == 404:
+		result.Status = "connected"
+	default:
+		result.Status = "unreachable"
+		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
+	}
+	return result
+}
+
+// updatePluginStatus maps a TestResultMsg to a PluginStatus and stores it in the cache.
+func (c *Client) updatePluginStatus(result proto.TestResultMsg) {
+	var status string
+	switch result.Status {
+	case "connected":
+		status = "configured_connected"
+	case "auth_failure", "unreachable", "timeout":
+		status = "configured_error"
+	default:
+		status = "not_configured"
+	}
+	ps := proto.PluginStatus{
+		ProviderKey:  result.ProviderKey,
+		Status:       status,
+		LastTestedAt: time.Now().UTC().Format(time.RFC3339),
+		ErrorDetail:  result.Diagnostic,
+	}
+	c.statusMu.Lock()
+	c.statusCache[result.ProviderKey] = ps
+	c.statusMu.Unlock()
 }
 
 // allPluginKeys returns the union of plugin names from the registry and the creds store.
