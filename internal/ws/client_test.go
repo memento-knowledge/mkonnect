@@ -461,17 +461,15 @@ func TestDeprecationNoticeIsNonFatal(t *testing.T) {
 }
 
 // TestCriticalPatchRequiredSuspendsDispatch verifies that once the gateway sets
-// critical_patch_required in handshake_ok, inbound "data" messages get a 503 instead of
-// being forwarded to the plugin handler (ADR-063 §7.4). This exercises mkonnect-internal
-// behavior only: a real gateway can't currently deliver "data" or read "response" at all
-// (its inboundAllowlist expects http_response) until #2212 replaces DataMsg/ResponseMsg —
-// see the NOTE on this code path in client.go.
+// critical_patch_required in handshake_ok, inbound http_request messages get a 503
+// http_response instead of being forwarded to the HTTP handler (ADR-063 §7.4), with the
+// responder_id echoed back so the platform can still route the reply.
 func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 	serverKey := genPrivKey(t)
 	keyBytes := make([]byte, mldsa65.PrivateKeySize)
 	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
 
-	var receivedResponse proto.ResponseMsg
+	var receivedResponse proto.HTTPResponseMsg
 	responseReceived := make(chan struct{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -501,13 +499,14 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 			return
 		}
 
-		if err := wsjson.Write(r.Context(), conn, proto.DataMsg{
-			Type: "data", RequestID: "req-1", Plugin: "jenkins", Method: "GET", Path: "/",
+		if err := wsjson.Write(r.Context(), conn, proto.HTTPRequestMsg{
+			Type: "http_request", RequestID: "req-1", ResponderID: "resp-1",
+			ProviderKey: "jenkins", Method: "GET", Path: "/",
 		}); err != nil {
-			t.Errorf("write data: %v", err)
+			t.Errorf("write http_request: %v", err)
 			return
 		}
-		// Read messages until we see the "response" (connector also sends connection_status).
+		// Read messages until we see the http_response (connector also sends connection_status).
 		for {
 			var raw json.RawMessage
 			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
@@ -518,7 +517,7 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 			if err := json.Unmarshal(raw, &tm); err != nil {
 				continue
 			}
-			if tm.Type == "response" {
+			if tm.Type == "http_response" {
 				if err := json.Unmarshal(raw, &receivedResponse); err != nil {
 					t.Errorf("unmarshal response: %v", err)
 				}
@@ -535,10 +534,11 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 	keyStore := auth.NewKeyStore(keyFile)
 	client := ws.NewClient(cfg, keyStore)
 
-	var pluginHandlerCalled atomic.Bool
-	client.SetPluginHandler(func(_ context.Context, _ proto.DataMsg) (int, []byte, error) {
-		pluginHandlerCalled.Store(true)
-		return 200, []byte("ok"), nil
+	var httpHandlerCalled atomic.Bool
+	client.SetHTTPPluginHandler(func(_ context.Context, _ proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
+		httpHandlerCalled.Store(true)
+		body := "ok"
+		return 200, nil, &body, nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -554,14 +554,17 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 	cancel()
 	<-connectDone
 
-	if pluginHandlerCalled.Load() {
-		t.Error("plugin handler was called despite critical_patch_required")
+	if httpHandlerCalled.Load() {
+		t.Error("HTTP handler was called despite critical_patch_required")
 	}
 	if receivedResponse.StatusCode != 503 {
 		t.Errorf("status code = %d, want 503", receivedResponse.StatusCode)
 	}
 	if receivedResponse.RequestID != "req-1" {
 		t.Errorf("request_id = %q, want %q", receivedResponse.RequestID, "req-1")
+	}
+	if receivedResponse.ResponderID != "resp-1" {
+		t.Errorf("responder_id = %q, want %q (must be echoed even on the 503 path)", receivedResponse.ResponderID, "resp-1")
 	}
 }
 
@@ -663,14 +666,14 @@ func TestHeartbeatSendsHealthMessage(t *testing.T) {
 }
 
 // TestGoingAwayDrainsInFlightRequest verifies that a going_away disconnect waits for an
-// in-flight handleData call to finish and write its response before the connection is
-// torn down, instead of dropping it.
+// in-flight handleHTTPRequest call to finish and write its response before the connection
+// is torn down, instead of dropping it.
 func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 	serverKey := genPrivKey(t)
 	keyBytes := make([]byte, mldsa65.PrivateKeySize)
 	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
 
-	var receivedResponse proto.ResponseMsg
+	var receivedResponse proto.HTTPResponseMsg
 	responseReceived := make(chan struct{})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -700,14 +703,15 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 			return
 		}
 
-		// Send a data message, then going_away immediately after — before the plugin
-		// handler (which sleeps briefly) has had a chance to respond. If the drain works,
-		// the response still arrives; if going_away just tore the connection down, this
-		// read would time out or error instead.
-		if err := wsjson.Write(r.Context(), conn, proto.DataMsg{
-			Type: "data", RequestID: "req-1", Plugin: "jenkins", Method: "GET", Path: "/",
+		// Send an http_request, then going_away immediately after — before the handler
+		// (which sleeps briefly) has had a chance to respond. If the drain works, the
+		// response still arrives; if going_away just tore the connection down, this read
+		// would time out or error instead.
+		if err := wsjson.Write(r.Context(), conn, proto.HTTPRequestMsg{
+			Type: "http_request", RequestID: "req-1", ResponderID: "resp-1",
+			ProviderKey: "jenkins", Method: "GET", Path: "/",
 		}); err != nil {
-			t.Errorf("write data: %v", err)
+			t.Errorf("write http_request: %v", err)
 			return
 		}
 		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "going_away"}); err != nil {
@@ -715,7 +719,7 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 			return
 		}
 
-		// Read messages until we see "response" (connector may also send connection_status).
+		// Read until we see http_response (connector may also send connection_status).
 		for {
 			var raw json.RawMessage
 			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
@@ -726,7 +730,7 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 			if err := json.Unmarshal(raw, &tm); err != nil {
 				continue
 			}
-			if tm.Type == "response" {
+			if tm.Type == "http_response" {
 				if err := json.Unmarshal(raw, &receivedResponse); err != nil {
 					t.Errorf("unmarshal response: %v", err)
 				}
@@ -742,9 +746,10 @@ func TestGoingAwayDrainsInFlightRequest(t *testing.T) {
 	cfg := newTestConfig(srv.URL, keyFile)
 	keyStore := auth.NewKeyStore(keyFile)
 	client := ws.NewClient(cfg, keyStore)
-	client.SetPluginHandler(func(_ context.Context, _ proto.DataMsg) (int, []byte, error) {
+	client.SetHTTPPluginHandler(func(_ context.Context, _ proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
 		time.Sleep(100 * time.Millisecond) // simulate a slow downstream call
-		return 200, []byte(`{"ok":true}`), nil
+		body := `{"ok":true}`
+		return 200, nil, &body, nil
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

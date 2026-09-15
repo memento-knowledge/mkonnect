@@ -17,78 +17,39 @@ func newRegistry(name, url string) *Registry {
 	return &Registry{plugins: map[string]string{name: url}}
 }
 
-func TestHandlerRoutesToPlugin(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte(`{"ok":true}`)) //nolint:errcheck
-	}))
-	defer srv.Close()
-
-	reg := newRegistry("test-plugin", srv.URL)
-	h := Handler(reg)
-
-	msg := proto.DataMsg{
-		Plugin: "test-plugin",
-		Method: http.MethodGet,
-		Path:   "/health",
-	}
-
-	status, body, err := h(context.Background(), msg)
+// mustStore returns an empty credential store backed by a temp file.
+func mustStore(t *testing.T) *creds.Store {
+	t.Helper()
+	s, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("creds.New: %v", err)
 	}
-	if status != 200 {
-		t.Fatalf("expected 200, got %d", status)
-	}
-	if !strings.Contains(string(body), "ok") {
-		t.Fatalf("unexpected body: %s", body)
-	}
+	return s
 }
 
-func TestHandlerUnknownPlugin(t *testing.T) {
-	reg := newRegistry("known", "http://localhost:9999")
-	h := Handler(reg)
+func TestHTTPHandlerUpstreamTimeout(t *testing.T) {
+	// Shorten the per-request timeout so the slow upstream trips it quickly.
+	orig := upstreamTimeout
+	upstreamTimeout = 20 * time.Millisecond
+	defer func() { upstreamTimeout = orig }()
 
-	msg := proto.DataMsg{
-		Plugin: "unknown-plugin",
-		Method: http.MethodGet,
-		Path:   "/",
-	}
-
-	status, body, err := h(context.Background(), msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if status != 404 {
-		t.Fatalf("expected 404, got %d", status)
-	}
-	if !strings.Contains(string(body), "not found") {
-		t.Fatalf("unexpected body: %s", body)
-	}
-}
-
-func TestHandlerTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(15 * time.Second)
+		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
 
-	reg := newRegistry("slow-plugin", srv.URL)
-	h := Handler(reg)
+	reg := newRegistry("slow", srv.URL)
+	h := HTTPHandler(reg, mustStore(t))
 
-	msg := proto.DataMsg{
-		Plugin: "slow-plugin",
-		Method: http.MethodGet,
-		Path:   "/",
-	}
-
-	status, _, err := h(context.Background(), msg)
+	status, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "slow", Method: http.MethodGet, Path: "/",
+	})
 	if err == nil {
-		t.Errorf("expected error on timeout, got nil")
+		t.Error("expected a transport error on upstream timeout, got nil")
 	}
 	if status != 504 {
-		t.Errorf("expected status 504, got %d", status)
+		t.Errorf("status = %d, want 504", status)
 	}
 }
 

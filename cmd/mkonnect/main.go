@@ -23,7 +23,7 @@ import (
 func main() {
 	// Handle connector subcommand dispatch before anything else.
 	if len(os.Args) > 1 && os.Args[1] == "connector" {
-		if err := cli.Run(os.Args[2:], os.Stdout); err != nil {
+		if err := cli.Run(os.Args[2:], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "connector: %v\n", err)
 			os.Exit(1)
 		}
@@ -65,7 +65,6 @@ func main() {
 	signal.Notify(sighupCh, syscall.SIGHUP)
 
 	client := ws.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile))
-	client.SetPluginHandler(plugin.Handler(reg))
 	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store))
 	client.SetCredsStore(store)
 	client.SetPluginRegistry(reg)

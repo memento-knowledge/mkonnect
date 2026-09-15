@@ -3,11 +3,13 @@ package ws
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -26,14 +28,10 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/version"
 )
 
-// PluginHandler processes an inbound DataMsg and returns a status code and body.
-type PluginHandler func(context.Context, proto.DataMsg) (statusCode int, body []byte, err error)
-
 // Client connects mkonnect to the Bridge Gateway over WebSocket.
 type Client struct {
 	cfg                   *config.Config
 	keyStore              *auth.KeyStore
-	pluginHandler         PluginHandler
 	writeMu               sync.Mutex
 	workerSem             chan struct{}
 	inFlight              sync.WaitGroup
@@ -63,11 +61,6 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore) *Client {
 		statusCache: make(map[string]proto.PluginStatus),
 		statusCh:    make(chan struct{}, 1),
 	}
-}
-
-// SetPluginHandler sets the function that handles inbound DataMsg requests.
-func (c *Client) SetPluginHandler(fn PluginHandler) {
-	c.pluginHandler = fn
 }
 
 // SetHTTPPluginHandler sets the handler for inbound http_request messages.
@@ -149,7 +142,7 @@ const handshakeTimeout = 30 * time.Second
 // need to observe a heartbeat without waiting 30s of real time.
 var heartbeatInterval = 30 * time.Second
 
-// drainTimeout bounds how long a going_away disconnect waits for in-flight handleData
+// drainTimeout bounds how long a going_away disconnect waits for in-flight request
 // goroutines to finish and write their responses before the connection is torn down.
 const drainTimeout = 10 * time.Second
 
@@ -362,7 +355,7 @@ func (c *Client) readHandshakeResult(ctx context.Context, conn *websocket.Conn, 
 	}
 }
 
-// runLoop reads DataMsg messages and dispatches them to the plugin handler.
+// runLoop reads inbound gateway messages and dispatches them to the appropriate handler.
 func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 	for {
 		var raw json.RawMessage
@@ -384,31 +377,6 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 			slog.Info("gateway is draining for a rolling update, waiting for in-flight requests before disconnecting")
 			c.waitForInFlight(drainTimeout)
 			return nil
-		case "data":
-			var msg proto.DataMsg
-			if err := json.Unmarshal(raw, &msg); err != nil {
-				slog.Warn("malformed data message", "err", err)
-				continue
-			}
-			select {
-			case c.workerSem <- struct{}{}:
-			default:
-				// Backpressure: write 429 synchronously. Spawning a goroutine here
-				// would create unbounded goroutines under load, defeating the semaphore.
-				if err := c.writeMsg(ctx, conn, proto.ResponseMsg{
-					Type: "response", RequestID: msg.RequestID,
-					StatusCode: 429, Body: []byte(`{"error":"too many concurrent requests"}`),
-				}); err != nil {
-					slog.Warn("failed to send 429", "request_id", msg.RequestID, "err", err)
-				}
-				continue
-			}
-			c.inFlight.Add(1)
-			go func(m proto.DataMsg) {
-				defer c.inFlight.Done()
-				defer func() { <-c.workerSem }()
-				c.handleData(ctx, conn, m)
-			}(msg)
 		case "http_request":
 			var msg proto.HTTPRequestMsg
 			if err := json.Unmarshal(raw, &msg); err != nil {
@@ -434,9 +402,14 @@ func (c *Client) runLoop(ctx context.Context, conn *websocket.Conn) error {
 				c.handleHTTPRequest(ctx, conn, m)
 			}(msg)
 		case "status_request":
-			go func() {
-				c.emitConnectionStatus(ctx, conn)
-			}()
+			// Handled inline (no goroutine): building status is a cache read and the write
+			// is already serialized by writeMu, so spawning a goroutine per request would
+			// only add an unbounded-goroutine vector for a flood of status_requests. The
+			// 10s bound keeps a stuck write from stalling the read loop (and thus delaying
+			// going_away handling) indefinitely — the heartbeat ping is the backstop.
+			sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			c.emitConnectionStatus(sctx, conn)
+			cancel()
 
 		case "test_connection":
 			var msg proto.TestConnectionMsg
@@ -499,7 +472,7 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
 	if err != nil {
 		result.Status = "unreachable"
-		result.Diagnostic = err.Error()
+		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
 	if credAuth == "bearer" && credToken != "" {
@@ -522,7 +495,7 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		} else {
 			result.Status = "unreachable"
 		}
-		result.Diagnostic = err.Error()
+		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
 	defer resp.Body.Close() //nolint:errcheck
@@ -541,6 +514,43 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = fmt.Sprintf("HTTP %d", code)
 	}
 	return result
+}
+
+// safeDiagnostic maps a probe error to a short, address-free description safe to send to
+// the platform. Raw net/http error strings embed the target host:port (and DNS errors the
+// hostname), so returning err.Error() verbatim would leak the customer's internal network
+// topology to Memento's cloud via test_result/connection_status — directly against the
+// connector's premise that internal details never leave the network. We surface only the
+// failure class. The status field (connected/auth_failure/unreachable/timeout) already
+// carries the actionable signal.
+func safeDiagnostic(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return "connection timed out"
+	}
+	// DNS errors' Error() includes the hostname being resolved — never surface it.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "DNS resolution failed"
+	}
+	// TLS verification failures are common with internal/self-signed certs. Report the
+	// class only — the wrapped x509 error can embed the hostname.
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return "TLS certificate verification failed"
+	}
+	// os.SyscallError (e.g. connect: ECONNREFUSED) stringifies to the errno text alone
+	// ("connection refused", "no route to host") with no address.
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) && syscallErr.Err != nil {
+		return syscallErr.Err.Error()
+	}
+	// Anything else — including *net.OpError and *net.AddrError, whose Error()/wrapped
+	// cause can embed the target address or hostname — collapses to a fixed class. The
+	// address-free causes worth surfacing (errno, DNS, timeout, TLS) are all matched above.
+	return "connection failed"
 }
 
 // updatePluginStatus maps a TestResultMsg to a PluginStatus and stores it in the cache.
@@ -618,7 +628,7 @@ func (c *Client) emitConnectionStatus(ctx context.Context, conn *websocket.Conn)
 	}
 }
 
-// waitForInFlight blocks until all in-flight handleData goroutines finish (so their
+// waitForInFlight blocks until all in-flight request goroutines finish (so their
 // responses get written while conn is still open) or timeout elapses, whichever comes
 // first — a going_away drain should not hang indefinitely on a stuck downstream call.
 func (c *Client) waitForInFlight(timeout time.Duration) {
@@ -676,51 +686,5 @@ func (c *Client) handleHTTPRequest(ctx context.Context, conn *websocket.Conn, ms
 	}
 	if err := c.writeMsg(ctx, conn, resp); err != nil {
 		slog.Warn("failed to send http_response", "request_id", msg.RequestID, "err", err)
-	}
-}
-
-func (c *Client) handleData(ctx context.Context, conn *websocket.Conn, msg proto.DataMsg) {
-	if c.criticalPatchRequired.Load() {
-		// NOTE: this 503 path is presently unreachable against the real gateway — the
-		// gateway forwards "data"/DataMsg-shaped traffic nowhere (its inboundAllowlist
-		// expects http_response, not response) until #2212 replaces DataMsg/ResponseMsg
-		// with http_request/http_response. The flag and gate are still correct and
-		// reusable as-is; #2212 should keep this check and just change the response shape
-		// to match spec §7.4's tool_unavailable.
-		resp := proto.ResponseMsg{
-			Type: "response", RequestID: msg.RequestID,
-			StatusCode: 503, Body: []byte(`{"error":"connector has suspended tool dispatch pending a critical security update"}`),
-		}
-		if err := c.writeMsg(ctx, conn, resp); err != nil {
-			slog.Warn("failed to send critical-patch 503", "request_id", msg.RequestID, "err", err)
-		}
-		return
-	}
-
-	var statusCode int
-	var body []byte
-
-	if c.pluginHandler != nil {
-		var err error
-		statusCode, body, err = c.pluginHandler(ctx, msg)
-		if err != nil {
-			slog.Warn("plugin handler error", "request_id", msg.RequestID, "err", err)
-			if statusCode == 0 {
-				statusCode = 500
-			}
-		}
-	} else {
-		statusCode = 501
-		body = []byte(`{"error":"no plugin handler configured"}`)
-	}
-
-	resp := proto.ResponseMsg{
-		Type:       "response",
-		RequestID:  msg.RequestID,
-		StatusCode: statusCode,
-		Body:       body,
-	}
-	if err := c.writeMsg(ctx, conn, resp); err != nil {
-		slog.Warn("failed to send response", "request_id", msg.RequestID, "err", err)
 	}
 }

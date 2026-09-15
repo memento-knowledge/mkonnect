@@ -10,3 +10,6 @@ func SetHeartbeatIntervalForTest(d time.Duration) (restore func()) {
 	heartbeatInterval = d
 	return func() { heartbeatInterval = old }
 }
+
+// SafeDiagnosticForTest exposes safeDiagnostic to the external ws_test package.
+func SafeDiagnosticForTest(err error) string { return safeDiagnostic(err) }

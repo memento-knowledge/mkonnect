@@ -76,24 +76,6 @@ type HealthMsg struct {
 	Type string `json:"type"` // "health"
 }
 
-// DataMsg is an inbound request from the platform delivered via the gateway.
-type DataMsg struct {
-	Type      string `json:"type"`
-	RequestID string `json:"request_id"`
-	Plugin    string `json:"plugin"`
-	Method    string `json:"method"`
-	Path      string `json:"path"`
-	Body      []byte `json:"body,omitempty"`
-}
-
-// ResponseMsg is the outbound response to the platform, sent via the gateway.
-type ResponseMsg struct {
-	Type       string `json:"type"`
-	RequestID  string `json:"request_id"`
-	StatusCode int    `json:"status_code"`
-	Body       []byte `json:"body,omitempty"`
-}
-
 // HTTPRequestMsg is an inbound proxied HTTP request delivered by the gateway.
 // ProviderKey identifies which plugin backend to forward to.
 // ResponderID is the UUID of the platform worker replica that sent this request and must be

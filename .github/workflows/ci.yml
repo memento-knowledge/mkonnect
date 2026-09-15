@@ -26,8 +26,40 @@ jobs:
       - name: Run tests
         run: go test ./... -v -race
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # staticcheck and govulncheck are pinned to the releases built for the Go version
+      # above (go.mod directive `go 1.25.0`). With GOTOOLCHAIN=local, `go run tool@ver`
+      # refuses to build a tool that requires a newer Go than the toolchain, so these pins
+      # must be bumped in lockstep whenever the setup-go version is raised.
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
   build-push:
-    needs: test
+    needs: [test, lint]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
