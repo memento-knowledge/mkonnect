@@ -26,6 +26,12 @@ jobs:
       - name: Run tests
         run: go test ./... -v -race
 
+      - name: Run release metadata tests
+        run: bash scripts/release-metadata_test.sh
+
+      - name: Run ECR Public lookup tests
+        run: bash scripts/ecr-public-image-digest_test.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -58,38 +64,8 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
-  build-push:
-    needs: [test, lint]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
-
-      - name: Login to Public ECR
-        run: |
-          aws ecr-public get-login-password --region us-east-1 | \
-            docker login --username AWS --password-stdin public.ecr.aws
-
-      - name: Build and push Docker image
-        env:
-          ECR_REGISTRY: public.ecr.aws
-          ECR_REPOSITORY: ${{ secrets.ECR_PUBLIC_ALIAS }}/memento-connector
-          IMAGE_TAG_LATEST: latest
-          IMAGE_TAG_SHA: sha-${{ github.sha }}
-        run: |
-          docker build --build-arg VERSION=$IMAGE_TAG_SHA -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_SHA
+      - name: actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
   helm-lint:
     runs-on: ubuntu-latest
@@ -98,6 +74,37 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.18.6
+
+      - name: Run release chart source tests
+        run: bash scripts/release-chart-source_test.sh
+
+      - name: Run release asset bundle tests
+        run: bash scripts/release-asset-bundle_test.sh
 
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build release image
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg VERSION=ci \
+            --build-arg REVISION="$REVISION" \
+            --tag mkonnect:ci \
+            .
+
+      - name: Verify image metadata and health command
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = ci
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$REVISION"
+          docker run --rm mkonnect:ci --health

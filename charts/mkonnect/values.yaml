@@ -1,10 +1,11 @@
 replicaCount: 1
 
 image:
-  # required: set to your published registry, e.g. public.ecr.aws/<alias>/memento-connector
+  # required: set to the published connector registry, e.g. public.ecr.aws/h2a8k0r3/memento-connector
   repository: ""
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # Set an explicit stable release version in production. Defaults to Chart.appVersion.
+  tag: ""
 
 config:
   gatewayUrl: ""           # required: wss://<customer-slug>.bridge.memento-platform.com/ws

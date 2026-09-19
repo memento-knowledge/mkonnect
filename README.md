@@ -71,6 +71,17 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 
 `<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history.
 
+## Releases
+
+Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. The container image and Helm chart use the same version. Pin deployments to a stable version such as `0.1.0`; never use a moving image tag.
+
+The published artifacts are:
+
+- Container image: `public.ecr.aws/h2a8k0r3/memento-connector:<release-version>`
+- Helm chart: `oci://public.ecr.aws/h2a8k0r3/mkonnect` at chart version `<release-version>`
+
+OCI Helm installation is recommended. If you download the chart from a GitHub Release instead, download its `.sha256` asset too and verify it with `sha256sum -c` before installing the local `.tgz` file.
+
 ## Running
 
 ### Docker
@@ -83,7 +94,7 @@ docker run -d \
   -e PLUGIN_JENKINS=http://jenkins:8080 \
   -v mkonnect-data:/data \
   -e KEY_FILE=/data/key \
-  public.ecr.aws/<alias>/memento-connector:latest
+  public.ecr.aws/h2a8k0r3/memento-connector:0.1.0
 ```
 
 The container image is a distroless, non-root, statically linked binary — see the [Dockerfile](Dockerfile).
@@ -98,9 +109,10 @@ config:
   registrationToken: "<token>"
 EOF
 
-helm install mkonnect charts/mkonnect \
+helm install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+  --version 0.1.0 \
   -f mkonnect-secrets.yaml \
-  --set image.repository=public.ecr.aws/<alias>/memento-connector \
+  --set image.repository=public.ecr.aws/h2a8k0r3/memento-connector \
   --set config.gatewayUrl=wss://<customer-slug>.bridge.memento-platform.com/ws \
   --set config.connectorId=<uuid> \
   --set plugins.jenkins=http://jenkins:8080
@@ -109,6 +121,21 @@ helm install mkonnect charts/mkonnect \
 `registrationToken` is written into a Kubernetes `Secret` (`charts/mkonnect/templates/secret.yaml`) alongside `gatewayUrl` and `connectorId`. Keep `mkonnect-secrets.yaml` out of version control and delete it once the connector has completed its first registration — subsequent reconnects use the persisted ML-DSA-65 key instead.
 
 Note that deleting the local file does *not* remove the token from the cluster: it remains in the deployed `Secret` and in Helm's release metadata. Restrict access to both (RBAC on `secrets` and on `helm get values`/release objects in the target namespace), and if the token is no longer needed, rotate or clear it explicitly via `helm upgrade --set config.registrationToken=""` (or a values file) rather than relying on local file deletion alone.
+
+To upgrade, choose a release version and update the chart and its default image version together:
+
+```bash
+helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+  --version 0.1.1 \
+  --reuse-values
+```
+
+To roll back a failed upgrade, choose the prior Helm revision:
+
+```bash
+helm history mkonnect
+helm rollback mkonnect <revision>
+```
 
 The chart provisions a `PersistentVolumeClaim` so the ML-DSA-65 key survives pod restarts. See [charts/mkonnect/values.yaml](charts/mkonnect/values.yaml) for all options.
 
@@ -128,7 +155,7 @@ gofmt -l .                 # formatting (should print nothing)
 helm lint charts/mkonnect  # lint the chart
 ```
 
-CI (see [.github/workflows/ci.yml](.github/workflows/ci.yml)) runs tests, a lint gate (`gofmt`, `go vet`, `staticcheck`, `govulncheck`), and Helm lint on every push and pull request, and builds/pushes the Docker image to Amazon ECR Public on merges to `main`.
+CI (see [.github/workflows/ci.yml](.github/workflows/ci.yml)) runs tests, a lint gate (`gofmt`, `go vet`, `staticcheck`, `govulncheck`, `actionlint`), and Helm lint on every push and pull request. Versioned artifacts are published only by the [release workflow](.github/workflows/release.yml) when an annotated stable release tag is pushed.
 
 ## Project layout
 

@@ -1,0 +1,336 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Annotated release tag to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: public.ecr.aws
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      release_commit: ${{ steps.metadata.outputs.release_commit }}
+      asset_name: ${{ steps.asset.outputs.asset_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - id: metadata
+        name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          git fetch --force origin main:refs/remotes/origin/main
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git checkout --detach "$RELEASE_TAG^{commit}"
+          bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
+
+      - name: Run release metadata tests
+        run: bash scripts/release-metadata_test.sh
+
+      - name: Run ECR Public lookup tests
+        run: bash scripts/ecr-public-image-digest_test.sh
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.25'
+
+      - name: Run tests
+        run: go test ./... -v -race
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+
+      - name: Run actionlint
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.18.6
+
+      - name: Run release chart source tests
+        run: bash scripts/release-chart-source_test.sh
+
+      - name: Run release asset bundle tests
+        run: bash scripts/release-asset-bundle_test.sh
+
+      - name: Lint and package chart
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          helm lint charts/mkonnect
+          helm package charts/mkonnect --destination dist
+          cd dist
+          sha256sum "mkonnect-$VERSION.tgz" > "mkonnect-$VERSION.tgz.sha256"
+          cd ..
+          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "dist/mkonnect-$VERSION.tgz"
+
+      - id: asset
+        name: Name release asset bundle
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_COMMIT: ${{ steps.metadata.outputs.release_commit }}
+        run: printf 'asset_name=release-assets-%s-%s\n' "$VERSION" "$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.asset.outputs.asset_name }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
+      ASSET_NAME: ${{ needs.verify.outputs.asset_name }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: dist
+
+      - name: Verify uploaded chart bundle
+        run: |
+          cd dist
+          sha256sum -c "mkonnect-$VERSION.tgz.sha256"
+
+      - name: Create or reconcile draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package="mkonnect-$VERSION.tgz"
+          checksum="$package.sha256"
+          release_json=$(mktemp)
+          if gh release view "$RELEASE_TAG" --json isDraft,assets,body >"$release_json" 2>/dev/null; then
+            if [ "$(jq -r '.isDraft' "$release_json")" != true ]; then
+              echo "release $RELEASE_TAG is already published" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes --title "mkonnect $VERSION"
+            gh release view "$RELEASE_TAG" --json isDraft,assets,body >"$release_json"
+          fi
+
+          has_asset() {
+            jq -e --arg name "$1" '.assets | any(.name == $name)' "$release_json" >/dev/null
+          }
+
+          chart_present=false
+          checksum_present=false
+          if has_asset "$package"; then chart_present=true; fi
+          if has_asset "$checksum"; then checksum_present=true; fi
+          canonical="$RUNNER_TEMP/release-assets-$VERSION"
+          rm -rf "$canonical"
+          mkdir -p "$canonical"
+          trap 'rm -f "$release_json"' EXIT
+
+          if "$chart_present"; then
+            gh release download "$RELEASE_TAG" --pattern "$package" --dir "$canonical"
+          fi
+          if "$checksum_present"; then
+            gh release download "$RELEASE_TAG" --pattern "$checksum" --dir "$canonical"
+          fi
+
+          bundle_output="$RUNNER_TEMP/release-asset-bundle-$VERSION.env"
+          bash scripts/release-asset-bundle.sh \
+            --chart-dir charts/mkonnect \
+            --source-package "dist/$package" \
+            --asset-dir "$canonical" \
+            --output "$bundle_output"
+          # shellcheck disable=SC1090
+          source "$bundle_output"
+          if "$chart_upload"; then
+            gh release upload "$RELEASE_TAG" "$canonical/$package"
+          fi
+          if "$checksum_upload"; then
+            gh release upload "$RELEASE_TAG" "$canonical/$checksum"
+          fi
+
+          printf 'CANONICAL_DIR=%s\n' "$canonical" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Validate registry configuration
+        run: |
+          if [ -z "$ECR_PUBLIC_ALIAS" ]; then
+            echo "ECR_PUBLIC_ALIAS repository variable is required" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.18.6
+
+      - name: Log in to Helm registry
+        run: aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws
+
+      - name: Reconcile release image tags
+        run: |
+          set -euo pipefail
+          image="$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/memento-connector"
+          version_tag="$VERSION"
+          commit_tag="sha-$RELEASE_COMMIT"
+
+          lookup_digest() {
+            bash scripts/ecr-public-image-digest.sh --repository memento-connector --tag "$1"
+          }
+
+          verify_labels() {
+            docker pull "$image:$1" >/dev/null
+            version=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
+            revision=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
+            [ "$version" = "$VERSION" ] && [ "$revision" = "$RELEASE_COMMIT" ]
+          }
+
+          if version_digest=$(lookup_digest "$version_tag"); then
+            version_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            version_exists=false
+            version_digest=
+          fi
+          if commit_digest=$(lookup_digest "$commit_tag"); then
+            commit_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            commit_exists=false
+            commit_digest=
+          fi
+
+          if ! "$version_exists" && ! "$commit_exists"; then
+            docker build --build-arg VERSION="$VERSION" --build-arg REVISION="$RELEASE_COMMIT" -t "$image:$version_tag" -t "$image:$commit_tag" .
+            docker push "$image:$version_tag"
+            docker push "$image:$commit_tag"
+          elif "$version_exists" && ! "$commit_exists"; then
+            verify_labels "$version_tag"
+            docker buildx imagetools create --prefer-index=false --tag "$image:$commit_tag" "$image@$version_digest"
+          elif ! "$version_exists" && "$commit_exists"; then
+            verify_labels "$commit_tag"
+            docker buildx imagetools create --prefer-index=false --tag "$image:$version_tag" "$image@$commit_digest"
+          else
+            verify_labels "$version_tag"
+            verify_labels "$commit_tag"
+          fi
+
+          version_digest=$(lookup_digest "$version_tag")
+          commit_digest=$(lookup_digest "$commit_tag")
+          [ -n "$version_digest" ] && [ "$version_digest" = "$commit_digest" ]
+          printf 'IMAGE_DIGEST=%s\nIMAGE=%s\n' "$version_digest" "$image" >> "$GITHUB_ENV"
+
+      - name: Reconcile Helm chart
+        run: |
+          set -euo pipefail
+          package="mkonnect-$VERSION.tgz"
+          checksum="$package.sha256"
+          chart_uri="oci://$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/mkonnect"
+
+          chart_digest() {
+            bash scripts/ecr-public-image-digest.sh --repository mkonnect --tag "$VERSION"
+          }
+
+          if chart_digest >/dev/null; then
+            chart_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            chart_exists=false
+          fi
+          if ! "$chart_exists"; then
+            helm push "$CANONICAL_DIR/$package" "oci://$ECR_REGISTRY/$ECR_PUBLIC_ALIAS"
+          else
+            pulled=$(mktemp -d)
+            trap 'rm -rf "$pulled"' EXIT
+            helm pull "$chart_uri" --version "$VERSION" --destination "$pulled"
+            expected=$(awk '{ print $1 }' "$CANONICAL_DIR/$checksum")
+            actual=$(sha256sum "$pulled/$package" | awk '{ print $1 }')
+            [ "$actual" = "$expected" ]
+          fi
+
+          final_digest=$(chart_digest)
+          [ -n "$final_digest" ]
+          printf 'CHART_DIGEST=%s\nCHART_URI=%s\n' "$final_digest" "$chart_uri" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package="mkonnect-$VERSION.tgz"
+          checksum="$package.sha256"
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --dir "$verify_dir"
+          (cd "$verify_dir" && sha256sum -c "$checksum")
+
+          generated_notes=$(mktemp)
+          gh release view "$RELEASE_TAG" --json body --jq .body >"$generated_notes"
+          notes=$(mktemp)
+          chart_sha=$(awk '{ print $1 }' "$CANONICAL_DIR/$checksum")
+          {
+            printf '%s\n\n' '## Artifacts'
+            printf '%s\n' "- Container image: $IMAGE:$VERSION"
+            printf '%s\n' "- Container image digest: $IMAGE_DIGEST"
+            printf '%s\n' "- Commit image tag: $IMAGE:sha-$RELEASE_COMMIT"
+            printf '%s\n' "- Helm chart: $CHART_URI:$VERSION"
+            printf '%s\n' "- Helm chart digest: $CHART_DIGEST"
+            printf '%s\n\n' "- Chart SHA-256: $chart_sha"
+            printf '%s\n\n' 'Install the chart with:'
+            printf '%s\n\n' "    helm install mkonnect $CHART_URI --version $VERSION -f mkonnect-secrets.yaml --set image.repository=$IMAGE"
+            cat "$generated_notes"
+          } >"$notes"
+          gh release edit "$RELEASE_TAG" --draft=false --notes-file "$notes"
