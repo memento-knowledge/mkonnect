@@ -4,7 +4,7 @@ image:
   # required: set to the published connector registry, e.g. public.ecr.aws/h2a8k0r3/memento-connector
   repository: ""
   pullPolicy: IfNotPresent
-  # Set an explicit stable release version in production. Defaults to Chart.appVersion.
+  # Set an explicit stable release ID in production. Defaults to Chart.appVersion.
   tag: ""
 
 config:

@@ -73,12 +73,14 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 
 ## Releases
 
-Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. The container image and Helm chart use the same version. Pin deployments to a stable version such as `0.1.0`; never use a moving image tag.
+Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. Releases use calendar identifiers such as `20260919.0`: the first release on a date is `.0`, then the index increases without gaps. Pin deployments to an explicit release; never use a moving image tag.
+
+The container image uses the calendar release identifier. Helm requires its own SemVer chart version, and each chart's `appVersion` records the calendar release identifier that supplies its default image tag.
 
 The published artifacts are:
 
-- Container image: `public.ecr.aws/h2a8k0r3/memento-connector:<release-version>`
-- Helm chart: `oci://public.ecr.aws/h2a8k0r3/mkonnect` at chart version `<release-version>`
+- Container image: `public.ecr.aws/h2a8k0r3/memento-connector:<release-id>`
+- Helm chart: `oci://public.ecr.aws/h2a8k0r3/mkonnect` at Helm chart version `<chart-version>`
 
 OCI Helm installation is recommended. If you download the chart from a GitHub Release instead, download its `.sha256` asset too and verify it with `sha256sum -c` before installing the local `.tgz` file.
 
@@ -94,7 +96,7 @@ docker run -d \
   -e PLUGIN_JENKINS=http://jenkins:8080 \
   -v mkonnect-data:/data \
   -e KEY_FILE=/data/key \
-  public.ecr.aws/h2a8k0r3/memento-connector:0.1.0
+  public.ecr.aws/h2a8k0r3/memento-connector:<release-id>
 ```
 
 The container image is a distroless, non-root, statically linked binary — see the [Dockerfile](Dockerfile).
@@ -110,7 +112,7 @@ config:
 EOF
 
 helm install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version 0.1.0 \
+  --version <chart-version> \
   -f mkonnect-secrets.yaml \
   --set image.repository=public.ecr.aws/h2a8k0r3/memento-connector \
   --set config.gatewayUrl=wss://<customer-slug>.bridge.memento-platform.com/ws \
@@ -122,11 +124,11 @@ helm install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
 
 Note that deleting the local file does *not* remove the token from the cluster: it remains in the deployed `Secret` and in Helm's release metadata. Restrict access to both (RBAC on `secrets` and on `helm get values`/release objects in the target namespace), and if the token is no longer needed, rotate or clear it explicitly via `helm upgrade --set config.registrationToken=""` (or a values file) rather than relying on local file deletion alone.
 
-To upgrade, choose a release version and update the chart and its default image version together:
+To upgrade, choose the Helm chart version for the desired calendar release. Its default image tag is the chart's `appVersion`:
 
 ```bash
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version 0.1.1 \
+  --version <chart-version> \
   --reuse-values
 ```
 
