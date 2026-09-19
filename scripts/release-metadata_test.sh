@@ -87,6 +87,14 @@ git -C "$repo" commit -qm "prepare third release"
 git -C "$repo" tag -a 20260919.2 -m "release 20260919.2"
 expect_failure missing-middle-index 20260919.2 main
 
+new_repo oversized-index
+sed -i.bak 's/appVersion: "20260919.0"/appVersion: "20260919.9223372036854775808"/' "$repo/charts/mkonnect/Chart.yaml"
+rm "$repo/charts/mkonnect/Chart.yaml.bak"
+git -C "$repo" add charts/mkonnect/Chart.yaml
+git -C "$repo" commit -qm "prepare oversized release"
+git -C "$repo" tag -a 20260919.9223372036854775808 -m "oversized release"
+expect_failure oversized-index 20260919.9223372036854775808 main
+
 new_repo contiguous-index
 git -C "$repo" tag -a 20260919.0 -m "release 20260919.0"
 sed -i.bak 's/appVersion: "20260919.0"/appVersion: "20260919.1"/' "$repo/charts/mkonnect/Chart.yaml"
@@ -96,10 +104,15 @@ git -C "$repo" commit -qm "prepare second release"
 git -C "$repo" tag -a 20260919.1 -m "release 20260919.1"
 expect_success contiguous-index 20260919.1 main
 
-new_repo higher-index-conflict
-git -C "$repo" tag -a 20260919.1 -m "release 20260919.1"
+new_repo older-release-retry
 git -C "$repo" tag -a 20260919.0 -m "release 20260919.0"
-expect_failure higher-index-conflict 20260919.0 main
+sed -i.bak 's/appVersion: "20260919.0"/appVersion: "20260919.1"/' "$repo/charts/mkonnect/Chart.yaml"
+rm "$repo/charts/mkonnect/Chart.yaml.bak"
+git -C "$repo" add charts/mkonnect/Chart.yaml
+git -C "$repo" commit -qm "prepare later release"
+git -C "$repo" tag -a 20260919.1 -m "release 20260919.1"
+git -C "$repo" checkout -q --detach '20260919.0^{commit}'
+expect_success older-release-retry 20260919.0 main
 
 new_repo side-branch
 git -C "$repo" switch -qc side

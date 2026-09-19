@@ -14,6 +14,32 @@ fail() {
   exit 1
 }
 
+increment_index() {
+  local value=$1
+  local position=$(( ${#value} - 1 ))
+  local carry=1
+  local digit
+  local next_digit
+  local result=
+
+  while ((position >= 0)); do
+    digit=${value:position:1}
+    next_digit=$((10#$digit + carry))
+    if ((next_digit == 10)); then
+      result="0$result"
+      carry=1
+    else
+      result="$next_digit$result"
+      carry=0
+    fi
+    ((position--))
+  done
+  if ((carry == 1)); then
+    result="1$result"
+  fi
+  printf '%s\n' "$result"
+}
+
 repo=
 tag=
 main_ref=
@@ -75,19 +101,20 @@ esac
 ((day_number >= 1 && day_number <= days_in_month)) || fail "tag date is invalid: $tag"
 
 release_day="$year$month$day"
-release_number=$((10#$release_index))
+release_tag_count=0
 while IFS= read -r existing_tag; do
   [[ $existing_tag =~ ^${release_day}[.]([0-9]+)$ ]] || continue
   existing_index=${BASH_REMATCH[1]}
   [[ $existing_index == 0 || $existing_index =~ ^[1-9][0-9]*$ ]] || continue
-  existing_number=$((10#$existing_index))
-  ((existing_number <= release_number)) || fail "release index $existing_index already exists after $tag"
+  release_tag_count=$((release_tag_count + 1))
 done < <(git -C "$repo" for-each-ref --format='%(refname:strip=2)' "refs/tags/$release_day.*")
 
-for ((index = 0; index <= release_number; index++)); do
-  expected_tag="$release_day.$index"
-  git -C "$repo" show-ref --verify --quiet "refs/tags/$expected_tag" || fail "release index $index is missing before $tag"
+expected_index=0
+for ((known_tag = 0; known_tag < release_tag_count; known_tag++)); do
+  expected_tag="$release_day.$expected_index"
+  git -C "$repo" show-ref --verify --quiet "refs/tags/$expected_tag" || fail "release index $expected_index is missing before $tag"
   [[ $(git -C "$repo" cat-file -t "$expected_tag" 2>/dev/null) == tag ]] || fail "release tag must be annotated: $expected_tag"
+  expected_index=$(increment_index "$expected_index")
 done
 
 release_commit=$(git -C "$repo" rev-parse "$tag^{commit}") || fail "tag does not resolve to a commit: $tag"
