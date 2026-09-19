@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
+	"golang.org/x/sys/unix"
 )
 
 func generateKey(t *testing.T) (*mldsa65.PublicKey, *mldsa65.PrivateKey) {
@@ -154,5 +156,46 @@ func TestKeyStoreRejectsKeyReadableByOtherUsers(t *testing.T) {
 
 	if _, _, err := NewKeyStore(path).Load(); err == nil {
 		t.Fatal("expected Load to reject a key readable by group or other users")
+	}
+}
+
+func TestKeyStoreRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "key")
+	_, priv := generateKey(t)
+	var packed [mldsa65.PrivateKeySize]byte
+	priv.Pack(&packed)
+	if err := os.WriteFile(target, packed[:], 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	if _, _, err := NewKeyStore(link).Load(); err == nil {
+		t.Fatal("expected Load to reject a symlink")
+	}
+}
+
+func TestKeyStoreRejectsFIFOWithoutBlocking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	if err := unix.Mkfifo(path, 0600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := NewKeyStore(path).Load()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected Load to reject a FIFO")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Load blocked while opening a FIFO")
 	}
 }
