@@ -890,7 +890,7 @@ func TestConnectionStatusEmittedOnConnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	if err := store.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "tok"}); err != nil {
+	if err := store.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "test-token-value-123"}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
 
@@ -1115,8 +1115,17 @@ func TestStatusRequestTriggersEmission(t *testing.T) {
 // TestTestConnectionProbesPlugin verifies that a test_connection message triggers a real
 // HTTP probe and produces a test_result followed by a connection_status update.
 func TestTestConnectionProbesPlugin(t *testing.T) {
-	// Start a real upstream HTTP server so the probe actually succeeds.
+	const username = "local-user"
+	const token = "basic-token-value-123"
+	expectedAuthorization := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+token))
+
+	// Start a real upstream HTTP server so the probe actually performs the local
+	// Basic authentication configured for this plugin.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expectedAuthorization {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		w.WriteHeader(200)
 	}))
 	defer upstream.Close()
@@ -1125,7 +1134,12 @@ func TestTestConnectionProbesPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	if err := store.Set("svc", creds.Credential{BaseURL: upstream.URL}); err != nil {
+	if err := store.Set("svc", creds.Credential{
+		BaseURL:  upstream.URL,
+		Auth:     "basic",
+		Username: username,
+		Token:    token,
+	}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
 

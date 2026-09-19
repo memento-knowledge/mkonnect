@@ -34,7 +34,10 @@ func Load(_ *config.Config) (*Registry, error) {
 		}
 		u, err := url.Parse(val)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return nil, fmt.Errorf("plugin %s: URL must be an absolute http or https URL, got %q", name, val)
+			return nil, fmt.Errorf("plugin %s: URL must be an absolute http or https URL", name)
+		}
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("plugin %s: URL must not include userinfo, query parameters, or fragments", name)
 		}
 		plugins[name] = val
 	}

@@ -3,17 +3,75 @@ package creds
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"unicode/utf8"
 )
 
-// Credential holds a plugin's base URL and optional bearer auth.
+// MinTokenLength prevents ambiguous, short strings from being used as local
+// credentials or mistaken for ordinary response content.
+const MinTokenLength = 16
+
+// Credential holds a plugin's base URL and optional local HTTP authentication.
 type Credential struct {
-	BaseURL string `json:"base_url"`
-	Auth    string `json:"auth,omitempty"` // "bearer" or ""
-	Token   string `json:"token,omitempty"`
+	BaseURL  string `json:"base_url"`
+	Auth     string `json:"auth,omitempty"` // "bearer", "basic", or ""
+	Username string `json:"username,omitempty"`
+	Token    string `json:"token,omitempty"`
+}
+
+// Validate checks the local authentication fields without including credential
+// values in any returned error.
+func (c Credential) Validate() error {
+	switch c.Auth {
+	case "":
+		if c.Username != "" || c.Token != "" {
+			return errors.New("credentials require an authentication mode")
+		}
+	case "bearer":
+		if c.Username != "" {
+			return errors.New("bearer authentication must not include a username")
+		}
+		if utf8.RuneCountInString(c.Token) < MinTokenLength {
+			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		}
+	case "basic":
+		if c.Username == "" {
+			return errors.New("basic authentication requires a username")
+		}
+		if utf8.RuneCountInString(c.Token) < MinTokenLength {
+			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		}
+	default:
+		return errors.New("unsupported authentication mode")
+	}
+	return nil
+}
+
+// HasAuthorization reports whether this credential has the local fields needed
+// to construct an Authorization header.
+func (c Credential) HasAuthorization() bool {
+	return c.Auth != "" && c.Validate() == nil
+}
+
+// ApplyAuthorization adds this credential's Authorization header to req when its
+// configured authentication mode has all required local credential fields.
+func (c Credential) ApplyAuthorization(req *http.Request) {
+	if !c.HasAuthorization() {
+		return
+	}
+	switch c.Auth {
+	case "bearer":
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	case "basic":
+		if c.Username != "" {
+			req.SetBasicAuth(c.Username, c.Token)
+		}
+	}
 }
 
 // Store is a thread-safe, file-backed map of plugin name → Credential.
@@ -67,6 +125,9 @@ func (s *Store) List() map[string]Credential {
 
 // Set writes or overwrites the credential for plugin and persists to disk.
 func (s *Store) Set(plugin string, cred Credential) error {
+	if err := cred.Validate(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[plugin] = cred
@@ -100,6 +161,11 @@ func (s *Store) load() error {
 	}
 	if m == nil {
 		m = make(map[string]Credential)
+	}
+	for plugin, cred := range m {
+		if err := cred.Validate(); err != nil {
+			return fmt.Errorf("credential %q is invalid: %w", plugin, err)
+		}
 	}
 	s.data = m
 	return nil

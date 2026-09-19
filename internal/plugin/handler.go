@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/httpclient"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
@@ -30,6 +32,93 @@ var hopByHopHeaders = map[string]bool{
 	"Upgrade":             true,
 }
 
+// sensitiveResponseHeaders may carry credentials created or used inside the
+// customer's network. They must not be sent back through the bridge.
+var sensitiveResponseHeaders = map[string]bool{
+	"Authorization":       true,
+	"Cookie":              true,
+	"Proxy-Authorization": true,
+	"Set-Cookie":          true,
+}
+
+const unsafeCredentialResponse = `{"error":"upstream response contains local credentials"}`
+
+// credentialRepresentations returns encoded and complete-authorization forms of
+// local credentials that an upstream service could reflect. A username alone is
+// not included because it is an identifier rather than an authentication secret.
+func credentialRepresentations(cred creds.Credential) []string {
+	if cred.Token == "" {
+		return nil
+	}
+
+	values := []string{cred.Token}
+	appendEncoded := func(value string) {
+		for _, encoded := range []string{
+			url.QueryEscape(value),
+			url.PathEscape(value),
+			base64.StdEncoding.EncodeToString([]byte(value)),
+			base64.RawStdEncoding.EncodeToString([]byte(value)),
+			base64.URLEncoding.EncodeToString([]byte(value)),
+			base64.RawURLEncoding.EncodeToString([]byte(value)),
+		} {
+			if encoded != value {
+				values = append(values, encoded)
+			}
+		}
+	}
+	appendEncoded(cred.Token)
+	switch cred.Auth {
+	case "bearer":
+		authorization := "Bearer " + cred.Token
+		values = append(values, authorization)
+		appendEncoded(authorization)
+	case "basic":
+		if cred.Username != "" {
+			encoded := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Token))
+			raw := cred.Username + ":" + cred.Token
+			authorization := "Basic " + encoded
+			values = append(values, raw, authorization, encoded)
+			appendEncoded(raw)
+			appendEncoded(authorization)
+			appendEncoded(encoded)
+		}
+	}
+	return values
+}
+
+func containsCredentialRepresentation(value string, representations []string) bool {
+	for _, representation := range representations {
+		if strings.Contains(value, representation) {
+			return true
+		}
+	}
+	return false
+}
+
+// responseContainsLocalCredentials checks every response field before it can
+// become a bridge message. An unsafe response is withheld intact rather than
+// applying substring replacements that could corrupt unrelated response data.
+func responseContainsLocalCredentials(headers http.Header, body string, cred creds.Credential) bool {
+	representations := credentialRepresentations(cred)
+	if len(representations) == 0 {
+		return false
+	}
+	if containsCredentialRepresentation(body, representations) {
+		return true
+	}
+	for key, values := range headers {
+		if containsCredentialRepresentation(key, representations) {
+			return true
+		}
+		for _, value := range values {
+			if containsCredentialRepresentation(value, representations) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
@@ -40,11 +129,18 @@ var upstreamTimeout = 10 * time.Second
 
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
-//  2. Injects an Authorization: Bearer header if a local bearer credential is configured.
+//  2. Injects an Authorization header if local credentials are configured.
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
 		Timeout: upstreamTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	directHTTPClient := &http.Client{
+		Timeout:   upstreamTimeout,
+		Transport: httpclient.NewDirectTransport(),
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -86,7 +182,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
 		}
 		base, err := url.Parse(baseURL)
-		if err != nil {
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
 		}
 		// url.Parse correctly splits path and raw query from msg.Path (e.g. "/api?k=v").
@@ -142,12 +238,16 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 
 		req.Header.Set("Via", "1.1 mkonnect")
 
-		// Inject local bearer credential if configured (local-side mode).
-		if haveCred && cred.Auth == "bearer" && cred.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+cred.Token)
+		// Inject local credentials only for this configured plugin. This happens
+		// after bridge headers are copied so the local credential cannot be replaced.
+		client := httpClient
+		useDirectTransport := haveCred && cred.HasAuthorization()
+		if useDirectTransport {
+			cred.ApplyAuthorization(req)
+			client = directHTTPClient
 		}
 
-		resp, err := httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, nil, ctx.Err()
@@ -163,16 +263,19 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if len(respBytes) > maxBodyBytes {
 			return 413, nil, errBody(`{"error":"upstream response too large"}`), nil
 		}
+		body := string(respBytes)
+		if useDirectTransport && responseContainsLocalCredentials(resp.Header, body, cred) {
+			return http.StatusBadGateway, nil, errBody(unsafeCredentialResponse), nil
+		}
 
 		// Collect response headers (first value per header name).
 		respHeaders := make(map[string]string, len(resp.Header))
 		for k, vs := range resp.Header {
-			if len(vs) > 0 {
+			if len(vs) > 0 && !sensitiveResponseHeaders[http.CanonicalHeaderKey(k)] {
 				respHeaders[k] = vs[0]
 			}
 		}
 
-		s := string(respBytes)
-		return resp.StatusCode, respHeaders, &s, nil
+		return resp.StatusCode, respHeaders, &body, nil
 	}
 }

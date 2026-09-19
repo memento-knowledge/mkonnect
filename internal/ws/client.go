@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/httpclient"
 	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 	"github.com/memento-knowledge/mkonnect/internal/version"
@@ -451,12 +453,14 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	}
 
 	// Resolve base URL: creds store first, then registry (mirrors HTTPHandler).
-	var baseURL, credAuth, credToken string
+	var baseURL string
+	var credential creds.Credential
+	var haveCredential bool
 	if c.credsStore != nil {
 		if cred, ok := c.credsStore.Get(providerKey); ok {
 			baseURL = cred.BaseURL
-			credAuth = cred.Auth
-			credToken = cred.Token
+			credential = cred
+			haveCredential = true
 		}
 	}
 	if baseURL == "" && c.pluginReg != nil {
@@ -467,26 +471,36 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = "not configured"
 		return result
 	}
+	base, err := url.Parse(baseURL)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+		result.Status = "unreachable"
+		result.Diagnostic = "invalid base URL"
+		return result
+	}
 
-	probeURL := strings.TrimRight(baseURL, "/") + "/"
+	probeURL := strings.TrimRight(base.String(), "/") + "/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
 	if err != nil {
 		result.Status = "unreachable"
 		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
-	if credAuth == "bearer" && credToken != "" {
-		req.Header.Set("Authorization", "Bearer "+credToken)
+	useDirectTransport := haveCredential && credential.HasAuthorization()
+	if useDirectTransport {
+		credential.ApplyAuthorization(req)
 	}
 
 	// Do not follow redirects: a redirect to an auth page (e.g. SSO) would succeed
 	// with a 200 and hide an auth_failure, and following redirects could forward the
-	// bearer token to a third-party host.
+	// local credentials to a third-party host.
 	probeClient := &http.Client{
 		Timeout: 10 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+	if useDirectTransport {
+		probeClient.Transport = httpclient.NewDirectTransport()
 	}
 	resp, err := probeClient.Do(req)
 	if err != nil {
