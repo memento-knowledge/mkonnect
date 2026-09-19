@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -469,8 +470,14 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = "not configured"
 		return result
 	}
+	base, err := url.Parse(baseURL)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
+		result.Status = "unreachable"
+		result.Diagnostic = "invalid base URL"
+		return result
+	}
 
-	probeURL := strings.TrimRight(baseURL, "/") + "/"
+	probeURL := strings.TrimRight(base.String(), "/") + "/"
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, probeURL, nil)
 	if err != nil {
 		result.Status = "unreachable"

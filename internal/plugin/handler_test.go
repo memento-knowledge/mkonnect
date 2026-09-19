@@ -214,6 +214,31 @@ func TestHTTPHandlerUnknownProviderKey(t *testing.T) {
 	}
 }
 
+func TestHTTPHandlerRejectsCredentialBaseURLWithUserinfo(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	const secret = "api-token"
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{
+		BaseURL: strings.Replace(upstream.URL, "://", "://local-user:"+secret+"@", 1),
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	code, _, body, err := HTTPHandler(newRegistry("svc", upstream.URL), store)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || code != http.StatusInternalServerError {
+		t.Fatalf("code=%d err=%v, want 500 without an error", code, err)
+	}
+	if body != nil && strings.Contains(*body, secret) {
+		t.Fatalf("URL password must not be included in bridge response: %q", *body)
+	}
+}
+
 // TestViaHeaderCannotBeOverwrittenByGateway verifies the security invariant that
 // "Via: 1.1 mkonnect" is set AFTER forwarding gateway headers, so a gateway-supplied
 // Via value cannot overwrite the connector's proxy marker.
@@ -283,7 +308,7 @@ func TestCredentialsNeverInHTTPResponseMsg(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerDoesNotReturnInjectedAuthorizationHeader(t *testing.T) {
+func TestHTTPHandlerRedactsLocalCredentialsFromBridgeResponse(t *testing.T) {
 	tests := []struct {
 		name      string
 		store     func(t *testing.T, url string) *creds.Store
@@ -316,8 +341,14 @@ func TestHTTPHandlerDoesNotReturnInjectedAuthorizationHeader(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Authorization", r.Header.Get("Authorization"))
+				authorization := r.Header.Get("Authorization")
+				username, token, _ := r.BasicAuth()
+				w.Header().Set("Authorization", authorization)
+				w.Header().Set("X-Reflected-Authorization", authorization)
+				w.Header().Set("X-Reflected-Username", username)
+				w.Header().Set("X-Reflected-Token", token)
 				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("authorization=" + authorization + " username=" + username + " token=" + token))
 			}))
 			defer srv.Close()
 

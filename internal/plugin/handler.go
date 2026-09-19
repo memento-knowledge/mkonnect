@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +38,31 @@ var sensitiveResponseHeaders = map[string]bool{
 	"Cookie":              true,
 	"Proxy-Authorization": true,
 	"Set-Cookie":          true,
+}
+
+const redactedCredential = "[redacted]"
+
+// redactLocalCredentials removes values derived from a locally configured
+// credential before a response is sent through the bridge.
+func redactLocalCredentials(value string, cred creds.Credential) string {
+	if cred.Token == "" {
+		return value
+	}
+
+	sensitiveValues := []string{cred.Token}
+	switch cred.Auth {
+	case "bearer":
+		sensitiveValues = append(sensitiveValues, "Bearer "+cred.Token)
+	case "basic":
+		if cred.Username != "" {
+			encoded := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Token))
+			sensitiveValues = append(sensitiveValues, "Basic "+encoded, encoded, cred.Username)
+		}
+	}
+	for _, sensitive := range sensitiveValues {
+		value = strings.ReplaceAll(value, sensitive, redactedCredential)
+	}
+	return value
 }
 
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
@@ -95,7 +121,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
 		}
 		base, err := url.Parse(baseURL)
-		if err != nil {
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
 			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
 		}
 		// url.Parse correctly splits path and raw query from msg.Path (e.g. "/api?k=v").
@@ -178,11 +204,11 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		respHeaders := make(map[string]string, len(resp.Header))
 		for k, vs := range resp.Header {
 			if len(vs) > 0 && !sensitiveResponseHeaders[http.CanonicalHeaderKey(k)] {
-				respHeaders[k] = vs[0]
+				respHeaders[redactLocalCredentials(k, cred)] = redactLocalCredentials(vs[0], cred)
 			}
 		}
 
-		s := string(respBytes)
+		s := redactLocalCredentials(string(respBytes), cred)
 		return resp.StatusCode, respHeaders, &s, nil
 	}
 }

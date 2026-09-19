@@ -113,6 +113,25 @@ func TestConfigSetRejectsInlineTokenWithoutLeakingIt(t *testing.T) {
 	}
 }
 
+func TestConfigSetRejectsBaseURLUserinfoWithoutLeakingIt(t *testing.T) {
+	credsPath := filepath.Join(t.TempDir(), "credentials.json")
+	t.Setenv("CREDS_FILE", credsPath)
+	const secret = "api-token"
+
+	var stdout bytes.Buffer
+	err := cli.Run([]string{"config", "set", "service",
+		"--base-url", "https://local-user:" + secret + "@service.internal"}, noStdin(), &stdout)
+	if err == nil {
+		t.Fatal("expected URL userinfo to be rejected")
+	}
+	if strings.Contains(err.Error(), secret) || strings.Contains(stdout.String(), secret) {
+		t.Fatal("URL password must not be repeated in an error or output")
+	}
+	if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
+		t.Fatalf("credential file was created after rejected URL: %v", err)
+	}
+}
+
 func TestConfigSetTokenStdin(t *testing.T) {
 	dir := t.TempDir()
 	credsPath := filepath.Join(dir, "credentials.json")

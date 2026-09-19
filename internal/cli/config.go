@@ -84,8 +84,12 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if *baseURL == "" {
 		return errors.New("--base-url is required")
 	}
-	if u, err := url.Parse(*baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("--base-url must be an absolute http or https URL, got %q", *baseURL)
+	u, err := url.Parse(*baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("--base-url must be an absolute http or https URL")
+	}
+	if u.User != nil {
+		return errors.New("--base-url must not include userinfo")
 	}
 	switch *auth {
 	case "", "bearer", "basic":
