@@ -113,22 +113,31 @@ func TestConfigSetRejectsInlineTokenWithoutLeakingIt(t *testing.T) {
 	}
 }
 
-func TestConfigSetRejectsBaseURLUserinfoWithoutLeakingIt(t *testing.T) {
-	credsPath := filepath.Join(t.TempDir(), "credentials.json")
-	t.Setenv("CREDS_FILE", credsPath)
+func TestConfigSetRejectsCredentialBearingBaseURLWithoutLeakingIt(t *testing.T) {
 	const secret = "api-token"
+	urls := []string{
+		"https://local-user:" + secret + "@service.internal",
+		"https://service.internal/?access_token=" + secret,
+		"https://service.internal/#access_token=" + secret,
+	}
 
-	var stdout bytes.Buffer
-	err := cli.Run([]string{"config", "set", "service",
-		"--base-url", "https://local-user:" + secret + "@service.internal"}, noStdin(), &stdout)
-	if err == nil {
-		t.Fatal("expected URL userinfo to be rejected")
-	}
-	if strings.Contains(err.Error(), secret) || strings.Contains(stdout.String(), secret) {
-		t.Fatal("URL password must not be repeated in an error or output")
-	}
-	if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
-		t.Fatalf("credential file was created after rejected URL: %v", err)
+	for _, baseURL := range urls {
+		t.Run(baseURL, func(t *testing.T) {
+			credsPath := filepath.Join(t.TempDir(), "credentials.json")
+			t.Setenv("CREDS_FILE", credsPath)
+
+			var stdout bytes.Buffer
+			err := cli.Run([]string{"config", "set", "service", "--base-url", baseURL}, noStdin(), &stdout)
+			if err == nil {
+				t.Fatal("expected credential-bearing URL to be rejected")
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(stdout.String(), secret) {
+				t.Fatal("URL credential must not be repeated in an error or output")
+			}
+			if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
+				t.Fatalf("credential file was created after rejected URL: %v", err)
+			}
+		})
 	}
 }
 

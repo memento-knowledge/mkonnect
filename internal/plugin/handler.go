@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/httpclient"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
@@ -40,29 +41,106 @@ var sensitiveResponseHeaders = map[string]bool{
 	"Set-Cookie":          true,
 }
 
-const redactedCredential = "[redacted]"
+const unsafeCredentialResponse = `{"error":"upstream response contains local credentials"}`
 
-// redactLocalCredentials removes values derived from a locally configured
-// credential before a response is sent through the bridge.
-func redactLocalCredentials(value string, cred creds.Credential) string {
+// credentialRepresentations returns encoded and complete-authorization forms of
+// local credentials that an upstream service could reflect. A username alone is
+// not included because it is an identifier rather than an authentication secret.
+func credentialRepresentations(cred creds.Credential) []string {
 	if cred.Token == "" {
-		return value
+		return nil
 	}
 
-	sensitiveValues := []string{cred.Token}
+	values := make([]string, 0, 16)
+	appendEncoded := func(value string) {
+		for _, encoded := range []string{
+			url.QueryEscape(value),
+			url.PathEscape(value),
+			base64.StdEncoding.EncodeToString([]byte(value)),
+			base64.RawStdEncoding.EncodeToString([]byte(value)),
+			base64.URLEncoding.EncodeToString([]byte(value)),
+			base64.RawURLEncoding.EncodeToString([]byte(value)),
+		} {
+			if encoded != value {
+				values = append(values, encoded)
+			}
+		}
+	}
+	appendEncoded(cred.Token)
 	switch cred.Auth {
 	case "bearer":
-		sensitiveValues = append(sensitiveValues, "Bearer "+cred.Token)
+		authorization := "Bearer " + cred.Token
+		values = append(values, authorization)
+		appendEncoded(authorization)
 	case "basic":
 		if cred.Username != "" {
 			encoded := base64.StdEncoding.EncodeToString([]byte(cred.Username + ":" + cred.Token))
-			sensitiveValues = append(sensitiveValues, "Basic "+encoded, encoded, cred.Username)
+			raw := cred.Username + ":" + cred.Token
+			authorization := "Basic " + encoded
+			values = append(values, raw, authorization, encoded)
+			appendEncoded(raw)
+			appendEncoded(authorization)
+			appendEncoded(encoded)
 		}
 	}
-	for _, sensitive := range sensitiveValues {
-		value = strings.ReplaceAll(value, sensitive, redactedCredential)
+	return values
+}
+
+func isTokenByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '.' || b == '_' || b == '~'
+}
+
+func containsBareToken(value, token string) bool {
+	for start := 0; ; {
+		offset := strings.Index(value[start:], token)
+		if offset < 0 {
+			return false
+		}
+		index := start + offset
+		beforeOK := index == 0 || !isTokenByte(value[index-1])
+		end := index + len(token)
+		afterOK := end == len(value) || !isTokenByte(value[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = end
 	}
-	return value
+}
+
+func containsCredentialRepresentation(value string, token string, representations []string) bool {
+	if containsBareToken(value, token) {
+		return true
+	}
+	for _, representation := range representations {
+		if strings.Contains(value, representation) {
+			return true
+		}
+	}
+	return false
+}
+
+// responseContainsLocalCredentials checks every response field before it can
+// become a bridge message. An unsafe response is withheld intact rather than
+// applying substring replacements that could corrupt unrelated response data.
+func responseContainsLocalCredentials(headers http.Header, body string, cred creds.Credential) bool {
+	representations := credentialRepresentations(cred)
+	if len(representations) == 0 {
+		return false
+	}
+	if containsCredentialRepresentation(body, cred.Token, representations) {
+		return true
+	}
+	for key, values := range headers {
+		if containsCredentialRepresentation(key, cred.Token, representations) {
+			return true
+		}
+		for _, value := range values {
+			if containsCredentialRepresentation(value, cred.Token, representations) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
@@ -79,7 +157,8 @@ var upstreamTimeout = 10 * time.Second
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
-		Timeout: upstreamTimeout,
+		Timeout:   upstreamTimeout,
+		Transport: httpclient.NewDirectTransport(),
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -121,7 +200,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
 		}
 		base, err := url.Parse(baseURL)
-		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
 		}
 		// url.Parse correctly splits path and raw query from msg.Path (e.g. "/api?k=v").
@@ -199,16 +278,19 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if len(respBytes) > maxBodyBytes {
 			return 413, nil, errBody(`{"error":"upstream response too large"}`), nil
 		}
+		body := string(respBytes)
+		if responseContainsLocalCredentials(resp.Header, body, cred) {
+			return http.StatusBadGateway, nil, errBody(unsafeCredentialResponse), nil
+		}
 
 		// Collect response headers (first value per header name).
 		respHeaders := make(map[string]string, len(resp.Header))
 		for k, vs := range resp.Header {
 			if len(vs) > 0 && !sensitiveResponseHeaders[http.CanonicalHeaderKey(k)] {
-				respHeaders[redactLocalCredentials(k, cred)] = redactLocalCredentials(vs[0], cred)
+				respHeaders[k] = vs[0]
 			}
 		}
 
-		s := redactLocalCredentials(string(respBytes), cred)
-		return resp.StatusCode, respHeaders, &s, nil
+		return resp.StatusCode, respHeaders, &body, nil
 	}
 }

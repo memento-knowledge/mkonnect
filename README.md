@@ -43,6 +43,8 @@ A plugin's backend can be defined two ways:
 
 When both define the same plugin name, the credential store wins.
 
+Plugin base URLs cannot include userinfo, query parameters, or fragments. Requests to plugins with local credentials bypass ambient `HTTP_PROXY` and `HTTPS_PROXY` settings. If an upstream response contains a configured credential or a supported encoded form of it, mkonnect returns a `502` instead of sending that response through the bridge.
+
 The `connector` subcommand is built into the same binary, so you run it inside the container:
 
 ```bash

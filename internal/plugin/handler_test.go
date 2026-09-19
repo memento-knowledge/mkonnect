@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -214,28 +218,36 @@ func TestHTTPHandlerUnknownProviderKey(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerRejectsCredentialBaseURLWithUserinfo(t *testing.T) {
+func TestHTTPHandlerRejectsCredentialBearingBaseURL(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
 
 	const secret = "api-token"
-	store := mustStore(t)
-	if err := store.Set("svc", creds.Credential{
-		BaseURL: strings.Replace(upstream.URL, "://", "://local-user:"+secret+"@", 1),
-	}); err != nil {
-		t.Fatalf("store.Set: %v", err)
+	urls := []string{
+		strings.Replace(upstream.URL, "://", "://local-user:"+secret+"@", 1),
+		upstream.URL + "?access_token=" + secret,
+		upstream.URL + "#access_token=" + secret,
 	}
 
-	code, _, body, err := HTTPHandler(newRegistry("svc", upstream.URL), store)(context.Background(), proto.HTTPRequestMsg{
-		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
-	})
-	if err != nil || code != http.StatusInternalServerError {
-		t.Fatalf("code=%d err=%v, want 500 without an error", code, err)
-	}
-	if body != nil && strings.Contains(*body, secret) {
-		t.Fatalf("URL password must not be included in bridge response: %q", *body)
+	for _, baseURL := range urls {
+		t.Run(baseURL, func(t *testing.T) {
+			store := mustStore(t)
+			if err := store.Set("svc", creds.Credential{BaseURL: baseURL}); err != nil {
+				t.Fatalf("store.Set: %v", err)
+			}
+
+			code, _, body, err := HTTPHandler(newRegistry("svc", upstream.URL), store)(context.Background(), proto.HTTPRequestMsg{
+				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+			})
+			if err != nil || code != http.StatusInternalServerError {
+				t.Fatalf("code=%d err=%v, want 500 without an error", code, err)
+			}
+			if body != nil && strings.Contains(*body, secret) {
+				t.Fatalf("URL credential must not be included in bridge response: %q", *body)
+			}
+		})
 	}
 }
 
@@ -308,7 +320,7 @@ func TestCredentialsNeverInHTTPResponseMsg(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerRedactsLocalCredentialsFromBridgeResponse(t *testing.T) {
+func TestHTTPHandlerBlocksBridgeResponseContainingLocalCredentials(t *testing.T) {
 	tests := []struct {
 		name      string
 		store     func(t *testing.T, url string) *creds.Store
@@ -356,8 +368,8 @@ func TestHTTPHandlerRedactsLocalCredentialsFromBridgeResponse(t *testing.T) {
 			code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})
-			if err != nil || code != http.StatusOK {
-				t.Fatalf("code=%d err=%v", code, err)
+			if err != nil || code != http.StatusBadGateway {
+				t.Fatalf("code=%d err=%v, want 502 without an error", code, err)
 			}
 
 			message, err := json.Marshal(proto.HTTPResponseMsg{
@@ -373,6 +385,118 @@ func TestHTTPHandlerRedactsLocalCredentialsFromBridgeResponse(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHTTPHandlerBlocksBridgeResponseContainingEncodedLocalCredential(t *testing.T) {
+	const token = "token/with-slash"
+	authorization := "Bearer " + token
+	escapedAuthorization := url.QueryEscape(authorization)
+	encodedAuthorization := base64.StdEncoding.EncodeToString([]byte(authorization))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Reflected-Authorization", escapedAuthorization)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(encodedAuthorization))
+	}))
+	defer srv.Close()
+
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: token}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || code != http.StatusBadGateway {
+		t.Fatalf("code=%d err=%v, want 502 without an error", code, err)
+	}
+	message, err := json.Marshal(proto.HTTPResponseMsg{Type: "http_response", StatusCode: code, Headers: headers, Body: body})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	for _, value := range []string{token, authorization, escapedAuthorization, encodedAuthorization} {
+		if strings.Contains(string(message), value) {
+			t.Fatalf("encoded local credential leaked into bridge response: %q", value)
+		}
+	}
+}
+
+func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Note", "ordinary response")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":42}`))
+	}))
+	defer srv.Close()
+
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStoreBasicCredential(t, "svc", srv.URL, "id", "1"))
+	code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if headers["X-Note"] != "ordinary response" {
+		t.Fatalf("response header was altered: %q", headers["X-Note"])
+	}
+	if body == nil || *body != `{"id":42}` {
+		t.Fatalf("response body was altered: %v", body)
+	}
+}
+
+func TestHTTPHandlerDoesNotUseAmbientProxy(t *testing.T) {
+	if os.Getenv("MKONNECT_PROXY_TEST_CHILD") == "1" {
+		store := mustStore(t)
+		if err := store.Set("svc", creds.Credential{
+			BaseURL: "http://example.invalid",
+			Auth:    "bearer",
+			Token:   "local-token",
+		}); err != nil {
+			t.Fatalf("store.Set: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		_, _, _, _ = HTTPHandler(newRegistry("svc", "http://example.invalid"), store)(ctx, proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+		})
+		return
+	}
+
+	var proxyCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHTTPHandlerDoesNotUseAmbientProxy$", "-test.v")
+	cmd.Env = proxyTestEnvironment(proxy.URL)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("proxy child failed: %v\n%s", err, output)
+	}
+	if proxyCalls.Load() != 0 {
+		t.Fatal("HTTP handler sent a local credential-bearing request through HTTP_PROXY")
+	}
+}
+
+func proxyTestEnvironment(proxyURL string) []string {
+	env := make([]string, 0, len(os.Environ())+5)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case "ALL_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "MKONNECT_PROXY_TEST_CHILD", "NO_PROXY":
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env,
+		"HTTP_PROXY="+proxyURL,
+		"HTTPS_PROXY=",
+		"ALL_PROXY=",
+		"NO_PROXY=",
+		"MKONNECT_PROXY_TEST_CHILD=1",
+	)
 }
 
 // TestHTTPHandlerPathTraversalBlocked verifies that ".." segments in msg.Path, including

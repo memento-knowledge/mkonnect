@@ -88,8 +88,8 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errors.New("--base-url must be an absolute http or https URL")
 	}
-	if u.User != nil {
-		return errors.New("--base-url must not include userinfo")
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("--base-url must not include userinfo, query parameters, or fragments")
 	}
 	switch *auth {
 	case "", "bearer", "basic":

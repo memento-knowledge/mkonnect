@@ -24,6 +24,7 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/httpclient"
 	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 	"github.com/memento-knowledge/mkonnect/internal/version"
@@ -471,7 +472,7 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		return result
 	}
 	base, err := url.Parse(baseURL)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil {
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		result.Status = "unreachable"
 		result.Diagnostic = "invalid base URL"
 		return result
@@ -492,7 +493,8 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	// with a 200 and hide an auth_failure, and following redirects could forward the
 	// local credentials to a third-party host.
 	probeClient := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout:   10 * time.Second,
+		Transport: httpclient.NewDirectTransport(),
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
