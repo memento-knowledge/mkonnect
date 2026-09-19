@@ -114,6 +114,20 @@ git -C "$repo" tag -a 20260919.1 -m "release 20260919.1"
 git -C "$repo" checkout -q --detach '20260919.0^{commit}'
 expect_success older-release-retry 20260919.0 main
 
+new_repo prior-index-off-main
+git -C "$repo" switch -qc side
+printf 'side branch\n' >"$repo/side"
+git -C "$repo" add side
+git -C "$repo" commit -qm "side release"
+git -C "$repo" tag -a 20260919.0 -m "side release 20260919.0"
+git -C "$repo" switch -q main
+sed -i.bak 's/appVersion: "20260919.0"/appVersion: "20260919.1"/' "$repo/charts/mkonnect/Chart.yaml"
+rm "$repo/charts/mkonnect/Chart.yaml.bak"
+git -C "$repo" add charts/mkonnect/Chart.yaml
+git -C "$repo" commit -qm "prepare main release"
+git -C "$repo" tag -a 20260919.1 -m "main release 20260919.1"
+expect_failure prior-index-off-main 20260919.1 main
+
 new_repo side-branch
 git -C "$repo" switch -qc side
 printf 'side branch\n' >"$repo/side"

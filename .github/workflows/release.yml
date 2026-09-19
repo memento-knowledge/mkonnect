@@ -128,7 +128,7 @@ jobs:
       CHART_VERSION: ${{ needs.verify.outputs.chart_version }}
       RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
       ASSET_NAME: ${{ needs.verify.outputs.asset_name }}
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

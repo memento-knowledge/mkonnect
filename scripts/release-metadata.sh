@@ -100,6 +100,8 @@ case $month_number in
 esac
 ((day_number >= 1 && day_number <= days_in_month)) || fail "tag date is invalid: $tag"
 
+git -C "$repo" rev-parse --verify "$main_ref^{commit}" >/dev/null 2>&1 || fail "main ref does not resolve: $main_ref"
+
 release_day="$year$month$day"
 release_tag_count=0
 while IFS= read -r existing_tag; do
@@ -114,11 +116,12 @@ for ((known_tag = 0; known_tag < release_tag_count; known_tag++)); do
   expected_tag="$release_day.$expected_index"
   git -C "$repo" show-ref --verify --quiet "refs/tags/$expected_tag" || fail "release index $expected_index is missing before $tag"
   [[ $(git -C "$repo" cat-file -t "$expected_tag" 2>/dev/null) == tag ]] || fail "release tag must be annotated: $expected_tag"
+  expected_commit=$(git -C "$repo" rev-parse "$expected_tag^{commit}") || fail "release tag does not resolve to a commit: $expected_tag"
+  git -C "$repo" merge-base --is-ancestor "$expected_commit" "$main_ref" || fail "release tag is not reachable from $main_ref: $expected_tag"
   expected_index=$(increment_index "$expected_index")
 done
 
 release_commit=$(git -C "$repo" rev-parse "$tag^{commit}") || fail "tag does not resolve to a commit: $tag"
-git -C "$repo" rev-parse --verify "$main_ref^{commit}" >/dev/null 2>&1 || fail "main ref does not resolve: $main_ref"
 git -C "$repo" merge-base --is-ancestor "$release_commit" "$main_ref" || fail "tag commit is not reachable from $main_ref"
 
 chart="$repo/charts/mkonnect/Chart.yaml"
