@@ -215,6 +215,26 @@ func TestConfigSetRejectsShortTokenWithoutLeakingIt(t *testing.T) {
 	}
 }
 
+func TestConfigSetCountsTokenCharactersRatherThanBytes(t *testing.T) {
+	credsPath := filepath.Join(t.TempDir(), "credentials.json")
+	t.Setenv("CREDS_FILE", credsPath)
+	shortToken := strings.Repeat("界", 15)
+
+	var stdout bytes.Buffer
+	err := cli.Run([]string{"config", "set", "service",
+		"--base-url", "https://service.internal", "--auth", "bearer", "--token-stdin"},
+		strings.NewReader(shortToken), &stdout)
+	if err == nil || !strings.Contains(err.Error(), "at least 16") {
+		t.Fatalf("expected minimum-token-length error, got %v", err)
+	}
+	if strings.Contains(err.Error(), shortToken) || strings.Contains(stdout.String(), shortToken) {
+		t.Fatal("short token must not be repeated in an error or output")
+	}
+	if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
+		t.Fatalf("credential file was created after rejected token: %v", err)
+	}
+}
+
 func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
 	dir := t.TempDir()
 	credsPath := filepath.Join(dir, "credentials.json")

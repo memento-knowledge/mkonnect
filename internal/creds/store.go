@@ -3,11 +3,13 @@ package creds
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"unicode/utf8"
 )
 
 // MinTokenLength prevents ambiguous, short strings from being used as local
@@ -22,17 +24,38 @@ type Credential struct {
 	Token    string `json:"token,omitempty"`
 }
 
+// Validate checks the local authentication fields without including credential
+// values in any returned error.
+func (c Credential) Validate() error {
+	switch c.Auth {
+	case "":
+		if c.Username != "" || c.Token != "" {
+			return errors.New("credentials require an authentication mode")
+		}
+	case "bearer":
+		if c.Username != "" {
+			return errors.New("bearer authentication must not include a username")
+		}
+		if utf8.RuneCountInString(c.Token) < MinTokenLength {
+			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		}
+	case "basic":
+		if c.Username == "" {
+			return errors.New("basic authentication requires a username")
+		}
+		if utf8.RuneCountInString(c.Token) < MinTokenLength {
+			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		}
+	default:
+		return errors.New("unsupported authentication mode")
+	}
+	return nil
+}
+
 // HasAuthorization reports whether this credential has the local fields needed
 // to construct an Authorization header.
 func (c Credential) HasAuthorization() bool {
-	switch c.Auth {
-	case "bearer":
-		return len(c.Token) >= MinTokenLength
-	case "basic":
-		return c.Username != "" && len(c.Token) >= MinTokenLength
-	default:
-		return false
-	}
+	return c.Auth != "" && c.Validate() == nil
 }
 
 // ApplyAuthorization adds this credential's Authorization header to req when its
@@ -102,6 +125,9 @@ func (s *Store) List() map[string]Credential {
 
 // Set writes or overwrites the credential for plugin and persists to disk.
 func (s *Store) Set(plugin string, cred Credential) error {
+	if err := cred.Validate(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[plugin] = cred
@@ -135,6 +161,11 @@ func (s *Store) load() error {
 	}
 	if m == nil {
 		m = make(map[string]Credential)
+	}
+	for plugin, cred := range m {
+		if err := cred.Validate(); err != nil {
+			return fmt.Errorf("credential %q is invalid: %w", plugin, err)
+		}
 	}
 	s.data = m
 	return nil

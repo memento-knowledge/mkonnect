@@ -2,11 +2,51 @@
 package creds_test
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 )
+
+func TestStoreRejectsShortPersistedTokensWithoutLeakingThem(t *testing.T) {
+	tests := []struct {
+		name       string
+		credential creds.Credential
+	}{
+		{
+			name:       "bearer",
+			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "bearer", Token: "short-token"},
+		},
+		{
+			name:       "basic",
+			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "basic", Username: "local-user", Token: "short-token"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "credentials.json")
+			data, err := json.Marshal(map[string]creds.Credential{"service": tt.credential})
+			if err != nil {
+				t.Fatalf("marshal credentials: %v", err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatalf("write credentials: %v", err)
+			}
+
+			_, err = creds.New(path)
+			if err == nil {
+				t.Fatal("expected persisted short token to be rejected")
+			}
+			if strings.Contains(err.Error(), "short-token") {
+				t.Fatal("persisted token must not be repeated in an error")
+			}
+		})
+	}
+}
 
 func TestStoreSetAndGet(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
@@ -14,14 +54,14 @@ func TestStoreSetAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := s.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "tok"}); err != nil {
+	if err := s.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "test-token-value-123"}); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	got, ok := s.Get("jenkins")
 	if !ok {
 		t.Fatal("Get: not found")
 	}
-	if got.BaseURL != "http://jenkins:8080" || got.Token != "tok" {
+	if got.BaseURL != "http://jenkins:8080" || got.Token != "test-token-value-123" {
 		t.Fatalf("unexpected credential: %+v", got)
 	}
 }

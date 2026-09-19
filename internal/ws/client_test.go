@@ -890,7 +890,7 @@ func TestConnectionStatusEmittedOnConnect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	if err := store.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "tok"}); err != nil {
+	if err := store.Set("jenkins", creds.Credential{BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "test-token-value-123"}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
 

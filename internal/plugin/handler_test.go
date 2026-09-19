@@ -480,7 +480,7 @@ func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStoreBasicCredential(t, "svc", srv.URL, "id", "1"))
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStoreBasicCredential(t, "svc", srv.URL, "id", "long-token-value-123"))
 	code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -495,7 +495,7 @@ func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerPreservesResponseContainingBareShortToken(t *testing.T) {
+func TestHTTPHandlerPreservesResponseWithoutFullAuthorizationReflection(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Note", "id")
 		w.WriteHeader(http.StatusOK)
@@ -504,7 +504,7 @@ func TestHTTPHandlerPreservesResponseContainingBareShortToken(t *testing.T) {
 	defer srv.Close()
 
 	store := mustStore(t)
-	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: "id"}); err != nil {
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: "long-token-value-123"}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
 	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store)(context.Background(), proto.HTTPRequestMsg{

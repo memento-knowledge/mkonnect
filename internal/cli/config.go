@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 )
@@ -134,7 +135,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		if tokenVal == "" {
 			return errors.New("--token-stdin was set but stdin was empty")
 		}
-		if len(tokenVal) < creds.MinTokenLength {
+		if utf8.RuneCountInString(tokenVal) < creds.MinTokenLength {
 			return fmt.Errorf("token must be at least %d characters", creds.MinTokenLength)
 		}
 	}
