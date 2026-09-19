@@ -13,10 +13,10 @@ chart_version=$(awk '$1 == "version:" { print $2; exit }' "$tmpdir/chart/Chart.y
 package="$chart_name-$chart_version.tgz"
 
 mkdir "$tmpdir/first" "$tmpdir/retry" "$tmpdir/assets"
-find "$tmpdir/chart" -type f -exec touch -t 202001010101 {} +
 helm package "$tmpdir/chart" --destination "$tmpdir/first"
-find "$tmpdir/chart" -type f -exec touch -t 202002020202 {} +
-helm package "$tmpdir/chart" --destination "$tmpdir/retry"
+tar -xzf "$tmpdir/first/$package" -C "$tmpdir/retry"
+find "$tmpdir/retry/$chart_name" -exec touch -t 202002020202 {} +
+tar -czf "$tmpdir/retry/$package" -C "$tmpdir/retry" "$chart_name"
 test "$(sha256sum "$tmpdir/first/$package" | awk '{ print $1 }')" != \
   "$(sha256sum "$tmpdir/retry/$package" | awk '{ print $1 }')"
 

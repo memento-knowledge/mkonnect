@@ -105,6 +105,6 @@ jobs:
         env:
           REVISION: ${{ github.sha }}
         run: |
-          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}')" = ci
-          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}')" = "$REVISION"
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = ci
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$REVISION"
           docker run --rm mkonnect:ci --health
