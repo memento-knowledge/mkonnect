@@ -57,17 +57,29 @@ func runConfig(args []string, stdin io.Reader, w io.Writer) error {
 
 func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: connector config set <plugin> --base-url <url> [--auth bearer (--token <token> | --token-stdin)]")
+		return errors.New("usage: connector config set <plugin> --base-url <url> [--auth bearer|basic --token-stdin [--username <username>]]")
 	}
 	plugin := args[0]
 	fs := flag.NewFlagSet("config set", flag.ContinueOnError)
 	fs.SetOutput(w)
 	baseURL := fs.String("base-url", "", "Base URL of the plugin service (required)")
-	auth := fs.String("auth", "", "Auth type: bearer")
-	token := fs.String("token", "", "Bearer token (exposed via process args/shell history — prefer --token-stdin)")
-	tokenStdin := fs.Bool("token-stdin", false, "Read the bearer token from stdin instead of --token")
+	auth := fs.String("auth", "", "Auth type: bearer or basic")
+	username := fs.String("username", "", "Username for basic auth")
+	// Keep --token defined only to return a clear, secret-safe error to callers of
+	// older releases. Tokens are intentionally never accepted through command args.
+	fs.String("token", "", "Unsupported; use --token-stdin")
+	tokenStdin := fs.Bool("token-stdin", false, "Read the token from stdin")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	tokenFlagUsed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "token" {
+			tokenFlagUsed = true
+		}
+	})
+	if tokenFlagUsed {
+		return errors.New("--token is not supported; pass the token through stdin with --token-stdin")
 	}
 	if *baseURL == "" {
 		return errors.New("--base-url is required")
@@ -75,15 +87,39 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if u, err := url.Parse(*baseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("--base-url must be an absolute http or https URL, got %q", *baseURL)
 	}
-	if *auth != "" && *auth != "bearer" {
-		return fmt.Errorf("unsupported auth type: %q (only 'bearer' is supported)", *auth)
+	switch *auth {
+	case "", "bearer", "basic":
+	default:
+		return fmt.Errorf("unsupported auth type: %q (supported: 'bearer', 'basic')", *auth)
+	}
+	switch *auth {
+	case "":
+		if *tokenStdin {
+			return errors.New("--token-stdin requires --auth bearer or --auth basic")
+		}
+		if *username != "" {
+			return errors.New("--username requires --auth basic")
+		}
+	case "bearer":
+		if !*tokenStdin {
+			return errors.New("--auth bearer requires --token-stdin")
+		}
+		if *username != "" {
+			return errors.New("--username is only valid with --auth basic")
+		}
+	case "basic":
+		if *username == "" {
+			return errors.New("--auth basic requires --username")
+		}
+		if strings.Contains(*username, ":") {
+			return errors.New("--username must not contain ':' for basic auth")
+		}
+		if !*tokenStdin {
+			return errors.New("--auth basic requires --token-stdin")
+		}
 	}
 
-	// Resolve the token from exactly one source.
-	if *token != "" && *tokenStdin {
-		return errors.New("provide either --token or --token-stdin, not both")
-	}
-	tokenVal := *token
+	var tokenVal string
 	if *tokenStdin {
 		b, err := io.ReadAll(stdin)
 		if err != nil {
@@ -96,26 +132,15 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		}
 	}
 
-	// An inline --token is exposed via the process list / shell history regardless of
-	// --auth; warn whenever it's used.
-	if *token != "" {
-		fmt.Fprintln(w, "Warning: --token is visible in the process list and shell history; prefer --token-stdin.")
-	}
-	switch {
-	case *auth == "bearer" && tokenVal == "":
-		return errors.New("a token is required when --auth bearer (use --token-stdin, or --token)")
-	case tokenVal != "" && *auth != "bearer":
-		fmt.Fprintf(w, "Warning: a token was provided but --auth is %q; it will be stored but not used.\n", *auth)
-	}
-
 	store, err := creds.New(credsPath())
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
 	}
 	if err := store.Set(plugin, creds.Credential{
-		BaseURL: *baseURL,
-		Auth:    *auth,
-		Token:   tokenVal,
+		BaseURL:  *baseURL,
+		Auth:     *auth,
+		Username: *username,
+		Token:    tokenVal,
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
@@ -142,8 +167,8 @@ func runConfigList(w io.Writer) error {
 	for _, name := range names {
 		cred := list[name]
 		auth := "(none)"
-		if cred.Auth == "bearer" {
-			auth = "bearer ***"
+		if cred.Auth == "bearer" || cred.Auth == "basic" {
+			auth = cred.Auth + " ***"
 		}
 		fmt.Fprintf(w, "%-20s  %-40s  %s\n", name, cred.BaseURL, auth)
 	}
@@ -184,8 +209,8 @@ func runStatus(_ []string, w io.Writer) error {
 	for _, name := range names {
 		cred := list[name]
 		authDesc := "no auth"
-		if cred.Auth == "bearer" {
-			authDesc = "bearer"
+		if cred.Auth == "bearer" || cred.Auth == "basic" {
+			authDesc = cred.Auth
 		}
 		fmt.Fprintf(w, "  %-20s  %s  [%s]\n", name, cred.BaseURL, authDesc)
 	}

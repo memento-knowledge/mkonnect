@@ -13,7 +13,7 @@ Memento platform ── wss:// ──▶ Bridge Gateway ── WebSocket ──�
 1. **Connect.** mkonnect dials the Bridge Gateway over `wss://`. The gateway sends a random challenge nonce first, on every connection attempt.
    - **First run:** mkonnect sends a one-time `REGISTRATION_TOKEN` (the challenge is unused on this path). The gateway responds with a freshly generated ML-DSA-65 private key, which mkonnect persists to disk (`KEY_FILE`, `0600` permissions).
    - **Every reconnect after that:** mkonnect proves possession of its private key by signing the challenge (ML-DSA-65, a post-quantum signature scheme). No long-lived secret crosses the wire again.
-2. **Serve requests.** The platform sends `http_request` messages down the tunnel, each naming a plugin (e.g. `jenkins`) plus an HTTP method, path, headers, and body. mkonnect resolves the plugin name to an internal base URL (from a local credential entry, else the `PLUGIN_*` registry), optionally injects a locally-stored bearer token, forwards the request to the internal service, and returns the result as an `http_response`. Credentials configured locally (see [Internal tool credentials](#internal-tool-credentials)) are injected on-prem and never transit the tunnel.
+2. **Serve requests.** The platform sends `http_request` messages down the tunnel, each naming a plugin (e.g. `jenkins`) plus an HTTP method, path, headers, and body. mkonnect resolves the plugin name to an internal base URL (from a local credential entry, else the `PLUGIN_*` registry), optionally injects locally-stored Bearer or Basic credentials, forwards the request to the internal service, and returns the result as an `http_response`. Credentials configured locally (see [Internal tool credentials](#internal-tool-credentials)) are injected on-prem and never transit the tunnel.
 3. **Report status.** On connect, on local config change (SIGHUP), and on each heartbeat, mkonnect sends a `connection_status` message listing each plugin's state. The platform can also request an on-demand connectivity probe (`test_connection`), which mkonnect runs against the plugin and answers with a `test_result` — no credential ever appears in either message.
 4. **Stay alive.** A heartbeat every 30s — a WebSocket ping (detects silent TCP drops from NAT timeouts or load balancer failures) and an application-level health message (what the gateway actually uses to track connector liveness) — keeps the connection monitored from both sides. If the connection drops, mkonnect reconnects with exponential backoff (1s → 60s cap).
 
@@ -39,28 +39,35 @@ Runtime configuration comes from environment variables (internal-tool credential
 A plugin's backend can be defined two ways:
 
 - **`PLUGIN_<NAME>` env var** — just a base URL, no authentication injected. Suitable for unauthenticated internal endpoints (e.g. an open Prometheus).
-- **Local credential store** — configured on the connector host with the `connector` CLI and persisted to `CREDS_FILE` (`/data/credentials.json`, mode `0600`). This is how you attach a bearer token to a tool like Jenkins. **Tokens are injected into the outbound request inside your network and are never sent to the Memento platform.**
+- **Local credential store** — configured on the connector host with the `connector` CLI and persisted to `CREDS_FILE` (`/data/credentials.json`, mode `0600`). It supports Bearer tokens and HTTP Basic credentials (username plus token). **Credentials are injected into the outbound request inside your network and are never sent to the Memento platform.**
 
 When both define the same plugin name, the credential store wins.
 
 The `connector` subcommand is built into the same binary, so you run it inside the container:
 
 ```bash
-# Bearer-authenticated tool — pipe the token via stdin so it never lands in
-# the process list or shell history:
+# Bearer-authenticated tool — tokens must be piped via stdin so they never land
+# in the process list or shell history:
 printf %s "$JENKINS_TOKEN" | \
   <exec> connector config set jenkins \
     --base-url http://jenkins.internal:8080 --auth bearer --token-stdin
 
+# Basic-authenticated tool — the username and API token stay in the local
+# credential store. Only the token is passed through stdin:
+printf %s "$BUILD_SERVICE_API_TOKEN" | \
+  <exec> connector config set build-service \
+    --base-url https://build.internal --auth basic \
+    --username "$BUILD_SERVICE_USERNAME" --token-stdin
+
 # Unauthenticated tool:
 <exec> connector config set prometheus --base-url http://prometheus.internal:9090
 
-<exec> connector config list      # base URLs; tokens shown masked
+<exec> connector config list      # base URLs; credentials shown masked
 <exec> connector config remove jenkins
 <exec> connector status           # configured plugins on this connector
 ```
 
-`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. (`--token` is still accepted for interactive use but is discouraged — it exposes the token via the process list; prefer `--token-stdin`.)
+`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. Tokens are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history.
 
 ## Running
 

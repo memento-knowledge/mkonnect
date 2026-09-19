@@ -23,8 +23,8 @@ func TestConfigSetAndList(t *testing.T) {
 	if err := cli.Run([]string{"config", "set", "jenkins",
 		"--base-url", "http://jenkins:8080",
 		"--auth", "bearer",
-		"--token", "secret"},
-		noStdin(), &stdout); err != nil {
+		"--token-stdin"},
+		strings.NewReader("secret"), &stdout); err != nil {
 		t.Fatalf("config set: %v", err)
 	}
 
@@ -99,16 +99,17 @@ func TestConfigSetBearerRequiresToken(t *testing.T) {
 	}
 }
 
-func TestConfigSetInlineTokenWarns(t *testing.T) {
+func TestConfigSetRejectsInlineTokenWithoutLeakingIt(t *testing.T) {
 	t.Setenv("CREDS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
 	var stdout bytes.Buffer
-	if err := cli.Run([]string{"config", "set", "jenkins",
-		"--base-url", "http://j:80", "--auth", "bearer", "--token", "secret"},
-		noStdin(), &stdout); err != nil {
-		t.Fatalf("config set: %v", err)
+	err := cli.Run([]string{"config", "set", "jenkins",
+		"--base-url", "http://j:80", "--auth", "bearer", "--token", "inline-secret"},
+		noStdin(), &stdout)
+	if err == nil {
+		t.Fatal("expected inline token to be rejected")
 	}
-	if !strings.Contains(stdout.String(), "--token-stdin") {
-		t.Errorf("expected a warning steering the user to --token-stdin, got:\n%s", stdout.String())
+	if strings.Contains(err.Error(), "inline-secret") || strings.Contains(stdout.String(), "inline-secret") {
+		t.Fatal("inline token must not be repeated in an error or output")
 	}
 }
 
@@ -123,9 +124,8 @@ func TestConfigSetTokenStdin(t *testing.T) {
 		strings.NewReader("s3cr3t\n"), &stdout); err != nil {
 		t.Fatalf("config set: %v", err)
 	}
-	// The inline-token warning must NOT appear for the stdin path.
-	if strings.Contains(stdout.String(), "process list") {
-		t.Errorf("--token-stdin should not trigger the inline-token warning:\n%s", stdout.String())
+	if strings.Contains(stdout.String(), "s3cr3t") {
+		t.Errorf("token from stdin must not appear in output:\n%s", stdout.String())
 	}
 	// The trailing newline must be trimmed, and the token stored verbatim.
 	b, err := os.ReadFile(credsPath)
@@ -140,18 +140,6 @@ func TestConfigSetTokenStdin(t *testing.T) {
 	}
 }
 
-func TestConfigSetTokenAndStdinConflict(t *testing.T) {
-	t.Setenv("CREDS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
-	var stdout bytes.Buffer
-	err := cli.Run([]string{"config", "set", "jenkins",
-		"--base-url", "http://j:80", "--auth", "bearer",
-		"--token", "x", "--token-stdin"},
-		strings.NewReader("y"), &stdout)
-	if err == nil {
-		t.Fatal("expected error when both --token and --token-stdin are given")
-	}
-}
-
 func TestConfigSetTokenStdinEmpty(t *testing.T) {
 	t.Setenv("CREDS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
 	var stdout bytes.Buffer
@@ -160,6 +148,64 @@ func TestConfigSetTokenStdinEmpty(t *testing.T) {
 		strings.NewReader(""), &stdout)
 	if err == nil {
 		t.Fatal("expected error when --token-stdin is set but stdin is empty")
+	}
+}
+
+func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
+	dir := t.TempDir()
+	credsPath := filepath.Join(dir, "credentials.json")
+	t.Setenv("CREDS_FILE", credsPath)
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "build-service",
+		"--base-url", "https://build.internal",
+		"--auth", "basic", "--username", "local-user", "--token-stdin"},
+		strings.NewReader("api-token\n"), &stdout); err != nil {
+		t.Fatalf("config set basic: %v", err)
+	}
+	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token") {
+		t.Fatalf("credentials must not appear in output:\n%s", stdout.String())
+	}
+
+	data, err := os.ReadFile(credsPath)
+	if err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if !strings.Contains(string(data), `"username": "local-user"`) || !strings.Contains(string(data), `"token": "api-token"`) {
+		t.Fatalf("basic credentials were not stored locally:\n%s", data)
+	}
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "list"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "basic ***") {
+		t.Fatalf("expected masked basic auth in list output:\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token") {
+		t.Fatalf("credentials must be masked in list output:\n%s", stdout.String())
+	}
+}
+
+func TestConfigSetBasicRequiresUsername(t *testing.T) {
+	t.Setenv("CREDS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
+	var stdout bytes.Buffer
+	err := cli.Run([]string{"config", "set", "build-service",
+		"--base-url", "https://build.internal", "--auth", "basic", "--token-stdin"},
+		strings.NewReader("api-token"), &stdout)
+	if err == nil || !strings.Contains(err.Error(), "--username") {
+		t.Fatalf("expected a --username validation error, got %v", err)
+	}
+}
+
+func TestConfigSetRejectsTokenStdinWithoutAuth(t *testing.T) {
+	t.Setenv("CREDS_FILE", filepath.Join(t.TempDir(), "credentials.json"))
+	var stdout bytes.Buffer
+	err := cli.Run([]string{"config", "set", "service",
+		"--base-url", "https://service.internal", "--token-stdin"},
+		strings.NewReader("api-token"), &stdout)
+	if err == nil || !strings.Contains(err.Error(), "--auth") {
+		t.Fatalf("expected an auth validation error, got %v", err)
 	}
 }
 

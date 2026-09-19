@@ -2,6 +2,8 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -25,6 +27,20 @@ func mustStore(t *testing.T) *creds.Store {
 		t.Fatalf("creds.New: %v", err)
 	}
 	return s
+}
+
+func mustStoreBasicCredential(t *testing.T, plugin, baseURL, username, token string) *creds.Store {
+	t.Helper()
+	store := mustStore(t)
+	if err := store.Set(plugin, creds.Credential{
+		BaseURL:  baseURL,
+		Auth:     "basic",
+		Username: username,
+		Token:    token,
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	return store
 }
 
 func TestHTTPHandlerUpstreamTimeout(t *testing.T) {
@@ -89,6 +105,45 @@ func TestHTTPHandlerInjectsBearerToken(t *testing.T) {
 	}
 	if gotAuth != "Bearer secret" {
 		t.Fatalf("expected 'Bearer secret', got %q", gotAuth)
+	}
+}
+
+func TestHTTPHandlerInjectsBasicCredentialsOnlyForConfiguredPlugin(t *testing.T) {
+	const username = "local-user"
+	const token = "api-token"
+	expectedBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+token))
+
+	gotAuth := make(map[string]string)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth[r.URL.Path] = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	reg := &Registry{plugins: map[string]string{
+		"build-service": srv.URL,
+		"metrics":       srv.URL,
+	}}
+	store := mustStoreBasicCredential(t, "build-service", srv.URL, username, token)
+	h := HTTPHandler(reg, store)
+
+	for _, providerKey := range []string{"build-service", "metrics"} {
+		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: providerKey,
+			Method:      http.MethodGet,
+			Path:        "/" + providerKey,
+			Headers:     map[string]string{"Authorization": "Bearer bridge-token"},
+		})
+		if err != nil || code != http.StatusOK {
+			t.Fatalf("request for %q: code=%d err=%v", providerKey, code, err)
+		}
+	}
+
+	if gotAuth["/build-service"] != expectedBasic {
+		t.Fatalf("configured plugin Authorization = %q, want %q", gotAuth["/build-service"], expectedBasic)
+	}
+	if gotAuth["/metrics"] != "Bearer bridge-token" {
+		t.Fatalf("unconfigured plugin Authorization = %q, want bridge header unchanged", gotAuth["/metrics"])
 	}
 }
 
@@ -225,6 +280,67 @@ func TestCredentialsNeverInHTTPResponseMsg(t *testing.T) {
 	}
 	if body != nil && strings.Contains(*body, secret) {
 		t.Fatalf("token found in response body: %q", *body)
+	}
+}
+
+func TestHTTPHandlerDoesNotReturnInjectedAuthorizationHeader(t *testing.T) {
+	tests := []struct {
+		name      string
+		store     func(t *testing.T, url string) *creds.Store
+		forbidden []string
+	}{
+		{
+			name: "bearer",
+			store: func(t *testing.T, url string) *creds.Store {
+				store := mustStore(t)
+				if err := store.Set("svc", creds.Credential{BaseURL: url, Auth: "bearer", Token: "bearer-secret"}); err != nil {
+					t.Fatalf("store.Set: %v", err)
+				}
+				return store
+			},
+			forbidden: []string{"bearer-secret", "Bearer bearer-secret"},
+		},
+		{
+			name: "basic",
+			store: func(t *testing.T, url string) *creds.Store {
+				return mustStoreBasicCredential(t, "svc", url, "local-user", "api-token")
+			},
+			forbidden: []string{
+				"local-user",
+				"api-token",
+				"Basic " + base64.StdEncoding.EncodeToString([]byte("local-user:api-token")),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Authorization", r.Header.Get("Authorization"))
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+
+			h := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL))
+			code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
+				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+			})
+			if err != nil || code != http.StatusOK {
+				t.Fatalf("code=%d err=%v", code, err)
+			}
+
+			message, err := json.Marshal(proto.HTTPResponseMsg{
+				Type: "http_response", RequestID: "request", StatusCode: code, Headers: headers, Body: body,
+			})
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			for _, value := range tt.forbidden {
+				if strings.Contains(string(message), value) {
+					t.Fatalf("local credential leaked into bridge response: %q", value)
+				}
+			}
+		})
 	}
 }
 

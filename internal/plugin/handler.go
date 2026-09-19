@@ -30,6 +30,15 @@ var hopByHopHeaders = map[string]bool{
 	"Upgrade":             true,
 }
 
+// sensitiveResponseHeaders may carry credentials created or used inside the
+// customer's network. They must not be sent back through the bridge.
+var sensitiveResponseHeaders = map[string]bool{
+	"Authorization":       true,
+	"Cookie":              true,
+	"Proxy-Authorization": true,
+	"Set-Cookie":          true,
+}
+
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
@@ -40,7 +49,7 @@ var upstreamTimeout = 10 * time.Second
 
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
-//  2. Injects an Authorization: Bearer header if a local bearer credential is configured.
+//  2. Injects an Authorization header if local credentials are configured.
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
@@ -142,9 +151,10 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 
 		req.Header.Set("Via", "1.1 mkonnect")
 
-		// Inject local bearer credential if configured (local-side mode).
-		if haveCred && cred.Auth == "bearer" && cred.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+cred.Token)
+		// Inject local credentials only for this configured plugin. This happens
+		// after bridge headers are copied so the local credential cannot be replaced.
+		if haveCred {
+			cred.ApplyAuthorization(req)
 		}
 
 		resp, err := httpClient.Do(req)
@@ -167,7 +177,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		// Collect response headers (first value per header name).
 		respHeaders := make(map[string]string, len(resp.Header))
 		for k, vs := range resp.Header {
-			if len(vs) > 0 {
+			if len(vs) > 0 && !sensitiveResponseHeaders[http.CanonicalHeaderKey(k)] {
 				respHeaders[k] = vs[0]
 			}
 		}

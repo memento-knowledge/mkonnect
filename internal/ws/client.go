@@ -451,12 +451,14 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	}
 
 	// Resolve base URL: creds store first, then registry (mirrors HTTPHandler).
-	var baseURL, credAuth, credToken string
+	var baseURL string
+	var credential creds.Credential
+	var haveCredential bool
 	if c.credsStore != nil {
 		if cred, ok := c.credsStore.Get(providerKey); ok {
 			baseURL = cred.BaseURL
-			credAuth = cred.Auth
-			credToken = cred.Token
+			credential = cred
+			haveCredential = true
 		}
 	}
 	if baseURL == "" && c.pluginReg != nil {
@@ -475,13 +477,13 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
-	if credAuth == "bearer" && credToken != "" {
-		req.Header.Set("Authorization", "Bearer "+credToken)
+	if haveCredential {
+		credential.ApplyAuthorization(req)
 	}
 
 	// Do not follow redirects: a redirect to an auth page (e.g. SSO) would succeed
 	// with a 200 and hide an auth_failure, and following redirects could forward the
-	// bearer token to a third-party host.
+	// local credentials to a third-party host.
 	probeClient := &http.Client{
 		Timeout: 10 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {

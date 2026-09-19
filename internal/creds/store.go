@@ -4,16 +4,34 @@ package creds
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 )
 
-// Credential holds a plugin's base URL and optional bearer auth.
+// Credential holds a plugin's base URL and optional local HTTP authentication.
 type Credential struct {
-	BaseURL string `json:"base_url"`
-	Auth    string `json:"auth,omitempty"` // "bearer" or ""
-	Token   string `json:"token,omitempty"`
+	BaseURL  string `json:"base_url"`
+	Auth     string `json:"auth,omitempty"` // "bearer", "basic", or ""
+	Username string `json:"username,omitempty"`
+	Token    string `json:"token,omitempty"`
+}
+
+// ApplyAuthorization adds this credential's Authorization header to req when its
+// configured authentication mode has all required local credential fields.
+func (c Credential) ApplyAuthorization(req *http.Request) {
+	if c.Token == "" {
+		return
+	}
+	switch c.Auth {
+	case "bearer":
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	case "basic":
+		if c.Username != "" {
+			req.SetBasicAuth(c.Username, c.Token)
+		}
+	}
 }
 
 // Store is a thread-safe, file-backed map of plugin name → Credential.
