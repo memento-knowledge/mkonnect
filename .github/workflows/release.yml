@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - '20*'
   workflow_dispatch:
     inputs:
       tag:
@@ -26,7 +26,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.metadata.outputs.version }}
+      release_id: ${{ steps.metadata.outputs.release_id }}
+      chart_version: ${{ steps.metadata.outputs.chart_version }}
       release_commit: ${{ steps.metadata.outputs.release_commit }}
       asset_name: ${{ steps.asset.outputs.asset_name }}
     steps:
@@ -40,6 +41,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           git fetch --force origin main:refs/remotes/origin/main
+          git fetch --force --tags origin
           git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           git checkout --detach "$RELEASE_TAG^{commit}"
           bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
@@ -90,21 +92,21 @@ jobs:
 
       - name: Lint and package chart
         env:
-          VERSION: ${{ steps.metadata.outputs.version }}
+          CHART_VERSION: ${{ steps.metadata.outputs.chart_version }}
         run: |
           helm lint charts/mkonnect
           helm package charts/mkonnect --destination dist
           cd dist
-          sha256sum "mkonnect-$VERSION.tgz" > "mkonnect-$VERSION.tgz.sha256"
+          sha256sum "mkonnect-$CHART_VERSION.tgz" > "mkonnect-$CHART_VERSION.tgz.sha256"
           cd ..
-          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "dist/mkonnect-$VERSION.tgz"
+          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "dist/mkonnect-$CHART_VERSION.tgz"
 
       - id: asset
         name: Name release asset bundle
         env:
-          VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_ID: ${{ steps.metadata.outputs.release_id }}
           RELEASE_COMMIT: ${{ steps.metadata.outputs.release_commit }}
-        run: printf 'asset_name=release-assets-%s-%s\n' "$VERSION" "$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
+        run: printf 'asset_name=release-assets-%s-%s\n' "$RELEASE_ID" "$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
 
       - name: Upload verified release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -122,7 +124,8 @@ jobs:
       contents: write
       id-token: write
     env:
-      VERSION: ${{ needs.verify.outputs.version }}
+      RELEASE_ID: ${{ needs.verify.outputs.release_id }}
+      CHART_VERSION: ${{ needs.verify.outputs.chart_version }}
       RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
       ASSET_NAME: ${{ needs.verify.outputs.asset_name }}
       RELEASE_TAG: ${{ github.ref_name }}
@@ -138,14 +141,14 @@ jobs:
       - name: Verify uploaded chart bundle
         run: |
           cd dist
-          sha256sum -c "mkonnect-$VERSION.tgz.sha256"
+          sha256sum -c "mkonnect-$CHART_VERSION.tgz.sha256"
 
       - name: Create or reconcile draft release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          package="mkonnect-$VERSION.tgz"
+          package="mkonnect-$CHART_VERSION.tgz"
           checksum="$package.sha256"
           release_json=$(mktemp)
           if gh release view "$RELEASE_TAG" --json isDraft,assets,body >"$release_json" 2>/dev/null; then
@@ -154,7 +157,7 @@ jobs:
               exit 1
             fi
           else
-            gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes --title "mkonnect $VERSION"
+            gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes --title "mkonnect $RELEASE_ID"
             gh release view "$RELEASE_TAG" --json isDraft,assets,body >"$release_json"
           fi
 
@@ -166,7 +169,7 @@ jobs:
           checksum_present=false
           if has_asset "$package"; then chart_present=true; fi
           if has_asset "$checksum"; then checksum_present=true; fi
-          canonical="$RUNNER_TEMP/release-assets-$VERSION"
+          canonical="$RUNNER_TEMP/release-assets-$RELEASE_ID"
           rm -rf "$canonical"
           mkdir -p "$canonical"
           trap 'rm -f "$release_json"' EXIT
@@ -178,7 +181,7 @@ jobs:
             gh release download "$RELEASE_TAG" --pattern "$checksum" --dir "$canonical"
           fi
 
-          bundle_output="$RUNNER_TEMP/release-asset-bundle-$VERSION.env"
+          bundle_output="$RUNNER_TEMP/release-asset-bundle-$RELEASE_ID.env"
           bash scripts/release-asset-bundle.sh \
             --chart-dir charts/mkonnect \
             --source-package "dist/$package" \
@@ -221,7 +224,7 @@ jobs:
         run: |
           set -euo pipefail
           image="$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/memento-connector"
-          version_tag="$VERSION"
+          version_tag="$RELEASE_ID"
           commit_tag="sha-$RELEASE_COMMIT"
 
           lookup_digest() {
@@ -232,7 +235,7 @@ jobs:
             docker pull "$image:$1" >/dev/null
             version=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
             revision=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-            [ "$version" = "$VERSION" ] && [ "$revision" = "$RELEASE_COMMIT" ]
+            [ "$version" = "$RELEASE_ID" ] && [ "$revision" = "$RELEASE_COMMIT" ]
           }
 
           if version_digest=$(lookup_digest "$version_tag"); then
@@ -253,7 +256,7 @@ jobs:
           fi
 
           if ! "$version_exists" && ! "$commit_exists"; then
-            docker build --build-arg VERSION="$VERSION" --build-arg REVISION="$RELEASE_COMMIT" -t "$image:$version_tag" -t "$image:$commit_tag" .
+            docker build --build-arg VERSION="$RELEASE_ID" --build-arg REVISION="$RELEASE_COMMIT" -t "$image:$version_tag" -t "$image:$commit_tag" .
             docker push "$image:$version_tag"
             docker push "$image:$commit_tag"
           elif "$version_exists" && ! "$commit_exists"; then
@@ -275,12 +278,12 @@ jobs:
       - name: Reconcile Helm chart
         run: |
           set -euo pipefail
-          package="mkonnect-$VERSION.tgz"
+          package="mkonnect-$CHART_VERSION.tgz"
           checksum="$package.sha256"
           chart_uri="oci://$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/mkonnect"
 
           chart_digest() {
-            bash scripts/ecr-public-image-digest.sh --repository mkonnect --tag "$VERSION"
+            bash scripts/ecr-public-image-digest.sh --repository mkonnect --tag "$CHART_VERSION"
           }
 
           if chart_digest >/dev/null; then
@@ -295,7 +298,7 @@ jobs:
           else
             pulled=$(mktemp -d)
             trap 'rm -rf "$pulled"' EXIT
-            helm pull "$chart_uri" --version "$VERSION" --destination "$pulled"
+            helm pull "$chart_uri" --version "$CHART_VERSION" --destination "$pulled"
             expected=$(awk '{ print $1 }' "$CANONICAL_DIR/$checksum")
             actual=$(sha256sum "$pulled/$package" | awk '{ print $1 }')
             [ "$actual" = "$expected" ]
@@ -310,7 +313,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          package="mkonnect-$VERSION.tgz"
+          package="mkonnect-$CHART_VERSION.tgz"
           checksum="$package.sha256"
           verify_dir=$(mktemp -d)
           trap 'rm -rf "$verify_dir"' EXIT
@@ -323,14 +326,14 @@ jobs:
           chart_sha=$(awk '{ print $1 }' "$CANONICAL_DIR/$checksum")
           {
             printf '%s\n\n' '## Artifacts'
-            printf '%s\n' "- Container image: $IMAGE:$VERSION"
+            printf '%s\n' "- Container image: $IMAGE:$RELEASE_ID"
             printf '%s\n' "- Container image digest: $IMAGE_DIGEST"
             printf '%s\n' "- Commit image tag: $IMAGE:sha-$RELEASE_COMMIT"
-            printf '%s\n' "- Helm chart: $CHART_URI:$VERSION"
+            printf '%s\n' "- Helm chart: $CHART_URI:$CHART_VERSION"
             printf '%s\n' "- Helm chart digest: $CHART_DIGEST"
             printf '%s\n\n' "- Chart SHA-256: $chart_sha"
             printf '%s\n\n' 'Install the chart with:'
-            printf '%s\n\n' "    helm install mkonnect $CHART_URI --version $VERSION -f mkonnect-secrets.yaml --set image.repository=$IMAGE"
+            printf '%s\n\n' "    helm install mkonnect $CHART_URI --version $CHART_VERSION -f mkonnect-secrets.yaml --set image.repository=$IMAGE"
             cat "$generated_notes"
           } >"$notes"
           gh release edit "$RELEASE_TAG" --draft=false --notes-file "$notes"
