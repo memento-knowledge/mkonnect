@@ -82,3 +82,26 @@ jobs:
 
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build release image
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg VERSION=ci \
+            --build-arg REVISION="$REVISION" \
+            --tag mkonnect:ci \
+            .
+
+      - name: Verify image metadata and health command
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}')" = ci
+          test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}')" = "$REVISION"
+          docker run --rm mkonnect:ci --health
