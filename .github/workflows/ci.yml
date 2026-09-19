@@ -29,6 +29,9 @@ jobs:
       - name: Run release metadata tests
         run: bash scripts/release-metadata_test.sh
 
+      - name: Run ECR Public lookup tests
+        run: bash scripts/ecr-public-image-digest_test.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -73,6 +76,9 @@ jobs:
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
         with:
           version: v3.18.6
+
+      - name: Run release chart source tests
+        run: bash scripts/release-chart-source_test.sh
 
       - name: Lint Helm chart
         run: helm lint charts/mkonnect

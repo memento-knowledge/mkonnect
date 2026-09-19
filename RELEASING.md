@@ -38,7 +38,7 @@ If the organization uses GitHub's repository-ID OIDC subject customization, insp
 gh api repos/memento-knowledge/mkonnect --jq .id
 ```
 
-Grant the role `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` with `Resource: "*"`. Restrict these ECR Public actions to the ARNs of only the two repositories above: `ecr-public:BatchCheckLayerAvailability`, `ecr-public:BatchGetImage`, `ecr-public:CompleteLayerUpload`, `ecr-public:DescribeImages`, `ecr-public:InitiateLayerUpload`, `ecr-public:PutImage`, and `ecr-public:UploadLayerPart`.
+Grant the role `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` with `Resource: "*"`. Restrict these ECR Public actions to the ARNs of only the two repositories above: `ecr-public:BatchCheckLayerAvailability`, `ecr-public:CompleteLayerUpload`, `ecr-public:DescribeImages`, `ecr-public:InitiateLayerUpload`, `ecr-public:PutImage`, and `ecr-public:UploadLayerPart`.
 
 The workflows use Helm `v3.18.6` for chart linting, packaging, and publication. Update that version only through a reviewed change that validates the new package format and OCI behavior.
 

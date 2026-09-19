@@ -47,6 +47,9 @@ jobs:
       - name: Run release metadata tests
         run: bash scripts/release-metadata_test.sh
 
+      - name: Run ECR Public lookup tests
+        run: bash scripts/ecr-public-image-digest_test.sh
+
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.25'
@@ -79,6 +82,9 @@ jobs:
         with:
           version: v3.18.6
 
+      - name: Run release chart source tests
+        run: bash scripts/release-chart-source_test.sh
+
       - name: Lint and package chart
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
@@ -87,6 +93,8 @@ jobs:
           helm package charts/mkonnect --destination dist
           cd dist
           sha256sum "mkonnect-$VERSION.tgz" > "mkonnect-$VERSION.tgz.sha256"
+          cd ..
+          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "dist/mkonnect-$VERSION.tgz"
 
       - id: asset
         name: Name release asset bundle
@@ -159,8 +167,6 @@ jobs:
           rm -rf "$canonical"
           mkdir -p "$canonical"
           trap 'rm -f "$release_json"' EXIT
-          expected_hash=$(sha256sum "dist/$package" | awk '{ print $1 }')
-          expected_checksum=$(awk '{ print $1 }' "dist/$checksum")
 
           if "$chart_present" && "$checksum_present"; then
             gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --dir "$canonical"
@@ -178,8 +184,7 @@ jobs:
           fi
 
           (cd "$canonical" && sha256sum -c "$checksum")
-          [ "$(sha256sum "$canonical/$package" | awk '{ print $1 }')" = "$expected_hash" ]
-          [ "$(awk '{ print $1 }' "$canonical/$checksum")" = "$expected_checksum" ]
+          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "$canonical/$package"
           printf 'CANONICAL_DIR=%s\n' "$canonical" >> "$GITHUB_ENV"
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
@@ -211,8 +216,8 @@ jobs:
           version_tag="$VERSION"
           commit_tag="sha-$RELEASE_COMMIT"
 
-          image_digest() {
-            aws ecr-public describe-images --region us-east-1 --repository-name memento-connector --image-ids "imageTag=$1" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true
+          lookup_digest() {
+            bash scripts/ecr-public-image-digest.sh --repository memento-connector --tag "$1"
           }
 
           verify_labels() {
@@ -222,30 +227,40 @@ jobs:
             [ "$version" = "$VERSION" ] && [ "$revision" = "$RELEASE_COMMIT" ]
           }
 
-          version_digest=$(image_digest "$version_tag")
-          commit_digest=$(image_digest "$commit_tag")
-          [ "$version_digest" = None ] && version_digest=
-          [ "$commit_digest" = None ] && commit_digest=
+          if version_digest=$(lookup_digest "$version_tag"); then
+            version_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            version_exists=false
+            version_digest=
+          fi
+          if commit_digest=$(lookup_digest "$commit_tag"); then
+            commit_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            commit_exists=false
+            commit_digest=
+          fi
 
-          if [ -z "$version_digest" ] && [ -z "$commit_digest" ]; then
+          if ! "$version_exists" && ! "$commit_exists"; then
             docker build --build-arg VERSION="$VERSION" --build-arg REVISION="$RELEASE_COMMIT" -t "$image:$version_tag" -t "$image:$commit_tag" .
             docker push "$image:$version_tag"
             docker push "$image:$commit_tag"
-          elif [ -n "$version_digest" ] && [ -z "$commit_digest" ]; then
+          elif "$version_exists" && ! "$commit_exists"; then
             verify_labels "$version_tag"
-            manifest=$(aws ecr-public batch-get-image --region us-east-1 --repository-name memento-connector --image-ids "imageTag=$version_tag" --query 'images[0].imageManifest' --output text)
-            aws ecr-public put-image --region us-east-1 --repository-name memento-connector --image-tag "$commit_tag" --image-manifest "$manifest" >/dev/null
-          elif [ -z "$version_digest" ] && [ -n "$commit_digest" ]; then
+            docker buildx imagetools create --prefer-index=false --tag "$image:$commit_tag" "$image@$version_digest"
+          elif ! "$version_exists" && "$commit_exists"; then
             verify_labels "$commit_tag"
-            manifest=$(aws ecr-public batch-get-image --region us-east-1 --repository-name memento-connector --image-ids "imageTag=$commit_tag" --query 'images[0].imageManifest' --output text)
-            aws ecr-public put-image --region us-east-1 --repository-name memento-connector --image-tag "$version_tag" --image-manifest "$manifest" >/dev/null
+            docker buildx imagetools create --prefer-index=false --tag "$image:$version_tag" "$image@$commit_digest"
           else
             verify_labels "$version_tag"
             verify_labels "$commit_tag"
           fi
 
-          version_digest=$(image_digest "$version_tag")
-          commit_digest=$(image_digest "$commit_tag")
+          version_digest=$(lookup_digest "$version_tag")
+          commit_digest=$(lookup_digest "$commit_tag")
           [ -n "$version_digest" ] && [ "$version_digest" = "$commit_digest" ]
           printf 'IMAGE_DIGEST=%s\nIMAGE=%s\n' "$version_digest" "$image" >> "$GITHUB_ENV"
 
@@ -257,12 +272,17 @@ jobs:
           chart_uri="oci://$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/mkonnect"
 
           chart_digest() {
-            aws ecr-public describe-images --region us-east-1 --repository-name mkonnect --image-ids "imageTag=$VERSION" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true
+            bash scripts/ecr-public-image-digest.sh --repository mkonnect --tag "$VERSION"
           }
 
-          existing_digest=$(chart_digest)
-          [ "$existing_digest" = None ] && existing_digest=
-          if [ -z "$existing_digest" ]; then
+          if chart_digest >/dev/null; then
+            chart_exists=true
+          else
+            status=$?
+            [ "$status" -eq 3 ] || exit "$status"
+            chart_exists=false
+          fi
+          if ! "$chart_exists"; then
             helm push "$CANONICAL_DIR/$package" "oci://$ECR_REGISTRY/$ECR_PUBLIC_ALIAS"
           else
             pulled=$(mktemp -d)
