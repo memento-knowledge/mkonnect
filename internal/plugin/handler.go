@@ -51,7 +51,7 @@ func credentialRepresentations(cred creds.Credential) []string {
 		return nil
 	}
 
-	values := make([]string, 0, 16)
+	values := []string{cred.Token}
 	appendEncoded := func(value string) {
 		for _, encoded := range []string{
 			url.QueryEscape(value),
@@ -241,7 +241,8 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		// Inject local credentials only for this configured plugin. This happens
 		// after bridge headers are copied so the local credential cannot be replaced.
 		client := httpClient
-		if haveCred && cred.HasAuthorization() {
+		useDirectTransport := haveCred && cred.HasAuthorization()
+		if useDirectTransport {
 			cred.ApplyAuthorization(req)
 			client = directHTTPClient
 		}
@@ -263,7 +264,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 413, nil, errBody(`{"error":"upstream response too large"}`), nil
 		}
 		body := string(respBytes)
-		if responseContainsLocalCredentials(resp.Header, body, cred) {
+		if useDirectTransport && responseContainsLocalCredentials(resp.Header, body, cred) {
 			return http.StatusBadGateway, nil, errBody(unsafeCredentialResponse), nil
 		}
 

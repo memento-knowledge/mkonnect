@@ -24,7 +24,7 @@ func TestConfigSetAndList(t *testing.T) {
 		"--base-url", "http://jenkins:8080",
 		"--auth", "bearer",
 		"--token-stdin"},
-		strings.NewReader("secret"), &stdout); err != nil {
+		strings.NewReader("bearer-token-value"), &stdout); err != nil {
 		t.Fatalf("config set: %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestConfigSetAndList(t *testing.T) {
 		t.Fatalf("expected jenkins in list output:\n%s", out)
 	}
 	// Token must be masked
-	if strings.Contains(out, "secret") {
+	if strings.Contains(out, "bearer-token-value") {
 		t.Fatalf("token must be masked in list output:\n%s", out)
 	}
 }
@@ -149,10 +149,10 @@ func TestConfigSetTokenStdin(t *testing.T) {
 	var stdout bytes.Buffer
 	if err := cli.Run([]string{"config", "set", "jenkins",
 		"--base-url", "http://j:80", "--auth", "bearer", "--token-stdin"},
-		strings.NewReader("s3cr3t\n"), &stdout); err != nil {
+		strings.NewReader("s3cr3t-token-value\n"), &stdout); err != nil {
 		t.Fatalf("config set: %v", err)
 	}
-	if strings.Contains(stdout.String(), "s3cr3t") {
+	if strings.Contains(stdout.String(), "s3cr3t-token-value") {
 		t.Errorf("token from stdin must not appear in output:\n%s", stdout.String())
 	}
 	// The trailing newline must be trimmed, and the token stored verbatim.
@@ -160,10 +160,10 @@ func TestConfigSetTokenStdin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read creds file: %v", err)
 	}
-	if !strings.Contains(string(b), `"token": "s3cr3t"`) {
+	if !strings.Contains(string(b), `"token": "s3cr3t-token-value"`) {
 		t.Errorf("token from stdin not stored (trimmed) as expected:\n%s", b)
 	}
-	if strings.Contains(string(b), `s3cr3t\n`) {
+	if strings.Contains(string(b), `s3cr3t-token-value\n`) {
 		t.Errorf("trailing newline was not trimmed from the stdin token")
 	}
 }
@@ -179,6 +179,42 @@ func TestConfigSetTokenStdinEmpty(t *testing.T) {
 	}
 }
 
+func TestConfigSetRejectsShortTokenWithoutLeakingIt(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "bearer",
+			args: []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "bearer", "--token-stdin"},
+		},
+		{
+			name: "basic",
+			args: []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "basic", "--username", "local-user", "--token-stdin"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			credsPath := filepath.Join(t.TempDir(), "credentials.json")
+			t.Setenv("CREDS_FILE", credsPath)
+			const token = "short-token"
+
+			var stdout bytes.Buffer
+			err := cli.Run(tt.args, strings.NewReader(token), &stdout)
+			if err == nil || !strings.Contains(err.Error(), "at least 16") {
+				t.Fatalf("expected minimum-token-length error, got %v", err)
+			}
+			if strings.Contains(err.Error(), token) || strings.Contains(stdout.String(), token) {
+				t.Fatal("short token must not be repeated in an error or output")
+			}
+			if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
+				t.Fatalf("credential file was created after rejected token: %v", err)
+			}
+		})
+	}
+}
+
 func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
 	dir := t.TempDir()
 	credsPath := filepath.Join(dir, "credentials.json")
@@ -188,10 +224,10 @@ func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
 	if err := cli.Run([]string{"config", "set", "build-service",
 		"--base-url", "https://build.internal",
 		"--auth", "basic", "--username", "local-user", "--token-stdin"},
-		strings.NewReader("api-token\n"), &stdout); err != nil {
+		strings.NewReader("api-token-value-123\n"), &stdout); err != nil {
 		t.Fatalf("config set basic: %v", err)
 	}
-	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token") {
+	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token-value-123") {
 		t.Fatalf("credentials must not appear in output:\n%s", stdout.String())
 	}
 
@@ -199,7 +235,7 @@ func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read credentials: %v", err)
 	}
-	if !strings.Contains(string(data), `"username": "local-user"`) || !strings.Contains(string(data), `"token": "api-token"`) {
+	if !strings.Contains(string(data), `"username": "local-user"`) || !strings.Contains(string(data), `"token": "api-token-value-123"`) {
 		t.Fatalf("basic credentials were not stored locally:\n%s", data)
 	}
 
@@ -210,7 +246,7 @@ func TestConfigSetBasicTokenFromStdinAndMasksCredentials(t *testing.T) {
 	if !strings.Contains(stdout.String(), "basic ***") {
 		t.Fatalf("expected masked basic auth in list output:\n%s", stdout.String())
 	}
-	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token") {
+	if strings.Contains(stdout.String(), "local-user") || strings.Contains(stdout.String(), "api-token-value-123") {
 		t.Fatalf("credentials must be masked in list output:\n%s", stdout.String())
 	}
 }

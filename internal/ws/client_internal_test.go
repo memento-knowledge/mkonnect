@@ -59,7 +59,7 @@ func TestProbePluginDoesNotUseAmbientProxy(t *testing.T) {
 			BaseURL:  "http://example.invalid",
 			Auth:     "basic",
 			Username: "local-user",
-			Token:    "local-token",
+			Token:    "local-token-value-123",
 		}); err != nil {
 			t.Fatalf("store.Set: %v", err)
 		}

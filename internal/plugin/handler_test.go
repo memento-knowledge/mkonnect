@@ -90,7 +90,7 @@ func TestHTTPHandlerInjectsBearerToken(t *testing.T) {
 	if err := store.Set("jenkins", creds.Credential{
 		BaseURL: srv.URL,
 		Auth:    "bearer",
-		Token:   "secret",
+		Token:   "bearer-token-value",
 	}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
@@ -107,14 +107,14 @@ func TestHTTPHandlerInjectsBearerToken(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("expected 200, got %d", code)
 	}
-	if gotAuth != "Bearer secret" {
-		t.Fatalf("expected 'Bearer secret', got %q", gotAuth)
+	if gotAuth != "Bearer bearer-token-value" {
+		t.Fatalf("expected Bearer authorization, got %q", gotAuth)
 	}
 }
 
 func TestHTTPHandlerInjectsBasicCredentialsOnlyForConfiguredPlugin(t *testing.T) {
 	const username = "local-user"
-	const token = "api-token"
+	const token = "basic-token-value-123"
 	expectedBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+token))
 
 	gotAuth := make(map[string]string)
@@ -330,22 +330,22 @@ func TestHTTPHandlerBlocksBridgeResponseContainingLocalCredentials(t *testing.T)
 			name: "bearer",
 			store: func(t *testing.T, url string) *creds.Store {
 				store := mustStore(t)
-				if err := store.Set("svc", creds.Credential{BaseURL: url, Auth: "bearer", Token: "bearer-secret"}); err != nil {
+				if err := store.Set("svc", creds.Credential{BaseURL: url, Auth: "bearer", Token: "bearer-secret-value"}); err != nil {
 					t.Fatalf("store.Set: %v", err)
 				}
 				return store
 			},
-			forbidden: []string{"bearer-secret", "Bearer bearer-secret"},
+			forbidden: []string{"bearer-secret-value", "Bearer bearer-secret-value"},
 		},
 		{
 			name: "basic",
 			store: func(t *testing.T, url string) *creds.Store {
-				return mustStoreBasicCredential(t, "svc", url, "local-user", "api-token")
+				return mustStoreBasicCredential(t, "svc", url, "local-user", "basic-token-value-123")
 			},
 			forbidden: []string{
 				"local-user",
-				"api-token",
-				"Basic " + base64.StdEncoding.EncodeToString([]byte("local-user:api-token")),
+				"basic-token-value-123",
+				"Basic " + base64.StdEncoding.EncodeToString([]byte("local-user:basic-token-value-123")),
 			},
 		},
 	}
@@ -422,6 +422,56 @@ func TestHTTPHandlerBlocksBridgeResponseContainingEncodedLocalCredential(t *test
 	}
 }
 
+func TestHTTPHandlerBlocksBridgeResponseContainingRawLocalToken(t *testing.T) {
+	const token = "long-token-value-123"
+	tests := []struct {
+		name  string
+		store func(t *testing.T, url string) *creds.Store
+	}{
+		{
+			name: "bearer",
+			store: func(t *testing.T, url string) *creds.Store {
+				store := mustStore(t)
+				if err := store.Set("svc", creds.Credential{BaseURL: url, Auth: "bearer", Token: token}); err != nil {
+					t.Fatalf("store.Set: %v", err)
+				}
+				return store
+			},
+		},
+		{
+			name: "basic",
+			store: func(t *testing.T, url string) *creds.Store {
+				return mustStoreBasicCredential(t, "svc", url, "local-user", token)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Reflected-Token", token)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(token))
+			}))
+			defer srv.Close()
+
+			code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL))(context.Background(), proto.HTTPRequestMsg{
+				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+			})
+			if err != nil || code != http.StatusBadGateway {
+				t.Fatalf("code=%d err=%v, want 502 without an error", code, err)
+			}
+			message, err := json.Marshal(proto.HTTPResponseMsg{Type: "http_response", StatusCode: code, Headers: headers, Body: body})
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			if strings.Contains(string(message), token) {
+				t.Fatal("raw local token leaked into bridge response")
+			}
+		})
+	}
+}
+
 func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Note", "ordinary response")
@@ -477,7 +527,7 @@ func TestHTTPHandlerDoesNotUseAmbientProxy(t *testing.T) {
 		if err := store.Set("svc", creds.Credential{
 			BaseURL: "http://example.invalid",
 			Auth:    "bearer",
-			Token:   "local-token",
+			Token:   "local-token-value-123",
 		}); err != nil {
 			t.Fatalf("store.Set: %v", err)
 		}

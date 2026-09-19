@@ -134,6 +134,9 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		if tokenVal == "" {
 			return errors.New("--token-stdin was set but stdin was empty")
 		}
+		if len(tokenVal) < creds.MinTokenLength {
+			return fmt.Errorf("token must be at least %d characters", creds.MinTokenLength)
+		}
 	}
 
 	store, err := creds.New(credsPath())

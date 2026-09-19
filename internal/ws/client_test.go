@@ -1116,7 +1116,7 @@ func TestStatusRequestTriggersEmission(t *testing.T) {
 // HTTP probe and produces a test_result followed by a connection_status update.
 func TestTestConnectionProbesPlugin(t *testing.T) {
 	const username = "local-user"
-	const token = "api-token"
+	const token = "basic-token-value-123"
 	expectedAuthorization := "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+token))
 
 	// Start a real upstream HTTP server so the probe actually performs the local

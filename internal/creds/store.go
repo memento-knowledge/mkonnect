@@ -10,6 +10,10 @@ import (
 	"sync"
 )
 
+// MinTokenLength prevents ambiguous, short strings from being used as local
+// credentials or mistaken for ordinary response content.
+const MinTokenLength = 16
+
 // Credential holds a plugin's base URL and optional local HTTP authentication.
 type Credential struct {
 	BaseURL  string `json:"base_url"`
@@ -23,9 +27,9 @@ type Credential struct {
 func (c Credential) HasAuthorization() bool {
 	switch c.Auth {
 	case "bearer":
-		return c.Token != ""
+		return len(c.Token) >= MinTokenLength
 	case "basic":
-		return c.Username != "" && c.Token != ""
+		return c.Username != "" && len(c.Token) >= MinTokenLength
 	default:
 		return false
 	}

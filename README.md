@@ -69,7 +69,7 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 <exec> connector status           # configured plugins on this connector
 ```
 
-`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. Tokens are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history.
+`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history.
 
 ## Running
 
