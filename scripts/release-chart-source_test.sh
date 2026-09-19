@@ -9,13 +9,15 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 cp -R "$root/charts/mkonnect" "$tmpdir/chart"
 helm package "$tmpdir/chart" --destination "$tmpdir"
-package="$tmpdir/mkonnect-0.1.0.tgz"
+chart_name=$(awk '$1 == "name:" { print $2; exit }' "$tmpdir/chart/Chart.yaml")
+chart_version=$(awk '$1 == "version:" { print $2; exit }' "$tmpdir/chart/Chart.yaml")
+package="$tmpdir/$chart_name-$chart_version.tgz"
 bash "$verify" --chart-dir "$tmpdir/chart" --package "$package"
 
 sleep 1
 mkdir "$tmpdir/retry"
 helm package "$root/charts/mkonnect" --destination "$tmpdir/retry"
-retry_package="$tmpdir/retry/mkonnect-0.1.0.tgz"
+retry_package="$tmpdir/retry/$chart_name-$chart_version.tgz"
 bash "$verify" --chart-dir "$tmpdir/chart" --package "$retry_package"
 
 sed -i.bak 's/Memento on-prem connector/Changed connector/' "$tmpdir/chart/Chart.yaml"

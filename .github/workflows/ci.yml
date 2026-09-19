@@ -80,6 +80,9 @@ jobs:
       - name: Run release chart source tests
         run: bash scripts/release-chart-source_test.sh
 
+      - name: Run release asset bundle tests
+        run: bash scripts/release-asset-bundle_test.sh
+
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
 

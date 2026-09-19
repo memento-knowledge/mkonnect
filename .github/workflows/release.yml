@@ -85,6 +85,9 @@ jobs:
       - name: Run release chart source tests
         run: bash scripts/release-chart-source_test.sh
 
+      - name: Run release asset bundle tests
+        run: bash scripts/release-asset-bundle_test.sh
+
       - name: Lint and package chart
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
@@ -168,23 +171,28 @@ jobs:
           mkdir -p "$canonical"
           trap 'rm -f "$release_json"' EXIT
 
-          if "$chart_present" && "$checksum_present"; then
-            gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --dir "$canonical"
-          elif "$chart_present"; then
+          if "$chart_present"; then
             gh release download "$RELEASE_TAG" --pattern "$package" --dir "$canonical"
-            cp "dist/$checksum" "$canonical/$checksum"
-            gh release upload "$RELEASE_TAG" "$canonical/$checksum"
-          elif "$checksum_present"; then
+          fi
+          if "$checksum_present"; then
             gh release download "$RELEASE_TAG" --pattern "$checksum" --dir "$canonical"
-            cp "dist/$package" "$canonical/$package"
-            gh release upload "$RELEASE_TAG" "$canonical/$package"
-          else
-            cp "dist/$package" "dist/$checksum" "$canonical/"
-            gh release upload "$RELEASE_TAG" "$canonical/$package" "$canonical/$checksum"
           fi
 
-          (cd "$canonical" && sha256sum -c "$checksum")
-          bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "$canonical/$package"
+          bundle_output="$RUNNER_TEMP/release-asset-bundle-$VERSION.env"
+          bash scripts/release-asset-bundle.sh \
+            --chart-dir charts/mkonnect \
+            --source-package "dist/$package" \
+            --asset-dir "$canonical" \
+            --output "$bundle_output"
+          # shellcheck disable=SC1090
+          source "$bundle_output"
+          if "$chart_upload"; then
+            gh release upload "$RELEASE_TAG" "$canonical/$package"
+          fi
+          if "$checksum_upload"; then
+            gh release upload "$RELEASE_TAG" "$canonical/$checksum"
+          fi
+
           printf 'CANONICAL_DIR=%s\n' "$canonical" >> "$GITHUB_ENV"
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
