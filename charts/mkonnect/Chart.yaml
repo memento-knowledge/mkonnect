@@ -3,4 +3,4 @@ name: mkonnect
 description: Memento on-prem connector — bridges customer-internal tools to the Memento platform
 type: application
 version: 0.1.0
-appVersion: "0.1.0"
+appVersion: "20260919.0"
