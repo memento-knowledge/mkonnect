@@ -25,13 +25,14 @@ Runtime configuration comes from environment variables (internal-tool credential
 
 | Variable | Required | Description |
 |---|---|---|
-| `GATEWAY_URL` | yes | WebSocket URL of the Bridge Gateway, e.g. `wss://<customer-slug>.bridge.memento-platform.com/ws`. Must use `wss://` in production — `ws://` works but logs a warning, since private key material can be transmitted during first-run registration. |
+| `GATEWAY_URL` | yes | Secure WebSocket URL of the Bridge Gateway, e.g. `wss://<customer-slug>.bridge.memento-platform.com/ws`. Must use `wss://`. |
 | `CONNECTOR_ID` | yes | Stable UUID identifying this connector instance. |
 | `REGISTRATION_TOKEN` | first run only | One-time token used to register a new connector. Not needed after the private key has been issued and persisted. |
 | `KEY_FILE` | no | Path to the ML-DSA-65 private key file. Defaults to `~/.mkonnect/key`. |
 | `PROTOCOL_VERSION` | no | Wire protocol version to negotiate. Defaults to `v1`. |
 | `CREDS_FILE` | no | Path to the local credential store written by `connector config set`. Defaults to `/data/credentials.json`. |
 | `PLUGIN_<NAME>` | no | Base URL of an internal service to expose as plugin `<name>` (lowercased), e.g. `PLUGIN_JENKINS=http://jenkins:8080`. Must be an absolute `http://` or `https://` URL. Use this for endpoints that need no local credential; for endpoints requiring a token, use `connector config set` instead (see below). |
+| `ALLOW_INSECURE_GATEWAY` | no | Local development escape hatch. Setting this to `true` permits `ws://` only when `GATEWAY_URL` targets `localhost` or a loopback IP address. Never enable it in production. |
 
 ## Internal tool credentials
 
