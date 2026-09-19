@@ -12,7 +12,7 @@ import (
 // regardless of the ambient environment; the test then sets only what it needs.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "KEY_FILE", "PROTOCOL_VERSION"} {
+	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "KEY_FILE", "PROTOCOL_VERSION", "ALLOW_INSECURE_GATEWAY"} {
 		t.Setenv(k, "")
 	}
 }
@@ -83,13 +83,31 @@ func TestLoadPreservesExplicitValues(t *testing.T) {
 	}
 }
 
-// TestLoadAllowsPlaintextWebSocket confirms ws:// is accepted (with a stderr warning, not
-// asserted here) so a plaintext dev/test gateway still works.
-func TestLoadAllowsPlaintextWebSocket(t *testing.T) {
+func TestLoadRejectsPlaintextWebSocketByDefault(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("GATEWAY_URL", "ws://localhost:8080/ws")
 	t.Setenv("CONNECTOR_ID", "c1")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected ws:// to be rejected without an explicit development opt-in")
+	}
+}
+
+func TestLoadRejectsPlaintextWebSocketForNonLoopbackHost(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GATEWAY_URL", "ws://gateway.example.com/ws")
+	t.Setenv("CONNECTOR_ID", "c1")
+	t.Setenv("ALLOW_INSECURE_GATEWAY", "true")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected ws:// to be rejected for a non-loopback host")
+	}
+}
+
+func TestLoadAllowsExplicitPlaintextLoopbackGateway(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GATEWAY_URL", "ws://127.0.0.1:8080/ws")
+	t.Setenv("CONNECTOR_ID", "c1")
+	t.Setenv("ALLOW_INSECURE_GATEWAY", "true")
 	if _, err := config.Load(); err != nil {
-		t.Fatalf("ws:// should be allowed, got error: %v", err)
+		t.Fatalf("explicitly enabled loopback ws:// should be allowed, got error: %v", err)
 	}
 }

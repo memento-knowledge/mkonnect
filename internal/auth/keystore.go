@@ -4,6 +4,7 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -25,11 +26,27 @@ func NewKeyStore(path string) *KeyStore {
 // Returns (nil, false, nil) if the file does not exist.
 // Returns (nil, false, err) on read or parse errors.
 func (ks *KeyStore) Load() (*mldsa65.PrivateKey, bool, error) {
-	data, err := os.ReadFile(ks.path)
+	f, err := os.Open(ks.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, false, nil
 		}
+		return nil, false, fmt.Errorf("reading key file: %w", err)
+	}
+	defer f.Close() //nolint:errcheck
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf("stat key file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("key file must be a regular file")
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, false, fmt.Errorf("key file has unsafe permissions %04o; require owner-only access", perm)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
 		return nil, false, fmt.Errorf("reading key file: %w", err)
 	}
 	priv, err := UnmarshalPrivateKey(data)

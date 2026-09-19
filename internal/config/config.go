@@ -3,6 +3,8 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,11 +49,20 @@ func Load() (*Config, error) {
 	if cfg.GatewayURL == "" {
 		return nil, fmt.Errorf("GATEWAY_URL is required")
 	}
-	if !strings.HasPrefix(cfg.GatewayURL, "ws://") && !strings.HasPrefix(cfg.GatewayURL, "wss://") {
-		return nil, fmt.Errorf("GATEWAY_URL must start with ws:// or wss://")
+	gatewayURL, err := url.Parse(cfg.GatewayURL)
+	if err != nil || gatewayURL.Host == "" || (gatewayURL.Scheme != "ws" && gatewayURL.Scheme != "wss") {
+		return nil, fmt.Errorf("GATEWAY_URL must be an absolute ws:// or wss:// URL")
 	}
-	if strings.HasPrefix(cfg.GatewayURL, "ws://") {
-		fmt.Fprintln(os.Stderr, "WARNING: GATEWAY_URL uses ws:// (plaintext). Use wss:// in production — private keys are transmitted over this connection.")
+	if gatewayURL.Scheme == "ws" {
+		if os.Getenv("ALLOW_INSECURE_GATEWAY") != "true" {
+			return nil, fmt.Errorf("GATEWAY_URL must use wss://; for local development only, set ALLOW_INSECURE_GATEWAY=true with a loopback ws:// URL")
+		}
+		host := gatewayURL.Hostname()
+		ip := net.ParseIP(host)
+		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+			return nil, fmt.Errorf("ALLOW_INSECURE_GATEWAY only permits ws:// loopback URLs")
+		}
+		fmt.Fprintln(os.Stderr, "WARNING: plaintext loopback gateway explicitly enabled for local development")
 	}
 	if cfg.ConnectorID == "" {
 		return nil, fmt.Errorf("CONNECTOR_ID is required")

@@ -139,3 +139,20 @@ func TestKeyStoreRoundTrip(t *testing.T) {
 		t.Fatal("loaded key does not match saved key")
 	}
 }
+
+func TestKeyStoreRejectsKeyReadableByOtherUsers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	_, priv := generateKey(t)
+	var packed [mldsa65.PrivateKeySize]byte
+	priv.Pack(&packed)
+	if err := os.WriteFile(path, packed[:], 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	if _, _, err := NewKeyStore(path).Load(); err == nil {
+		t.Fatal("expected Load to reject a key readable by group or other users")
+	}
+}
