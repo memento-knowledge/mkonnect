@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
+	"github.com/memento-knowledge/mkonnect/internal/plugin"
 )
 
 func TestProbePluginRejectsCredentialBearingBaseURL(t *testing.T) {
@@ -82,6 +83,39 @@ func TestProbePluginDoesNotUseAmbientProxy(t *testing.T) {
 	}
 	if proxyCalls.Load() != 0 {
 		t.Fatal("connectivity probe sent a local credential-bearing request through HTTP_PROXY")
+	}
+}
+
+func TestProbePluginUsesAmbientProxyWithoutLocalCredentials(t *testing.T) {
+	if os.Getenv("MKONNECT_PROXY_TEST_CHILD") == "1" {
+		t.Setenv("PLUGIN_SVC", "http://example.invalid")
+		registry, err := plugin.Load(nil)
+		if err != nil {
+			t.Fatalf("plugin.Load: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		result := (&Client{pluginReg: registry}).probePlugin(ctx, "svc")
+		if result.Status != "connected" {
+			t.Fatalf("status = %q, want connected through proxy", result.Status)
+		}
+		return
+	}
+
+	var proxyCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestProbePluginUsesAmbientProxyWithoutLocalCredentials$", "-test.v")
+	cmd.Env = proxyTestEnvironment(proxy.URL)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("proxy child failed: %v\n%s", err, output)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy calls = %d, want 1 for unauthenticated plugin", proxyCalls.Load())
 	}
 }
 

@@ -485,7 +485,8 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		result.Diagnostic = safeDiagnostic(err)
 		return result
 	}
-	if haveCredential {
+	useDirectTransport := haveCredential && credential.HasAuthorization()
+	if useDirectTransport {
 		credential.ApplyAuthorization(req)
 	}
 
@@ -493,11 +494,13 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	// with a 200 and hide an auth_failure, and following redirects could forward the
 	// local credentials to a third-party host.
 	probeClient := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: httpclient.NewDirectTransport(),
+		Timeout: 10 * time.Second,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
+	}
+	if useDirectTransport {
+		probeClient.Transport = httpclient.NewDirectTransport()
 	}
 	resp, err := probeClient.Do(req)
 	if err != nil {

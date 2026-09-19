@@ -18,10 +18,23 @@ type Credential struct {
 	Token    string `json:"token,omitempty"`
 }
 
+// HasAuthorization reports whether this credential has the local fields needed
+// to construct an Authorization header.
+func (c Credential) HasAuthorization() bool {
+	switch c.Auth {
+	case "bearer":
+		return c.Token != ""
+	case "basic":
+		return c.Username != "" && c.Token != ""
+	default:
+		return false
+	}
+}
+
 // ApplyAuthorization adds this credential's Authorization header to req when its
 // configured authentication mode has all required local credential fields.
 func (c Credential) ApplyAuthorization(req *http.Request) {
-	if c.Token == "" {
+	if !c.HasAuthorization() {
 		return
 	}
 	switch c.Auth {

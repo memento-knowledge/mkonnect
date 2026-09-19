@@ -445,6 +445,32 @@ func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
 	}
 }
 
+func TestHTTPHandlerPreservesResponseContainingBareShortToken(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Note", "id")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":42}`))
+	}))
+	defer srv.Close()
+
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: "id"}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	if headers["X-Note"] != "id" {
+		t.Fatalf("response header was altered: %q", headers["X-Note"])
+	}
+	if body == nil || *body != `{"id":42}` {
+		t.Fatalf("response body was altered: %v", body)
+	}
+}
+
 func TestHTTPHandlerDoesNotUseAmbientProxy(t *testing.T) {
 	if os.Getenv("MKONNECT_PROXY_TEST_CHILD") == "1" {
 		store := mustStore(t)
@@ -477,6 +503,36 @@ func TestHTTPHandlerDoesNotUseAmbientProxy(t *testing.T) {
 	}
 	if proxyCalls.Load() != 0 {
 		t.Fatal("HTTP handler sent a local credential-bearing request through HTTP_PROXY")
+	}
+}
+
+func TestHTTPHandlerUsesAmbientProxyWithoutLocalCredentials(t *testing.T) {
+	if os.Getenv("MKONNECT_PROXY_TEST_CHILD") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		defer cancel()
+		code, _, _, err := HTTPHandler(newRegistry("svc", "http://example.invalid"), mustStore(t))(ctx, proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+		})
+		if err != nil || code != http.StatusOK {
+			t.Fatalf("code=%d err=%v, want proxy response", code, err)
+		}
+		return
+	}
+
+	var proxyCalls atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyCalls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxy.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHTTPHandlerUsesAmbientProxyWithoutLocalCredentials$", "-test.v")
+	cmd.Env = proxyTestEnvironment(proxy.URL)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("proxy child failed: %v\n%s", err, output)
+	}
+	if proxyCalls.Load() != 1 {
+		t.Fatalf("proxy calls = %d, want 1 for unauthenticated plugin", proxyCalls.Load())
 	}
 }
 

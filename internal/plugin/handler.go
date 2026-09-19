@@ -86,31 +86,7 @@ func credentialRepresentations(cred creds.Credential) []string {
 	return values
 }
 
-func isTokenByte(b byte) bool {
-	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '.' || b == '_' || b == '~'
-}
-
-func containsBareToken(value, token string) bool {
-	for start := 0; ; {
-		offset := strings.Index(value[start:], token)
-		if offset < 0 {
-			return false
-		}
-		index := start + offset
-		beforeOK := index == 0 || !isTokenByte(value[index-1])
-		end := index + len(token)
-		afterOK := end == len(value) || !isTokenByte(value[end])
-		if beforeOK && afterOK {
-			return true
-		}
-		start = end
-	}
-}
-
-func containsCredentialRepresentation(value string, token string, representations []string) bool {
-	if containsBareToken(value, token) {
-		return true
-	}
+func containsCredentialRepresentation(value string, representations []string) bool {
 	for _, representation := range representations {
 		if strings.Contains(value, representation) {
 			return true
@@ -127,15 +103,15 @@ func responseContainsLocalCredentials(headers http.Header, body string, cred cre
 	if len(representations) == 0 {
 		return false
 	}
-	if containsCredentialRepresentation(body, cred.Token, representations) {
+	if containsCredentialRepresentation(body, representations) {
 		return true
 	}
 	for key, values := range headers {
-		if containsCredentialRepresentation(key, cred.Token, representations) {
+		if containsCredentialRepresentation(key, representations) {
 			return true
 		}
 		for _, value := range values {
-			if containsCredentialRepresentation(value, cred.Token, representations) {
+			if containsCredentialRepresentation(value, representations) {
 				return true
 			}
 		}
@@ -157,6 +133,12 @@ var upstreamTimeout = 10 * time.Second
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
+		Timeout: upstreamTimeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	directHTTPClient := &http.Client{
 		Timeout:   upstreamTimeout,
 		Transport: httpclient.NewDirectTransport(),
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -258,11 +240,13 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 
 		// Inject local credentials only for this configured plugin. This happens
 		// after bridge headers are copied so the local credential cannot be replaced.
-		if haveCred {
+		client := httpClient
+		if haveCred && cred.HasAuthorization() {
 			cred.ApplyAuthorization(req)
+			client = directHTTPClient
 		}
 
-		resp, err := httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, nil, ctx.Err()
