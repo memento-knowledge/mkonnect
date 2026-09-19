@@ -4,7 +4,8 @@ image:
   # required: set to your published registry, e.g. public.ecr.aws/<alias>/memento-connector
   repository: ""
   pullPolicy: IfNotPresent
-  tag: "latest"
+  # Set an explicit stable release version in production. Defaults to Chart.appVersion.
+  tag: ""
 
 config:
   gatewayUrl: ""           # required: wss://<customer-slug>.bridge.memento-platform.com/ws

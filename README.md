@@ -128,7 +128,7 @@ gofmt -l .                 # formatting (should print nothing)
 helm lint charts/mkonnect  # lint the chart
 ```
 
-CI (see [.github/workflows/ci.yml](.github/workflows/ci.yml)) runs tests, a lint gate (`gofmt`, `go vet`, `staticcheck`, `govulncheck`), and Helm lint on every push and pull request, and builds/pushes the Docker image to Amazon ECR Public on merges to `main`.
+CI (see [.github/workflows/ci.yml](.github/workflows/ci.yml)) runs tests, a lint gate (`gofmt`, `go vet`, `staticcheck`, `govulncheck`, `actionlint`), and Helm lint on every push and pull request. Versioned artifacts are published only by the [release workflow](.github/workflows/release.yml) when an annotated stable release tag is pushed.
 
 ## Project layout
 

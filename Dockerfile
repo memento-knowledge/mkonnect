@@ -13,10 +13,15 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/memento-know
 # Stage 2: runtime (distroless, non-root)
 FROM gcr.io/distroless/static:nonroot
 
+ARG VERSION=dev
+ARG REVISION=unknown
+
 LABEL org.opencontainers.image.title="mkonnect" \
       org.opencontainers.image.description="Memento on-prem connector — bridges customer-internal tools to the Memento platform" \
       org.opencontainers.image.source="https://github.com/memento-knowledge/mkonnect" \
-      org.opencontainers.image.licenses="MIT"
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION"
 
 COPY --from=builder /mkonnect /mkonnect
 
