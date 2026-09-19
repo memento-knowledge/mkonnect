@@ -41,8 +41,11 @@ jobs:
         run: |
           git fetch --force origin main:refs/remotes/origin/main
           git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-          bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
           git checkout --detach "$RELEASE_TAG^{commit}"
+          bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
+
+      - name: Run release metadata tests
+        run: bash scripts/release-metadata_test.sh
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
@@ -73,6 +76,8 @@ jobs:
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.18.6
 
       - name: Lint and package chart
         env:
@@ -154,16 +159,18 @@ jobs:
           rm -rf "$canonical"
           mkdir -p "$canonical"
           trap 'rm -f "$release_json"' EXIT
+          expected_hash=$(sha256sum "dist/$package" | awk '{ print $1 }')
+          expected_checksum=$(awk '{ print $1 }' "dist/$checksum")
 
           if "$chart_present" && "$checksum_present"; then
             gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --dir "$canonical"
           elif "$chart_present"; then
             gh release download "$RELEASE_TAG" --pattern "$package" --dir "$canonical"
-            (cd "$canonical" && sha256sum "$package" >"$checksum")
+            cp "dist/$checksum" "$canonical/$checksum"
             gh release upload "$RELEASE_TAG" "$canonical/$checksum"
           elif "$checksum_present"; then
-            cp "dist/$package" "dist/$checksum" "$canonical/"
-            (cd "$canonical" && sha256sum -c "$checksum")
+            gh release download "$RELEASE_TAG" --pattern "$checksum" --dir "$canonical"
+            cp "dist/$package" "$canonical/$package"
             gh release upload "$RELEASE_TAG" "$canonical/$package"
           else
             cp "dist/$package" "dist/$checksum" "$canonical/"
@@ -171,6 +178,8 @@ jobs:
           fi
 
           (cd "$canonical" && sha256sum -c "$checksum")
+          [ "$(sha256sum "$canonical/$package" | awk '{ print $1 }')" = "$expected_hash" ]
+          [ "$(awk '{ print $1 }' "$canonical/$checksum")" = "$expected_checksum" ]
           printf 'CANONICAL_DIR=%s\n' "$canonical" >> "$GITHUB_ENV"
 
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
@@ -189,6 +198,8 @@ jobs:
         run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
 
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: v3.18.6
 
       - name: Log in to Helm registry
         run: aws ecr-public get-login-password --region us-east-1 | helm registry login --username AWS --password-stdin public.ecr.aws

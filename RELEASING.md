@@ -17,7 +17,9 @@ Set the public registry alias as a GitHub Actions repository variable:
 gh variable set ECR_PUBLIC_ALIAS --repo memento-knowledge/mkonnect --body h2a8k0r3
 ```
 
-Keep `AWS_ROLE_ARN` as a GitHub Actions secret. The role's GitHub OIDC trust policy must accept `sts.amazonaws.com` as its audience and include this tag subject alongside any existing trusted subjects:
+Before trusting a release-tag OIDC subject, create a GitHub repository ruleset for `refs/tags/v*`. Restrict tag creation, updates, and deletion to the release maintainers, with no broad bypass. A user who can create a matching tag can otherwise start the release workflow and obtain its AWS identity.
+
+Keep `AWS_ROLE_ARN` as a GitHub Actions secret. After the ruleset is active, the role's GitHub OIDC trust policy must accept `sts.amazonaws.com` as its audience and include this tag subject alongside any existing trusted subjects:
 
 ```json
 {
@@ -37,6 +39,8 @@ gh api repos/memento-knowledge/mkonnect --jq .id
 ```
 
 Grant the role `ecr-public:GetAuthorizationToken` and `sts:GetServiceBearerToken` with `Resource: "*"`. Restrict these ECR Public actions to the ARNs of only the two repositories above: `ecr-public:BatchCheckLayerAvailability`, `ecr-public:BatchGetImage`, `ecr-public:CompleteLayerUpload`, `ecr-public:DescribeImages`, `ecr-public:InitiateLayerUpload`, `ecr-public:PutImage`, and `ecr-public:UploadLayerPart`.
+
+The workflows use Helm `v3.18.6` for chart linting, packaging, and publication. Update that version only through a reviewed change that validates the new package format and OCI behavior.
 
 ## Prepare a release
 
