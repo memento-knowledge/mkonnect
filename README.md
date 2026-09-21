@@ -4,6 +4,15 @@
 
 Lightweight on-prem connector for the Memento Knowledge (mk) platform. It runs inside a customer's network and bridges internal tools — Jenkins, Prometheus, Coralogix, and more — to the Memento platform over a secure WebSocket tunnel, so nothing needs to be exposed to the public internet.
 
+## Documentation
+
+Administrator guides live in [`docs/`](docs/):
+
+- **[Installation guide](docs/installation.md)** — deploy with Docker or Helm, verify the connection, upgrade, and uninstall.
+- **[Setup guide](docs/setup.md)** — make your internal tools reachable and attach credentials safely.
+
+The rest of this README is a conceptual overview and configuration reference.
+
 ## How it works
 
 ```
@@ -69,7 +78,7 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 <exec> connector status           # configured plugins on this connector
 ```
 
-`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. Changes are picked up on the next request; send the process a `SIGHUP` to reload immediately without a restart. Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history.
+`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
 
 ## Releases
 
