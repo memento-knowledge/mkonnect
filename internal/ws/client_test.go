@@ -1244,8 +1244,11 @@ func TestConnectFailsFastWhenKeyDirUnwritable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// An existing but non-writable key directory: the key file is absent (so Load reports
-	// "not registered" and takes the first-run path), but the private key cannot be saved.
+	// An existing key directory with mode 0500 (r-x). The execute/search bit still lets
+	// Load look up the *absent* key file, so Load returns "not registered" (ENOENT, not a
+	// permission error) and Connect takes the first-run path — while the missing write bit
+	// makes creating the key file fail, which is exactly what the EnsureWritable pre-flight
+	// must catch before the gateway is contacted.
 	roDir := filepath.Join(t.TempDir(), "ro")
 	if err := os.Mkdir(roDir, 0o500); err != nil {
 		t.Fatalf("mkdir: %v", err)
