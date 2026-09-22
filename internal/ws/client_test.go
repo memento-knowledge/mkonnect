@@ -1212,6 +1212,44 @@ func TestTestConnectionProbesPlugin(t *testing.T) {
 }
 
 // TestNonceMarshal verifies the Nonce type round-trips through JSON correctly.
+// TestConnectFailsFastWhenKeyDirUnwritable verifies that, on first run, an unwritable key
+// directory makes Connect fail *before* dialing the gateway — so the one-time registration
+// token is never consumed. Registering only to fail at Save() would burn the token and leave
+// every retry stuck on "token already consumed".
+func TestConnectFailsFastWhenKeyDirUnwritable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root bypasses directory write permissions")
+	}
+	var contacted atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		contacted.Store(true)
+	}))
+	defer srv.Close()
+
+	// An existing but non-writable key directory: the key file is absent (so Load reports
+	// "not registered" and takes the first-run path), but the private key cannot be saved.
+	roDir := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) }) // let TempDir cleanup remove it
+	keyFile := filepath.Join(roDir, "key")
+
+	cfg := newTestConfig(srv.URL, keyFile) // RegistrationToken is set (first-run path)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+
+	err := client.Connect(context.Background())
+	if err == nil {
+		t.Fatal("expected Connect to fail when the key dir is unwritable")
+	}
+	if !strings.Contains(err.Error(), "cannot register") {
+		t.Errorf("error = %v, want it to explain the registration was refused", err)
+	}
+	if contacted.Load() {
+		t.Error("gateway was contacted despite an unwritable key dir — the one-time token could be consumed")
+	}
+}
+
 func TestNonceMarshal(t *testing.T) {
 	var n proto.Nonce
 	for i := range n {
