@@ -1212,6 +1212,24 @@ func TestTestConnectionProbesPlugin(t *testing.T) {
 }
 
 // TestNonceMarshal verifies the Nonce type round-trips through JSON correctly.
+func TestNonceMarshal(t *testing.T) {
+	var n proto.Nonce
+	for i := range n {
+		n[i] = byte(i)
+	}
+	data, err := json.Marshal(n)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var n2 proto.Nonce
+	if err := json.Unmarshal(data, &n2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if n != n2 {
+		t.Errorf("nonce round-trip mismatch: got %v, want %v", n2, n)
+	}
+}
+
 // TestConnectFailsFastWhenKeyDirUnwritable verifies that, on first run, an unwritable key
 // directory makes Connect fail *before* dialing the gateway — so the one-time registration
 // token is never consumed. Registering only to fail at Save() would burn the token and leave
@@ -1247,23 +1265,5 @@ func TestConnectFailsFastWhenKeyDirUnwritable(t *testing.T) {
 	}
 	if contacted.Load() {
 		t.Error("gateway was contacted despite an unwritable key dir — the one-time token could be consumed")
-	}
-}
-
-func TestNonceMarshal(t *testing.T) {
-	var n proto.Nonce
-	for i := range n {
-		n[i] = byte(i)
-	}
-	data, err := json.Marshal(n)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var n2 proto.Nonce
-	if err := json.Unmarshal(data, &n2); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if n != n2 {
-		t.Errorf("nonce round-trip mismatch: got %v, want %v", n2, n)
 	}
 }

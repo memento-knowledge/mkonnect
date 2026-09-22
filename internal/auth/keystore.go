@@ -74,8 +74,15 @@ func (k *KeyStore) EnsureWritable() error {
 		return fmt.Errorf("key directory %s is not writable (fix the volume/mount permissions): %w", dir, err)
 	}
 	name := f.Name()
-	_ = f.Close()
+	// Write a full key-sized payload, not just create the file: inode creation can
+	// succeed on a device that is out of space where the subsequent write fails, and
+	// Save writes the whole key — so the probe should too.
+	_, writeErr := f.Write(make([]byte, mldsa65.PrivateKeySize))
+	closeErr := f.Close()
 	_ = os.Remove(name) // best-effort cleanup of the probe file
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return fmt.Errorf("key directory %s is not writable (fix the volume/mount permissions): %w", dir, err)
+	}
 	return nil
 }
 
