@@ -23,6 +23,67 @@ outbound request *inside your network*. They are never sent to the Memento platf
 additionally strips credential-bearing response headers and refuses to return a response that
 reflects your local token back through the tunnel.
 
+## How your credentials are stored
+
+Be clear-eyed about where these secrets live:
+
+- They are written to a JSON file on the connector's own volume — `/data/credentials.json` by
+  default, or wherever `CREDS_FILE` points. The file is created with mode `0600` (owner-only) and
+  owned by the non-root container user (uid `65532`), and is written atomically.
+- **Tokens are stored in cleartext.** mkonnect does not encrypt them at rest and does not integrate
+  with an external secret manager or OS keychain on its own. Anyone who can read that volume — a
+  `docker exec` into the container, `root` on the host reading the Docker named volume, or a backup
+  or snapshot of it — can read the tokens. Treat the connector host and its `/data` volume as
+  sensitive: restrict who can reach them, and encrypt (or exclude) that volume in your backups.
+- As covered in the trust boundary above, the tokens never leave your network — they are injected
+  into the outbound request on-prem and are never sent to the Memento platform.
+
+If your platform provides a secret manager (HashiCorp Vault, a cloud secret store, Kubernetes
+Secrets), prefer sourcing the credential file from it rather than typing tokens into a long-lived
+container. On Kubernetes, mount a Secret as the credential file — see below.
+
+### Mounting a Secret as the credential file (Kubernetes)
+
+Instead of running `connector config set` against a live pod, keep the credentials in a `Secret`
+you manage — which can itself be backed by Vault, the External Secrets Operator, or a cloud secret
+store — and mount it into the connector. The plaintext then lives only in that Secret, never in your
+Helm values or shell history.
+
+1. Build the credential JSON (same shape the CLI writes) and load it into a Secret:
+
+   ```bash
+   cat > credentials.json <<'EOF'
+   {
+     "jenkins": {
+       "base_url": "http://jenkins.internal:8080",
+       "auth": "bearer",
+       "token": "REPLACE_WITH_TOKEN"
+     }
+   }
+   EOF
+   kubectl create secret generic mkonnect-tool-creds \
+     --from-file=credentials.json=./credentials.json
+   rm credentials.json
+   ```
+
+   Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
+   `basic`, or omit for none), `username` (basic auth only), and `token` (at least 16 characters).
+
+2. Point the chart at the Secret in your values:
+
+   ```yaml
+   credentials:
+     secretName: mkonnect-tool-creds
+     key: credentials.json
+   ```
+
+The chart then mounts the Secret **read-only** at `/etc/mkonnect/credentials.json` (mode `0440`, so
+the non-root connector can read it via its `fsGroup`) and sets `CREDS_FILE` accordingly. Because the
+mount is read-only, `connector config set` cannot write there — manage credentials by updating the
+Secret and restarting the workload (`kubectl rollout restart deployment/mkonnect`). Leaving
+`credentials.secretName` empty keeps the default behavior (a writable `/data/credentials.json` you
+manage with the CLI).
+
 ## Running the connector CLI
 
 The `connector` subcommand is built into the same binary, so run it inside the running container:

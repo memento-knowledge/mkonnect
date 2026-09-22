@@ -92,16 +92,29 @@ func New(path string) (*Store, error) {
 		}
 		return s, nil
 	}
-	// Ensure the credentials file is not readable by group or others.
-	// If chmod fails, verify the existing mode is already safe before continuing;
-	// an unreadable-by-others file is acceptable, a world-readable one is not.
+	// On a writable store, tighten the file to 0600. If chmod fails — most often
+	// because the file is on a read-only mount, e.g. a Kubernetes Secret — fall
+	// back to verifying the existing mode is safe (see readOnlyModeAcceptable).
 	if err := os.Chmod(path, 0600); err != nil {
 		info, statErr := os.Stat(path)
-		if statErr != nil || info.Mode().Perm()&0o077 != 0 {
-			return nil, fmt.Errorf("credentials file %s has unsafe permissions and chmod failed: %w", path, err)
+		if statErr != nil || !readOnlyModeAcceptable(info.Mode()) {
+			return nil, fmt.Errorf("credentials file %s has unsafe permissions and chmod failed; restrict it to the owner, allowing at most group read (e.g. 0600 or 0640): %w", path, err)
 		}
 	}
 	return s, nil
+}
+
+// readOnlyModeAcceptable reports whether a credentials file whose mode could not
+// be corrected to 0600 (typically a read-only mount) is still safe to use.
+//
+// It forbids any access by "other" (world) and any write by "group", while
+// allowing group *read*. Group read is required because Kubernetes mounts a
+// Secret volume owned by root with group set to the pod's fsGroup, so a non-root
+// connector can only read its own credential file through the group bit; a
+// Secret mounted read-only cannot be chmod-ed to 0600 at runtime.
+func readOnlyModeAcceptable(mode os.FileMode) bool {
+	// 0o027 = group-write (0o020) plus all "other" bits (0o007).
+	return mode.Perm()&0o027 == 0
 }
 
 // Get returns the credential for plugin, or false if not found.
