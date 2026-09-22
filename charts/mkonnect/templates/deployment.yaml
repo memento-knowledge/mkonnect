@@ -31,6 +31,10 @@ spec:
               value: {{ .Values.config.protocolVersion | quote }}
             - name: KEY_FILE
               value: {{ .Values.config.keyFile | quote }}
+            {{- if .Values.credentials.secretName }}
+            - name: CREDS_FILE
+              value: {{ printf "/etc/mkonnect/%s" (required "credentials.key is required when credentials.secretName is set" .Values.credentials.key) | quote }}
+            {{- end }}
             {{- range $plugin, $url := .Values.plugins }}
             - name: PLUGIN_{{ $plugin | upper }}
               value: {{ $url | quote }}
@@ -38,6 +42,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            {{- if .Values.credentials.secretName }}
+            - name: credentials
+              mountPath: /etc/mkonnect
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           startupProbe:
@@ -55,3 +64,16 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.credentials.secretName }}
+        - name: credentials
+          secret:
+            secretName: {{ .Values.credentials.secretName | quote }}
+            # 0440 (r--r-----): Kubernetes mounts the Secret owned by root with
+            # group = the pod's fsGroup (65532), so the non-root connector reads
+            # it through the group bit. The connector accepts owner+group-read
+            # but rejects any world access, so do not widen this.
+            defaultMode: 0440
+            items:
+              - key: {{ required "credentials.key is required when credentials.secretName is set" .Values.credentials.key | quote }}
+                path: {{ .Values.credentials.key | quote }}
+        {{- end }}

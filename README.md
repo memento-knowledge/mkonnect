@@ -48,7 +48,7 @@ Runtime configuration comes from environment variables (internal-tool credential
 A plugin's backend can be defined two ways:
 
 - **`PLUGIN_<NAME>` env var** — just a base URL, no authentication injected. Suitable for unauthenticated internal endpoints (e.g. an open Prometheus).
-- **Local credential store** — configured on the connector host with the `connector` CLI and persisted to `CREDS_FILE` (`/data/credentials.json`, mode `0600`). It supports Bearer tokens and HTTP Basic credentials (username plus token). **Credentials are injected into the outbound request inside your network and are never sent to the Memento platform.**
+- **Local credential store** — configured on the connector host with the `connector` CLI and persisted to `CREDS_FILE` (`/data/credentials.json`, mode `0600`). It supports Bearer tokens and HTTP Basic credentials (username plus token). **Credentials are injected into the outbound request inside your network and are never sent to the Memento platform.** They are stored in cleartext on the connector's volume (not encrypted at rest); on Kubernetes you can mount a `Secret` as the credential file instead. See [How your credentials are stored](docs/setup.md#how-your-credentials-are-stored).
 
 When both define the same plugin name, the credential store wins.
 

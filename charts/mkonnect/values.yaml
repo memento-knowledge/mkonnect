@@ -17,6 +17,22 @@ config:
 # Example: jenkins: "http://jenkins:8080"
 plugins: {}
 
+# Optionally mount a pre-created Secret as the connector's read-only credential
+# store, instead of writing it at runtime with `connector config set`. This is
+# the recommended way to manage tool credentials on Kubernetes: the plaintext
+# lives only in a Secret you control (and can source from Vault, the External
+# Secrets Operator, etc.), never in this values file.
+#
+# The Secret must hold the credentials JSON under the key named below. Its
+# format matches the file `connector config set` writes:
+#   { "jenkins": { "base_url": "http://jenkins:8080", "auth": "bearer",
+#                  "token": "<token>" } }
+# When secretName is set, the connector reads this file and does not accept
+# `connector config set` (the mount is read-only).
+credentials:
+  secretName: ""              # name of an existing Secret; empty disables the mount
+  key: "credentials.json"     # key within that Secret holding the credentials JSON
+
 persistence:
   enabled: true
   size: 1Gi

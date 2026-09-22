@@ -130,6 +130,37 @@ func TestStoreReload(t *testing.T) {
 	}
 }
 
+func TestStoreNewAcceptsGroupReadableFile(t *testing.T) {
+	// A credentials file delivered group-readable (as a Kubernetes Secret is,
+	// with defaultMode 0440/0640) must be accepted. On a writable volume New
+	// also tightens it back to owner-only.
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	data, err := json.Marshal(map[string]creds.Credential{
+		"jenkins": {BaseURL: "http://jenkins:8080", Auth: "bearer", Token: "test-token-value-123"},
+	})
+	if err != nil {
+		t.Fatalf("marshal credentials: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		t.Fatalf("write credentials: %v", err)
+	}
+
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New with group-readable file: %v", err)
+	}
+	if _, ok := s.Get("jenkins"); !ok {
+		t.Fatal("expected credential to load")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("expected writable credentials file to be tightened to 0600, got %#o", perm)
+	}
+}
+
 func TestStoreNewMissingFileOK(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	s, err := creds.New(path) // file does not exist yet
