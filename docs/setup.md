@@ -187,8 +187,8 @@ card) in the Memento portal:
 
 | Result | Meaning and fix |
 |---|---|
-| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one with `connector config set`, and confirm the name matches what the platform expects. |
-| `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set`. For bearer tools, confirm the token has the needed scopes. |
+| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one with `connector config set` (or, if you mount a Secret, add the entry to it), and confirm the name matches what the platform expects. |
+| `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
 | `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
 | `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. |
 | Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes). See [Applying changes](#applying-changes). |

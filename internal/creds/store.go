@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"unicode/utf8"
 )
@@ -42,6 +43,9 @@ func (c Credential) Validate() error {
 	case "basic":
 		if c.Username == "" {
 			return errors.New("basic authentication requires a username")
+		}
+		if strings.ContainsRune(c.Username, ':') {
+			return errors.New("basic authentication username must not contain ':'")
 		}
 		if utf8.RuneCountInString(c.Token) < MinTokenLength {
 			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
@@ -95,7 +99,7 @@ func New(path string) (*Store, error) {
 	// On a writable store, tighten the file to 0600. If chmod fails — most often
 	// because the file is on a read-only mount, e.g. a Kubernetes Secret — fall
 	// back to verifying the existing mode is safe (see readOnlyModeAcceptable).
-	if err := os.Chmod(path, 0600); err != nil {
+	if err := chmod(path, 0600); err != nil {
 		info, statErr := os.Stat(path)
 		if statErr != nil || !readOnlyModeAcceptable(info.Mode()) {
 			return nil, fmt.Errorf("credentials file %s has unsafe permissions and chmod failed; restrict it to the owner, allowing at most group read (e.g. 0600 or 0640): %w", path, err)
@@ -103,6 +107,10 @@ func New(path string) (*Store, error) {
 	}
 	return s, nil
 }
+
+// chmod is os.Chmod, overridable in tests to exercise the read-only-mount branch
+// of New (as the file's owner, chmod cannot be made to fail portably).
+var chmod = os.Chmod
 
 // readOnlyModeAcceptable reports whether a credentials file whose mode could not
 // be corrected to 0600 (typically a read-only mount) is still safe to use.

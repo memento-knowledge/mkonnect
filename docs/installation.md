@@ -173,9 +173,11 @@ helm uninstall mkonnect
 kubectl delete pvc mkonnect-data
 ```
 
-Because credentials for your internal tools are stored **only** in the connector's local volume
+Because credentials for your internal tools are stored on the connector's local volume
 (see the [Setup guide](setup.md)), removing the connector and its volume removes them from your
-network entirely — there is nothing to revoke on Memento's side.
+network entirely — there is nothing to revoke on Memento's side. (If you instead mount a
+Kubernetes Secret as the credential store, delete that Secret too — it is managed outside the
+connector's volume and is not removed by `helm uninstall`.)
 
 ## Troubleshooting
 
