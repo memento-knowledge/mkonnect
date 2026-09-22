@@ -199,3 +199,35 @@ func TestKeyStoreRejectsFIFOWithoutBlocking(t *testing.T) {
 		t.Fatal("Load blocked while opening a FIFO")
 	}
 }
+
+func TestEnsureWritableCreatesDirAndSucceeds(t *testing.T) {
+	// A nested, not-yet-existing key dir must be created and confirmed writable.
+	path := filepath.Join(t.TempDir(), "sub", "key")
+	if err := NewKeyStore(path).EnsureWritable(); err != nil {
+		t.Fatalf("EnsureWritable on a writable location: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		t.Fatalf("key dir was not created: %v", err)
+	}
+	// No probe file should be left behind.
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("EnsureWritable left files behind: %v", entries)
+	}
+}
+
+func TestEnsureWritableFailsWhenDirUnavailable(t *testing.T) {
+	// Put the key under a path whose parent is a regular file, so the directory can't be
+	// created (ENOTDIR). This is independent of uid, so it also fails as root.
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	path := filepath.Join(blocker, "key")
+	if err := NewKeyStore(path).EnsureWritable(); err == nil {
+		t.Fatal("expected EnsureWritable to fail when the key dir cannot be created")
+	}
+}

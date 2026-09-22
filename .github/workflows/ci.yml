@@ -108,3 +108,14 @@ jobs:
           test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = ci
           test "$(docker inspect mkonnect:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$REVISION"
           docker run --rm mkonnect:ci --health
+
+      - name: Verify a fresh /data volume is writable by the non-root user
+        run: |
+          docker volume create ci-data-check
+          # Mounting the image initializes the empty volume from the image's /data
+          # (ownership included); --health exits 0 immediately after that.
+          docker run --rm -v ci-data-check:/data mkonnect:ci --health
+          owner=$(docker run --rm -v ci-data-check:/data alpine stat -c %u /data)
+          docker volume rm ci-data-check
+          echo "fresh /data owner uid: $owner"
+          test "$owner" = "65532"

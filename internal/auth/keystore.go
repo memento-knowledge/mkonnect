@@ -58,6 +58,34 @@ func (ks *KeyStore) Load() (*mldsa65.PrivateKey, bool, error) {
 	return priv, true, nil
 }
 
+// EnsureWritable verifies the connector can create the key file in its directory,
+// creating the directory if needed. It is used as a pre-flight check before first-run
+// registration: the gateway consumes the one-time registration token and issues the
+// private key as soon as the connector registers, so if the key cannot be persisted the
+// token would be burned for nothing. It writes and removes a temporary probe file,
+// mirroring what Save does, so a success here predicts that Save will succeed.
+func (k *KeyStore) EnsureWritable() error {
+	dir := filepath.Dir(k.path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("create key dir %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".keycheck-*.tmp")
+	if err != nil {
+		return fmt.Errorf("key directory %s is not writable (fix the volume/mount permissions): %w", dir, err)
+	}
+	name := f.Name()
+	// Write a full key-sized payload, not just create the file: inode creation can
+	// succeed on a device that is out of space where the subsequent write fails, and
+	// Save writes the whole key — so the probe should too.
+	_, writeErr := f.Write(make([]byte, mldsa65.PrivateKeySize))
+	closeErr := f.Close()
+	_ = os.Remove(name) // best-effort cleanup of the probe file
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return fmt.Errorf("key directory %s is not writable (fix the volume/mount permissions): %w", dir, err)
+	}
+	return nil
+}
+
 // Save writes the private key to disk with 0600 permissions.
 // It creates parent directories as needed.
 func (k *KeyStore) Save(priv *mldsa65.PrivateKey) error {

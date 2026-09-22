@@ -155,13 +155,22 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load key: %w", err)
 	}
-	if !found && c.cfg.RegistrationToken == "" {
-		// Checked before dialing: without this, HelloMsg would carry neither a token nor a
-		// signature; the gateway would take the reconnect path and reject with "connector
-		// not registered" — a confusing error for what's actually a missing
-		// REGISTRATION_TOKEN, and one a misconfigured connector would redial the gateway
-		// for on every backoff cycle just to receive.
-		return fmt.Errorf("no saved key and REGISTRATION_TOKEN is not set — cannot register or reconnect")
+	if !found {
+		if c.cfg.RegistrationToken == "" {
+			// Checked before dialing: without this, HelloMsg would carry neither a token nor a
+			// signature; the gateway would take the reconnect path and reject with "connector
+			// not registered" — a confusing error for what's actually a missing
+			// REGISTRATION_TOKEN, and one a misconfigured connector would redial the gateway
+			// for on every backoff cycle just to receive.
+			return fmt.Errorf("no saved key and REGISTRATION_TOKEN is not set — cannot register or reconnect")
+		}
+		// Pre-flight, before dialing: registration makes the gateway consume the one-time
+		// token and issue the private key, so if we can't persist it we would burn the
+		// token and every retry would then fail with "token already consumed". Verify the
+		// key directory is writable first and fail with a clear, actionable error instead.
+		if err := c.keyStore.EnsureWritable(); err != nil {
+			return fmt.Errorf("cannot register: %w", err)
+		}
 	}
 
 	wsURL := strings.TrimRight(c.cfg.GatewayURL, "/")
