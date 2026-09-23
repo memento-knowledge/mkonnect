@@ -86,13 +86,19 @@ manage with the CLI).
 
 ## Running the connector CLI
 
-The `connector` subcommand is built into the same binary, so run it inside the running container:
+The `connector` command is a **subcommand of the `/mkonnect` binary**, not a separate
+executable. Because `docker exec` and `kubectl exec` bypass the image's entrypoint, you must
+invoke the binary by its path — `/mkonnect connector ...`. Running `connector` on its own fails
+with `executable file not found in $PATH`.
 
-- **Docker:** `docker exec -i mkonnect connector ...`
-- **Kubernetes:** `kubectl exec -i <pod> -- connector ...`
+Run it inside the already-running container:
 
-The examples below use `<exec>` to stand in for whichever applies. The `-i` (interactive) flag
-matters: tokens are read from **stdin**, never from a command-line flag.
+- **Docker:** `docker exec -i mkonnect /mkonnect connector ...`
+- **Kubernetes:** `kubectl exec -i <pod> -- /mkonnect connector ...`
+
+Replace `mkonnect` / `<pod>` with your container name or pod. The examples below use `<exec>`
+for whichever prefix above applies to you, so each command reads `<exec> connector ...`. The `-i`
+(interactive) flag matters: tokens are read from **stdin**, never from a command-line flag.
 
 ## Configure an unauthenticated tool
 
