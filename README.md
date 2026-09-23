@@ -99,6 +99,7 @@ OCI Helm installation is recommended. If you download the chart from a GitHub Re
 
 ```bash
 docker run -d \
+  --name mkonnect \
   -e GATEWAY_URL=wss://<customer-slug>.bridge.memento-platform.com/ws \
   -e CONNECTOR_ID=<uuid> \
   -e REGISTRATION_TOKEN=<token> \

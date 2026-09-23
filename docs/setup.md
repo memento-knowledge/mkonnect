@@ -97,8 +97,7 @@ Run it inside the already-running container:
 - **Kubernetes:** `kubectl exec -i <pod> -- /mkonnect connector ...`
 
 Replace `mkonnect` / `<pod>` with your container name or pod. The examples below use `<exec>`
-to stand in for the prefix that applies to you — `docker exec -i mkonnect /mkonnect` or
-`kubectl exec -i <pod> -- /mkonnect` — so each command reads `<exec> connector ...`. The `-i`
+for whichever prefix above applies to you, so each command reads `<exec> connector ...`. The `-i`
 (interactive) flag matters: tokens are read from **stdin**, never from a command-line flag.
 
 ## Configure an unauthenticated tool
