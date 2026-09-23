@@ -54,7 +54,7 @@ When both define the same plugin name, the credential store wins.
 
 Plugin base URLs cannot include userinfo, query parameters, or fragments. Requests to plugins with local credentials bypass ambient `HTTP_PROXY` and `HTTPS_PROXY` settings. If an upstream response contains a complete local authorization representation or a supported encoded form of one, mkonnect returns a `502` instead of sending that response through the bridge.
 
-The `connector` subcommand is built into the same binary, so you run it inside the container:
+The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint):
 
 ```bash
 # Bearer-authenticated tool — tokens must be piped via stdin so they never land
@@ -78,7 +78,7 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 <exec> connector status           # configured plugins on this connector
 ```
 
-`<exec>` is `docker exec -i mkonnect` for Docker, or `kubectl exec -i <pod> --` for Kubernetes. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
+`<exec>` is `docker exec -i mkonnect /mkonnect` for Docker, or `kubectl exec -i <pod> -- /mkonnect` for Kubernetes (replace `mkonnect`/`<pod>` with your container name or pod). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
 
 ## Releases
 

@@ -114,8 +114,8 @@ The connector should register and connect within a few seconds.
 - **Inside the container:**
 
   ```bash
-  docker exec -i mkonnect connector status          # Docker
-  kubectl exec -i <pod> -- connector status         # Kubernetes
+  docker exec -i mkonnect /mkonnect connector status     # Docker
+  kubectl exec -i <pod> -- /mkonnect connector status    # Kubernetes
   ```
 
 If the status stays **degraded**, see [Troubleshooting](#troubleshooting).
