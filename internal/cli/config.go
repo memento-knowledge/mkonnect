@@ -153,7 +153,20 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		return fmt.Errorf("save credential: %w", err)
 	}
 	fmt.Fprintf(w, "Credential for %q saved.\n", plugin)
+	printReloadReminder(w)
 	return nil
+}
+
+// printReloadReminder tells the operator that an already-running connector must be reloaded
+// to pick up a credential change. The daemon caches credentials in memory and only re-reads
+// them on SIGHUP or restart, so a bare "saved"/"removed" can read as "done" when the running
+// connector is in fact still using the old value (issue #19). Phrased conditionally so it is
+// also correct during first-time setup, before any connector is running.
+func printReloadReminder(w io.Writer) {
+	fmt.Fprintln(w, "A running connector caches credentials in memory; reload it to apply this change:")
+	fmt.Fprintln(w, "  Docker:      docker kill -s HUP <container>")
+	fmt.Fprintln(w, "  Kubernetes:  kubectl rollout restart deployment/mkonnect")
+	fmt.Fprintln(w, "See docs/setup.md (\"Applying changes\").")
 }
 
 func runConfigList(w io.Writer) error {
@@ -196,6 +209,7 @@ func runConfigRemove(args []string, w io.Writer) error {
 		return fmt.Errorf("remove credential: %w", err)
 	}
 	fmt.Fprintf(w, "Credential for %q removed.\n", plugin)
+	printReloadReminder(w)
 	return nil
 }
 
