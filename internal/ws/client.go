@@ -145,7 +145,8 @@ const handshakeTimeout = 30 * time.Second
 // stalls mid-upgrade — e.g. landing on a not-yet-ready gateway pod during a rolling update, where
 // the TCP connection is accepted but the upgrade response never arrives — blocks Connect, and thus
 // Run's reconnect backoff, forever with no further log output. Bounding it turns such a stuck dial
-// into a normal failure that re-enters the backoff loop. A var so tests can shorten it.
+// into a normal failure that re-enters the backoff loop. It is a var, not a const, so
+// export_test.go can shorten it for tests that need to observe a stuck dial timing out.
 var dialTimeout = 30 * time.Second
 
 // heartbeatInterval is a var, not a const, so export_test.go can shorten it for tests that
