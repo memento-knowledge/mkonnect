@@ -140,6 +140,14 @@ func reconnectPause() time.Duration {
 // (and therefore Run's reconnect backoff) forever on a stuck read.
 const handshakeTimeout = 30 * time.Second
 
+// dialTimeout bounds a single websocket.Dial attempt (TCP connect, TLS, and the HTTP upgrade
+// request/response). Without it the dial runs on Run's process-lifetime context, so a dial that
+// stalls mid-upgrade — e.g. landing on a not-yet-ready gateway pod during a rolling update, where
+// the TCP connection is accepted but the upgrade response never arrives — blocks Connect, and thus
+// Run's reconnect backoff, forever with no further log output. Bounding it turns such a stuck dial
+// into a normal failure that re-enters the backoff loop. A var so tests can shorten it.
+var dialTimeout = 30 * time.Second
+
 // heartbeatInterval is a var, not a const, so export_test.go can shorten it for tests that
 // need to observe a heartbeat without waiting 30s of real time.
 var heartbeatInterval = 30 * time.Second
@@ -175,9 +183,14 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	wsURL := strings.TrimRight(c.cfg.GatewayURL, "/")
 
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+	// Bound the dial with its own timeout so a stuck upgrade cannot block Run's reconnect
+	// loop forever (see dialTimeout). coder/websocket uses this context only for the dial and
+	// handshake, not for the returned connection, so it is cancelled as soon as Dial returns.
+	dialCtx, cancelDial := context.WithTimeout(ctx, dialTimeout)
+	conn, _, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{},
 	})
+	cancelDial()
 	if err != nil {
 		return fmt.Errorf("ws dial: %w", err)
 	}
@@ -206,7 +219,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 	}
 
-	c.emitConnectionStatus(ctx, conn)
+	// Bound this first post-handshake write: it runs before the heartbeat goroutine (below)
+	// exists to notice and tear down a wedged connection, so on the unbounded parent ctx a
+	// stalled write here would hang Connect with no backstop.
+	statusCtx, cancelStatus := context.WithTimeout(ctx, handshakeTimeout)
+	c.emitConnectionStatus(statusCtx, conn)
+	cancelStatus()
 
 	// Heartbeat: a WebSocket-level ping (waits for a pong; this is what actually detects a
 	// half-open/zombie TCP connection the gateway has stopped reading from — e.g. router.go's

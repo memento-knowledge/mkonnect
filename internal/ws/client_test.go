@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1268,5 +1269,50 @@ func TestConnectFailsFastWhenKeyDirUnwritable(t *testing.T) {
 	}
 	if contacted.Load() {
 		t.Error("gateway was contacted despite an unwritable key dir — the one-time token could be consumed")
+	}
+}
+
+// TestConnectTimesOutOnStuckDial verifies that a dial which stalls mid-upgrade (TCP accepted,
+// HTTP upgrade response never sent — the rolling-update scenario in issue #18) fails within the
+// dial timeout and re-enters Run's backoff, instead of blocking Connect forever.
+func TestConnectTimesOutOnStuckDial(t *testing.T) {
+	restore := ws.SetDialTimeoutForTest(200 * time.Millisecond)
+	defer restore()
+
+	var contacted atomic.Bool
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		// Accept the request but never respond, so the client's dial blocks on the upgrade
+		// response until its dial context expires. Unblocked only at cleanup.
+		contacted.Store(true)
+		<-hold
+	}))
+	// LIFO: close(hold) runs first to release the handler, then srv.Close() can return.
+	defer srv.Close()
+	defer close(hold)
+
+	keyFile := filepath.Join(t.TempDir(), "key") // writable dir, no key -> first-run path reaches the dial
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+
+	done := make(chan error, 1)
+	go func() { done <- client.Connect(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected Connect to fail on a stuck dial")
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("error = %v, want it to wrap context.DeadlineExceeded (the dial timeout)", err)
+		}
+		if !strings.Contains(err.Error(), "ws dial") {
+			t.Errorf("error = %v, want it to identify the dial stage", err)
+		}
+		if !contacted.Load() {
+			t.Error("black-hole server was never contacted — the test did not exercise a real dial")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connect did not return within 2s on a stuck dial — the reconnect hang (issue #18) has regressed")
 	}
 }
