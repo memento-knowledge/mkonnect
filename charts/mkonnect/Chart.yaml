@@ -2,5 +2,5 @@ apiVersion: v2
 name: mkonnect
 description: Memento on-prem connector — bridges customer-internal tools to the Memento platform
 type: application
-version: 0.2.1
-appVersion: "20260924.0"
+version: 0.2.2
+appVersion: "20260926.0"
