@@ -42,6 +42,43 @@ func TestConfigSetAndList(t *testing.T) {
 	}
 }
 
+func TestConfigSetAndRemovePrintReloadReminder(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	// assertReminder checks the reload hint is present without leaking the token.
+	assertReminder := func(t *testing.T, out, verb, token string) {
+		t.Helper()
+		if !strings.Contains(out, verb) {
+			t.Fatalf("expected %q in output:\n%s", verb, out)
+		}
+		for _, want := range []string{"reload", "docker kill -s HUP", "kubectl rollout restart", "docs/setup.md"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("expected reload reminder to contain %q:\n%s", want, out)
+			}
+		}
+		if token != "" && strings.Contains(out, token) {
+			t.Fatalf("reminder output must not contain the token:\n%s", out)
+		}
+	}
+
+	const token = "reminder-token-1234" // >= 16 chars
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "jenkins",
+		"--base-url", "http://jenkins:8080",
+		"--auth", "bearer", "--token-stdin"},
+		strings.NewReader(token), &stdout); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+	assertReminder(t, stdout.String(), "saved", token)
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "remove", "jenkins"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config remove: %v", err)
+	}
+	assertReminder(t, stdout.String(), "removed", "")
+}
+
 func TestConfigSetNoAuth(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
