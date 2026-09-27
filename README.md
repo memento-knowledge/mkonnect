@@ -34,13 +34,13 @@ Runtime configuration comes from environment variables (internal-tool credential
 
 | Variable | Required | Description |
 |---|---|---|
-| `GATEWAY_URL` | yes | Secure WebSocket URL of the Bridge Gateway, e.g. `wss://<customer-slug>.bridge.memento-platform.com/ws`. Must use `wss://`. |
+| `GATEWAY_URL` | yes | Secure WebSocket URL of the Bridge Gateway. Copy it exactly from the Memento portal; it must use `wss://`. |
 | `CONNECTOR_ID` | yes | Stable UUID identifying this connector instance. |
 | `REGISTRATION_TOKEN` | first run only | One-time token used to register a new connector. Not needed after the private key has been issued and persisted. |
 | `KEY_FILE` | no | Path to the ML-DSA-65 private key file. Defaults to `~/.mkonnect/key`. |
 | `PROTOCOL_VERSION` | no | Wire protocol version to negotiate. Defaults to `v1`. |
 | `CREDS_FILE` | no | Path to the local credential store written by `connector config set`. Defaults to `/data/credentials.json`. |
-| `PLUGIN_<NAME>` | no | Base URL of an internal service to expose as plugin `<name>` (lowercased), e.g. `PLUGIN_JENKINS=http://jenkins:8080`. Must be an absolute `http://` or `https://` URL. Use this for endpoints that need no local credential; for endpoints requiring a token, use `connector config set` instead (see below). |
+| `PLUGIN_<NAME>` | no | Base URL of an internal service to expose as plugin `<name>` (lowercased), e.g. `PLUGIN_JENKINS=http://jenkins.internal:8080`. Must be an absolute `http://` or `https://` URL. Use this for endpoints that need no local credential; for endpoints requiring a token, use `connector config set` instead (see below). |
 | `ALLOW_INSECURE_GATEWAY` | no | Local development escape hatch. Setting this to `true` permits `ws://` only when `GATEWAY_URL` targets `localhost` or a loopback IP address. Never enable it in production. |
 
 ## Internal tool credentials
@@ -82,7 +82,7 @@ printf %s "$BUILD_SERVICE_API_TOKEN" | \
 
 ## Releases
 
-Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. Releases use calendar identifiers such as `20260919.0`: the first release on a date is `.0`, then the index increases without gaps. Pin deployments to an explicit release; never use a moving image tag.
+Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. Releases use calendar identifiers in the form `YYYYMMDD.n`: the first release on a date is `.0`, then the index increases without gaps. Pin deployments to an explicit release; never use a moving image tag.
 
 The container image uses the calendar release identifier. Helm requires its own SemVer chart version, and each chart's `appVersion` records the calendar release identifier that supplies its default image tag.
 
@@ -97,66 +97,53 @@ OCI Helm installation is recommended. If you download the chart from a GitHub Re
 
 ### Docker
 
-```bash
-docker run -d \
-  --name mkonnect \
-  -e GATEWAY_URL=wss://<customer-slug>.bridge.memento-platform.com/ws \
-  -e CONNECTOR_ID=<uuid> \
-  -e REGISTRATION_TOKEN=<token> \
-  -e PLUGIN_JENKINS=http://jenkins:8080 \
-  -v mkonnect-data:/data \
-  -e KEY_FILE=/data/key \
-  public.ecr.aws/h2a8k0r3/memento-connector:<release-id>
-```
+Follow the [Docker installation guide](docs/installation.md#option-a--docker). It keeps the
+one-time registration token out of shell history and source checkouts, then removes it from the
+container configuration only after the portal confirms registration. The guide also covers Docker
+Desktop, Linux host, and sibling-container networking.
 
 The container image is a distroless, non-root, statically linked binary — see the [Dockerfile](Dockerfile).
 
 ### Kubernetes (Helm)
 
-`REGISTRATION_TOKEN` is only needed for the first-run handshake (see [How it works](#how-it-works)), but it's still a secret — pass it via a values file instead of `--set`/`--set-string`, which would otherwise leak it into your shell history and process list:
-
-```bash
-cat > mkonnect-secrets.yaml <<EOF
-config:
-  registrationToken: "<token>"
-EOF
-
-helm install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version <chart-version> \
-  -f mkonnect-secrets.yaml \
-  --set image.repository=public.ecr.aws/h2a8k0r3/memento-connector \
-  --set config.gatewayUrl=wss://<customer-slug>.bridge.memento-platform.com/ws \
-  --set config.connectorId=<uuid> \
-  --set plugins.jenkins=http://jenkins:8080
-```
-
-`registrationToken` is written into a Kubernetes `Secret` (`charts/mkonnect/templates/secret.yaml`) alongside `gatewayUrl` and `connectorId`. Keep `mkonnect-secrets.yaml` out of version control and delete it once the connector has completed its first registration — subsequent reconnects use the persisted ML-DSA-65 key instead.
-
-Note that deleting the local file does *not* remove the token from the cluster: it remains in the deployed `Secret` and in Helm's release metadata. Restrict access to both (RBAC on `secrets` and on `helm get values`/release objects in the target namespace), and if the token is no longer needed, rotate or clear it explicitly via `helm upgrade --set config.registrationToken=""` (or a values file) rather than relying on local file deletion alone.
-
-To upgrade, choose the Helm chart version for the desired calendar release. Its default image tag is the chart's `appVersion`:
-
-```bash
-helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version <chart-version> \
-  --reuse-values
-```
-
-To roll back a failed upgrade, choose the prior Helm revision:
-
-```bash
-helm history mkonnect
-helm rollback mkonnect <revision>
-```
-
-The chart provisions a `PersistentVolumeClaim` so the ML-DSA-65 key survives pod restarts. See [charts/mkonnect/values.yaml](charts/mkonnect/values.yaml) for all options.
+Follow the [Helm installation guide](docs/installation.md#option-b--kubernetes-helm). It passes the
+token using `--set-file`, retains it until the portal confirms registration, and explains the
+remaining Helm release-history exposure. The chart provisions a `PersistentVolumeClaim` so the
+ML-DSA-65 key survives pod restarts. See [charts/mkonnect/values.yaml](charts/mkonnect/values.yaml)
+for all options.
 
 ### From source
 
 ```bash
+# Bash or Zsh; this path is intended for local development.
 go build -o mkonnect ./cmd/mkonnect
-GATEWAY_URL=wss://... CONNECTOR_ID=... REGISTRATION_TOKEN=... ./mkonnect
+
+umask 077
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+mkdir -p "$mkonnect_config_dir"
+chmod 700 "$mkonnect_config_dir"
+: > "$mkonnect_config_dir/registration.token"
+chmod 600 "$mkonnect_config_dir/registration.token"
+printf 'Paste registration token: ' >&2
+IFS= read -r -s REGISTRATION_TOKEN
+printf '\n' >&2
+printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
+unset REGISTRATION_TOKEN
+
+REGISTRATION_TOKEN="$(<"$mkonnect_config_dir/registration.token")"
+export REGISTRATION_TOKEN
+GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
 ```
+
+After it has registered, stop the process, then restart without the token:
+
+```bash
+unset REGISTRATION_TOKEN
+rm "$mkonnect_config_dir/registration.token"
+GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
+```
+
+For production, use the Docker or Helm instructions above.
 
 ## Development
 

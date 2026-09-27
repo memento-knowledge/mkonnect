@@ -46,13 +46,20 @@ container. On Kubernetes, mount a Secret as the credential file — see below.
 
 Instead of running `connector config set` against a live pod, keep the credentials in a `Secret`
 you manage — which can itself be backed by Vault, the External Secrets Operator, or a cloud secret
-store — and mount it into the connector. The plaintext then lives only in that Secret, never in your
-Helm values or shell history.
+store — and mount it into the connector. The durable copy then lives in that Secret, never in your
+Helm values or shell history. The creation step uses a short-lived local file, so create it with
+restrictive permissions outside your checkout and remove it after the Secret has been created.
 
 1. Build the credential JSON (same shape the CLI writes) and load it into a Secret:
 
    ```bash
-   cat > credentials.json <<'EOF'
+   umask 077
+   mkonnect_secret_dir="$(mktemp -d)"
+   chmod 700 "$mkonnect_secret_dir"
+   credentials_file="$mkonnect_secret_dir/credentials.json"
+   : > "$credentials_file"
+   chmod 600 "$credentials_file"
+   cat > "$credentials_file" <<'EOF'
    {
      "jenkins": {
        "base_url": "http://jenkins.internal:8080",
@@ -61,10 +68,15 @@ Helm values or shell history.
      }
    }
    EOF
+   # Replace REPLACE_WITH_TOKEN in a local editor; do not paste a real token into this shell block.
+   ${EDITOR:-vi} "$credentials_file"
    kubectl create secret generic mkonnect-tool-creds \
-     --from-file=credentials.json=./credentials.json
-   rm credentials.json
+     --from-file=credentials.json="$credentials_file" \
+     && rm "$credentials_file"
    ```
+
+   If creating the Secret fails, the owner-only file remains in the temporary directory so you can
+   correct the problem and retry. Do not add it to source control.
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
    `basic`, or omit for none), `username` (basic auth only), and `token` (at least 16 characters).
@@ -108,6 +120,32 @@ install time, or register it with the CLI (base URL only):
 ```bash
 <exec> connector config set prometheus --base-url http://prometheus.internal:9090
 ```
+
+### Reaching a tool from Docker
+
+With Docker's normal bridge networking, the base URL is resolved from mkonnect's network namespace.
+In particular, `localhost` means the mkonnect container itself, not the Docker host where you ran
+the command.
+
+- For a tool running on the Docker host, use `http://host.docker.internal:<port>` on Docker
+  Desktop (macOS or Windows). On Linux, add
+  `--add-host host.docker.internal:host-gateway` to the `docker run` command that starts mkonnect,
+  then use the same URL.
+- On Linux, `--network host` is an alternative when your deployment policy permits it. In that mode
+  `http://localhost:<port>` reaches the Docker host. Use the same network option whenever you
+  recreate mkonnect, including when removing the registration token.
+- For a tool in another container, attach both containers to the same user-defined Docker network
+  and use that container's network alias in the base URL. For example:
+
+  ```bash
+  docker network create mkonnect-tools
+  docker network connect mkonnect-tools mkonnect
+  docker network connect --alias jenkins mkonnect-tools <jenkins-container>
+  ```
+
+  The tool is then reachable at `http://jenkins:8080` if it listens on port 8080. Do not rely on
+  Docker's default bridge network for container-name DNS. Reattach mkonnect to this network after
+  every container recreation or image upgrade: `docker network connect mkonnect-tools mkonnect`.
 
 ## Configure a bearer-token tool
 
@@ -195,7 +233,7 @@ card) in the Memento portal:
 |---|---|
 | `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one with `connector config set` (or, if you mount a Secret, add the entry to it), and confirm the name matches what the platform expects. |
 | `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
-| `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
+| `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. For Docker, remember that `localhost` is the connector container; see [Reaching a tool from Docker](#reaching-a-tool-from-docker). Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
 | `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. |
 | Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes). See [Applying changes](#applying-changes). |
 | A credentialed tool is unreachable but a proxy is set | Requests that carry a **local credential** deliberately bypass ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, so the token goes straight to the tool rather than to a proxy. Ensure the connector has *direct* network access to the tool's host. (Unauthenticated `PLUGIN_<NAME>` requests still honor the ambient proxy settings.) |

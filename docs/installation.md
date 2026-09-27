@@ -25,7 +25,7 @@ Open the Memento portal, go to **Integrations → On-Prem Connector**, and note:
 
 | Value | Used as | Notes |
 |---|---|---|
-| Gateway URL | `GATEWAY_URL` | `wss://<customer-slug>.bridge.memento-platform.com/ws` |
+| Gateway URL | `GATEWAY_URL` | Copy it **exactly** from the portal; do not construct it from an example URL. |
 | Connector ID | `CONNECTOR_ID` | a UUID identifying this connector |
 | Registration token | `REGISTRATION_TOKEN` | **one-time**, expires in 24h — used only on first start |
 | Release ID / chart version | image tag / `--version` | pin an explicit version; never a moving tag |
@@ -39,46 +39,78 @@ connector authenticates with the private key it was issued and the token is no l
 
 ## Option A — Docker
 
-Create a named volume for the key, then start the connector pinned to a specific release ID
-(from the portal, e.g. `20260919.0`):
+Create a named volume for the key, then start the connector pinned to the release ID shown in the
+portal. Keep the one-time registration token in a temporary, owner-only environment file rather
+than putting it in your shell history. Run this snippet from Bash or Zsh:
 
 ```bash
+umask 077
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+mkdir -p "$mkonnect_config_dir"
+chmod 700 "$mkonnect_config_dir"
+
+cat > "$mkonnect_config_dir/mkonnect.env" <<'EOF'
+GATEWAY_URL=<gateway-url-from-portal>
+CONNECTOR_ID=<connector-id-from-portal>
+KEY_FILE=/data/key
+# Optional unauthenticated internal tools belong here so upgrades and restarts keep them:
+# PLUGIN_PROMETHEUS=http://prometheus.internal:9090
+EOF
+
+: > "$mkonnect_config_dir/registration.env"
+chmod 600 "$mkonnect_config_dir/registration.env"
+printf 'Paste registration token: ' >&2
+IFS= read -r -s REGISTRATION_TOKEN
+printf '\n' >&2
+printf 'REGISTRATION_TOKEN=%s\n' "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.env"
+unset REGISTRATION_TOKEN
+
 docker volume create mkonnect-data
 
 docker run -d --name mkonnect --restart unless-stopped \
-  -e GATEWAY_URL=wss://<customer-slug>.bridge.memento-platform.com/ws \
-  -e CONNECTOR_ID=<uuid> \
-  -e REGISTRATION_TOKEN=<token> \
-  -e KEY_FILE=/data/key \
   -v mkonnect-data:/data \
+  --env-file "$mkonnect_config_dir/mkonnect.env" \
+  --env-file "$mkonnect_config_dir/registration.env" \
   public.ecr.aws/h2a8k0r3/memento-connector:<release-id>
 ```
+
+If mkonnect must reach a service running on the Docker host, see [Reaching a tool from
+Docker](setup.md#reaching-a-tool-from-docker) before starting it; Linux Docker requires an
+additional `--add-host` flag on both `docker run` commands.
 
 The image is a distroless, non-root, statically linked binary. The `-v mkonnect-data:/data`
 volume is where the private key (`/data/key`) and the local credential store
 (`/data/credentials.json`) live, so both survive container restarts and upgrades.
 
-You can define unauthenticated internal tools inline with `PLUGIN_<NAME>` variables (e.g.
-`-e PLUGIN_PROMETHEUS=http://prometheus.internal:9090`); authenticated tools are configured after
-startup — see the [Setup guide](setup.md).
+Put unauthenticated `PLUGIN_<NAME>` entries in `mkonnect.env` as shown above; authenticated tools
+are configured after startup — see the [Setup guide](setup.md). This retained owner-only file keeps
+the gateway settings and every persistent plugin setting together for restarts and upgrades.
 
 ## Option B — Kubernetes (Helm)
 
-The chart is published as an OCI artifact. The registration token is a secret, so pass it through
-a values file rather than `--set` (which would land in your shell history and the process list):
+The chart is published as an OCI artifact. The registration token is a secret, so read it without
+echoing and pass it by file rather than `--set` (which would land in your shell history and the
+process list). Run this snippet from Bash or Zsh:
 
 ```bash
-cat > mkonnect-secrets.yaml <<'EOF'
-config:
-  registrationToken: "<token>"
-EOF
+umask 077
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+mkdir -p "$mkonnect_config_dir"
+chmod 700 "$mkonnect_config_dir"
+: > "$mkonnect_config_dir/registration.token"
+chmod 600 "$mkonnect_config_dir/registration.token"
+printf 'Paste registration token: ' >&2
+IFS= read -r -s REGISTRATION_TOKEN
+printf '\n' >&2
+printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
+unset REGISTRATION_TOKEN
 
-helm install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+helm upgrade --install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
   --version <chart-version> \
-  -f mkonnect-secrets.yaml \
+  --set-file config.registrationToken="$mkonnect_config_dir/registration.token" \
   --set image.repository=public.ecr.aws/h2a8k0r3/memento-connector \
-  --set config.gatewayUrl=wss://<customer-slug>.bridge.memento-platform.com/ws \
-  --set config.connectorId=<uuid>
+  --set config.gatewayUrl=<gateway-url-from-portal> \
+  --set config.connectorId=<connector-id-from-portal>
 ```
 
 The chart writes `registrationToken`, `gatewayUrl`, and `connectorId` into a Kubernetes `Secret`,
@@ -86,16 +118,9 @@ and provisions a `PersistentVolumeClaim` so the private key survives pod restart
 [`charts/mkonnect/values.yaml`](../charts/mkonnect/values.yaml) for all options (resources,
 storage class, plugins, service account).
 
-After the connector has registered once, delete the local `mkonnect-secrets.yaml`. Note that
-deleting it does **not** scrub the token from the cluster — it remains in the deployed `Secret`
-and in Helm's release metadata. Restrict access to both (RBAC on `secrets` and on
-`helm get values`), and clear the token explicitly when it is no longer needed:
-
-```bash
-helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version <chart-version> --reuse-values \
-  --set config.registrationToken=""
-```
+Keep the owner-only token file until [the portal confirms the connector is connected](#verify-the-connection).
+If installation fails, it remains outside your checkout so you can retry without re-entering it;
+the `upgrade --install` command is safe to rerun after correcting the failure.
 
 ## Verify the connection
 
@@ -122,6 +147,50 @@ If the status stays **degraded**, see [Troubleshooting](#troubleshooting).
 
 Next: [set up your internal tools](setup.md).
 
+## Remove the registration token after verification
+
+Only remove the registration token after the portal has shown **connected**. Until then, retain the
+owner-only file so a failed start can be retried without requesting another token.
+
+**Docker:** Docker stores environment variables in the container configuration, so recreate the
+container without the one-time token. All persistent settings, including `PLUGIN_<NAME>` entries,
+remain in `mkonnect.env` and are loaded again:
+
+```bash
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+rm "$mkonnect_config_dir/registration.env"
+docker rm -f mkonnect
+docker run -d --name mkonnect --restart unless-stopped \
+  -v mkonnect-data:/data \
+  --env-file "$mkonnect_config_dir/mkonnect.env" \
+  public.ecr.aws/h2a8k0r3/memento-connector:<release-id>
+```
+
+The persisted key in `mkonnect-data` lets the replacement container reconnect without registering
+again. Include the same Linux Docker networking option, if any, that you used for the first run.
+If you attached mkonnect to a user-defined network for a sibling tool, reattach it after each
+recreation:
+
+```bash
+docker network connect <tool-network> mkonnect
+```
+
+**Kubernetes:** remove the local token file, then clear the active Helm value:
+
+```bash
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+rm "$mkonnect_config_dir/registration.token"
+helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+  --version <chart-version> --reuse-values \
+  --set config.registrationToken=""
+```
+
+This clears the token from the active release value but does **not** redact earlier Helm release
+revisions, which can remain accessible to users with permission to read Helm release metadata.
+The token is one-time and consumed, but restrict access to the cluster Secret and every Helm
+revision. If policy requires the token to be absent from all retained release metadata, involve the
+cluster administrator in the release-history retention procedure before deployment.
+
 ## Upgrading
 
 Releases use calendar identifiers (`YYYYMMDD.n`). Always pin an explicit release; never track a
@@ -131,15 +200,19 @@ version selects the matching image.
 **Docker:** pull the new release ID and recreate the container with the same volume:
 
 ```bash
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 docker pull public.ecr.aws/h2a8k0r3/memento-connector:<new-release-id>
 docker rm -f mkonnect
 docker run -d --name mkonnect --restart unless-stopped \
-  ... (same flags as install) \
+  -v mkonnect-data:/data \
+  --env-file "$mkonnect_config_dir/mkonnect.env" \
   public.ecr.aws/h2a8k0r3/memento-connector:<new-release-id>
 ```
 
 Because the key and credential store live on the `mkonnect-data` volume, the connector reconnects
-with its existing key — no re-registration and no credential re-entry.
+with its existing key — no re-registration and no credential re-entry. Include the same Linux
+Docker networking option used at installation, and reattach any user-defined sibling-tool network
+with `docker network connect <tool-network> mkonnect`.
 
 **Helm:**
 
@@ -185,7 +258,7 @@ connector's volume and is not removed by `helm uninstall`.)
 |---|---|
 | Container exits immediately with a config error | A required variable is missing or malformed. `GATEWAY_URL` must be an absolute `wss://` URL and `CONNECTOR_ID` must be set. Check `docker logs mkonnect`. |
 | `GATEWAY_URL must use wss://` | The gateway URL is plaintext `ws://`. Use `wss://`. For local development only, a loopback `ws://` URL is allowed with `ALLOW_INSECURE_GATEWAY=true`. |
-| Repeating `gateway connection failed` warnings | The connector can't reach the gateway. Confirm outbound HTTPS (443) to `<customer-slug>.bridge.memento-platform.com` is allowed by your firewall/proxy. The connector retries with backoff (1s → 60s), so transient failures self-heal. |
+| Repeating `gateway connection failed` warnings | The connector can't reach the gateway. Confirm outbound HTTPS (443) to the host in the Gateway URL from the portal is allowed by your firewall/proxy. The connector retries with backoff (1s → 60s), so transient failures self-heal. |
 | Portal shows **degraded** after it was connected | The connector lost its heartbeat (stopped, or lost outbound access). Verify the container/pod is running and can still reach the gateway. |
 | First start fails with a registration error | The registration token is expired (24h) or already consumed. Generate a fresh token in the portal and restart. If an earlier attempt failed with `permission denied` while saving the key (below), the token was consumed then — you'll need a fresh one. |
 | `cannot register: key directory … is not writable` | The connector refuses to register when it can't persist the key, so it doesn't waste the one-time token. This means the `/data` volume isn't writable by the container's non-root user (uid 65532). An **empty** named volume with a current image is writable automatically; if you reuse a **non-empty** volume created by an older image (or a bind mount, which Docker never initializes from the image), fix its ownership once: `docker run --rm -v mkonnect-data:/data alpine chown -R 65532:65532 /data`, then restart. |
