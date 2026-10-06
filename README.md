@@ -57,18 +57,19 @@ Plugin base URLs cannot include userinfo, query parameters, or fragments. Reques
 The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint):
 
 ```bash
-# Bearer-authenticated tool — tokens must be piped via stdin so they never land
-# in the process list or shell history:
-printf %s "$JENKINS_TOKEN" | \
-  <exec> connector config set jenkins \
-    --base-url http://jenkins.internal:8080 --auth bearer --token-stdin
+# Bearer-authenticated tool (e.g. Grafana) — tokens must be piped via stdin so
+# they never land in the process list or shell history:
+printf %s "$GRAFANA_TOKEN" | \
+  <exec> connector config set grafana \
+    --base-url http://grafana.internal:3000 --auth bearer --token-stdin
 
-# Basic-authenticated tool — the username and API token stay in the local
-# credential store. Only the token is passed through stdin:
-printf %s "$BUILD_SERVICE_API_TOKEN" | \
-  <exec> connector config set build-service \
-    --base-url https://build.internal --auth basic \
-    --username "$BUILD_SERVICE_USERNAME" --token-stdin
+# Basic-authenticated tool — e.g. Jenkins, whose REST API uses HTTP Basic with the
+# API token as the password (it does not accept Bearer). The username and token
+# stay in the local credential store; only the token is passed through stdin:
+printf %s "$JENKINS_API_TOKEN" | \
+  <exec> connector config set jenkins \
+    --base-url http://jenkins.internal:8080 --auth basic \
+    --username "$JENKINS_USERNAME" --token-stdin
 
 # Unauthenticated tool:
 <exec> connector config set prometheus --base-url http://prometheus.internal:9090

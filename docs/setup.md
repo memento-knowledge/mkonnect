@@ -63,12 +63,13 @@ restrictive permissions outside your checkout and remove it after the Secret has
    {
      "jenkins": {
        "base_url": "http://jenkins.internal:8080",
-       "auth": "bearer",
-       "token": "REPLACE_WITH_TOKEN"
+       "auth": "basic",
+       "username": "REPLACE_WITH_USERNAME",
+       "token": "REPLACE_WITH_API_TOKEN"
      }
    }
    EOF
-   # Replace REPLACE_WITH_TOKEN in a local editor; do not paste a real token into this shell block.
+   # Replace the REPLACE_WITH_* placeholders in a local editor; do not paste a real token into this shell block.
    ${EDITOR:-vi} "$credentials_file"
    kubectl create secret generic mkonnect-tool-creds \
      --from-file=credentials.json="$credentials_file" \
@@ -149,31 +150,38 @@ the command.
 
 ## Configure a bearer-token tool
 
-For a tool that authenticates with a bearer token (a common Jenkins setup), pipe the token through
-stdin so it never appears in the process list or your shell history:
+For a tool whose API authenticates with a bearer token (for example Grafana service-account
+tokens), pipe the token through stdin so it never appears in the process list or your shell
+history:
 
 ```bash
-printf %s "$JENKINS_TOKEN" | \
-  <exec> connector config set jenkins \
-    --base-url http://jenkins.internal:8080 \
+printf %s "$GRAFANA_TOKEN" | \
+  <exec> connector config set grafana \
+    --base-url http://grafana.internal:3000 \
     --auth bearer --token-stdin
 ```
 
-The connector will add `Authorization: Bearer <token>` to each request it forwards to `jenkins`.
+The connector will add `Authorization: Bearer <token>` to each request it forwards to `grafana`.
+Use this mode only for tools that actually accept `Authorization: Bearer` — Jenkins does not; see
+the basic-auth example below.
 
 ## Configure a basic-auth tool
 
 For a tool using HTTP Basic authentication, provide a username and pipe the password/token through
-stdin:
+stdin. **Jenkins is the canonical example:** its REST API authenticates with HTTP Basic — your
+Jenkins username plus an API token used as the password — and does **not** accept
+`Authorization: Bearer`. Configuring Jenkins as a bearer tool makes every request fail with
+`401`/`403` even though the connector shows as connected.
 
 ```bash
-printf %s "$BUILD_SERVICE_PASSWORD" | \
-  <exec> connector config set build-service \
-    --base-url https://build.internal \
-    --auth basic --username "$BUILD_SERVICE_USERNAME" --token-stdin
+printf %s "$JENKINS_API_TOKEN" | \
+  <exec> connector config set jenkins \
+    --base-url http://jenkins.internal:8080 \
+    --auth basic --username "$JENKINS_USERNAME" --token-stdin
 ```
 
-The connector adds the `Authorization: Basic …` header, encoding `username:token` locally.
+The connector adds the `Authorization: Basic …` header, encoding `username:token` locally — here
+the Jenkins API token is the `token` and is sent as the password.
 
 ## Token rules
 

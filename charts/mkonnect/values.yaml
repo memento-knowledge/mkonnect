@@ -25,8 +25,8 @@ plugins: {}
 #
 # The Secret must hold the credentials JSON under the key named below. Its
 # format matches the file `connector config set` writes:
-#   { "jenkins": { "base_url": "http://jenkins:8080", "auth": "bearer",
-#                  "token": "<token>" } }
+#   { "jenkins": { "base_url": "http://jenkins:8080", "auth": "basic",
+#                  "username": "<user>", "token": "<api-token>" } }
 # When secretName is set, the connector reads this file and does not accept
 # `connector config set` (the mount is read-only).
 credentials:
