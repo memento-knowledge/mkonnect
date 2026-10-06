@@ -17,6 +17,12 @@ define a plugin in one of two ways:
 
 If the same plugin name is defined both ways, the local credential store wins.
 
+**The tool names in this guide are examples.** `jenkins`, `grafana`, and `prometheus` are
+illustrative plugin names standing in for your own tools — mkonnect is tool-agnostic and forwards to
+any HTTP(S) service. Choose the authentication mode below by **how your tool authenticates** (a
+bearer token, HTTP Basic, or none), not by which product it is, and use the plugin name the platform
+expects for that integration.
+
 **The trust boundary.** Credentials you configure with `connector config set` are stored only on
 the connector's local volume (`/data/credentials.json`, owner-only) and are injected into the
 outbound request *inside your network*. They are never sent to the Memento platform. The connector
@@ -150,9 +156,9 @@ the command.
 
 ## Configure a bearer-token tool
 
-For a tool whose API authenticates with a bearer token (for example Grafana service-account
-tokens), pipe the token through stdin so it never appears in the process list or your shell
-history:
+For a tool whose API authenticates with a bearer token, pipe the token through stdin so it never
+appears in the process list or your shell history. Grafana (service-account tokens) is used here
+only as an example of such a tool:
 
 ```bash
 printf %s "$GRAFANA_TOKEN" | \
@@ -168,10 +174,10 @@ the basic-auth example below.
 ## Configure a basic-auth tool
 
 For a tool using HTTP Basic authentication, provide a username and pipe the password/token through
-stdin. **Jenkins is the canonical example:** its REST API authenticates with HTTP Basic — your
-Jenkins username plus an API token used as the password — and does **not** accept
-`Authorization: Bearer`. Configuring Jenkins as a bearer tool makes every request fail with
-`401`/`403` even though the connector shows as connected.
+stdin. **Jenkins is used here as the example, because it is a common source of confusion:** its
+REST API authenticates with HTTP Basic — your Jenkins username plus an API token used as the
+password — and does **not** accept `Authorization: Bearer`. Configuring Jenkins as a bearer tool
+makes every request fail with `401`/`403` even though the connector shows as connected.
 
 ```bash
 printf %s "$JENKINS_API_TOKEN" | \
