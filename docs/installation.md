@@ -29,6 +29,20 @@ The connector is deliberately lightweight. A single instance needs:
   rules or port-forwarding are required. It also needs outbound access to whichever internal tools
   you want to bridge (e.g. Jenkins, Prometheus) on their own ports.
 
+**Running several tools through one connector.** A single connector can bridge many tools at once —
+each is just another plugin name in its registry and credential store — and its footprint is driven
+by concurrent request volume and payload size, not by how many tools are configured. **Prefer one
+connector for all of your tools** rather than one per tool; run separate connectors only when your
+tools sit in different network zones (each connector must be able to reach its tools' base URLs) or
+you want their credentials kept isolated. Two limits apply to a connector regardless of how many
+tools it serves:
+
+- **Concurrency.** A connector serves up to four in-flight requests at a time (the `128Mi` memory
+  limit is sized for this); heavier parallel load queues behind them rather than using more memory.
+- **Response size.** Each request and response body is capped at 32 MiB. A tool that can return
+  large payloads — a broad log or search query, for instance — may exceed this and receive a `502`;
+  scope or paginate such queries to stay under the cap.
+
 ### What you'll collect from the Memento portal
 
 Open the Memento portal, go to **Integrations → On-Prem Connector**, and note:
