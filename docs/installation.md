@@ -8,18 +8,28 @@ For a conceptual overview and the full environment-variable reference, see the [
 
 ## Before you start
 
-**What the connector needs**
+### System requirements
 
-- **Outbound HTTPS (443) only.** The connector dials *out* to the Memento Bridge Gateway and to
-  Memento's container registry. It never accepts inbound connections, so no inbound firewall rules
-  or port-forwarding are required. It also needs outbound access to whichever internal tools you
-  want to bridge (e.g. Jenkins, Prometheus) on their own ports.
-- **A runtime:** Docker Engine, or a Kubernetes cluster with Helm 3.8+ (OCI support).
-- **Persistent storage** for the connector's private key (a Docker volume or a
-  `PersistentVolumeClaim`). The key is issued once at registration and reused on every reconnect;
-  losing it means re-registering.
+The connector is deliberately lightweight. A single instance needs:
 
-**What you'll collect from the Memento portal**
+- **A runtime:** Docker Engine, or a Kubernetes cluster with Helm 3.8+ (OCI support). The image is
+  distroless and runs as a non-root user (uid 65532).
+- **CPU architecture `linux/amd64`.** The published image is amd64-only. On an arm64 host (for
+  example Apple Silicon) it runs under emulation — Docker Desktop's Rosetta/qemu — which works for
+  evaluation but is not recommended for production; run it on an amd64 host there.
+- **Modest CPU and memory.** The Helm chart defaults to a `100m` CPU / `64Mi` memory request and a
+  `500m` CPU / `128Mi` memory limit — enough for its handful of concurrent in-flight requests.
+  Tune these in [`charts/mkonnect/values.yaml`](../charts/mkonnect/values.yaml).
+- **A small persistent volume** for the connector's private key and local credential store (a
+  Docker volume, or a `PersistentVolumeClaim`; the chart default is `1Gi`, though it uses far
+  less). The key is issued once at registration and reused on every reconnect; losing it means
+  re-registering.
+- **Outbound HTTPS (443) only.** The connector dials *out* to the Memento Bridge Gateway (`wss://`)
+  and to Memento's container registry. It never accepts inbound connections, so no inbound firewall
+  rules or port-forwarding are required. It also needs outbound access to whichever internal tools
+  you want to bridge (e.g. Jenkins, Prometheus) on their own ports.
+
+### What you'll collect from the Memento portal
 
 Open the Memento portal, go to **Integrations → On-Prem Connector**, and note:
 
