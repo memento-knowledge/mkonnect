@@ -8,7 +8,7 @@ Lightweight on-prem connector for the Memento Knowledge (mk) platform. It runs i
 
 Administrator guides live in [`docs/`](docs/):
 
-- **[Installation guide](docs/installation.md)** — deploy with Docker or Helm, verify the connection, upgrade, and uninstall.
+- **[Installation guide](docs/installation.md)** — [system requirements](docs/installation.md#system-requirements), deploy with Docker or Helm, verify the connection, upgrade, and uninstall.
 - **[Setup guide](docs/setup.md)** — make your internal tools reachable and attach credentials safely.
 
 The rest of this README is a conceptual overview and configuration reference.
