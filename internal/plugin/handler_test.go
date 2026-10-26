@@ -756,12 +756,16 @@ func proxyTestEnvironment(proxyURL string) []string {
 	)
 }
 
-// TestHTTPHandlerPathTraversalBlocked verifies that ".." segments in msg.Path, including
-// percent-encoded variants (%2e%2e), cannot escape the configured base path prefix.
+// TestHTTPHandlerPathTraversalBlocked verifies that ".." segments in msg.Path — whether
+// literal, percent-encoded (%2e%2e), or reached across a percent-encoded slash (..%2f) —
+// cannot escape the configured base path prefix. Confinement is enforced on the decoded,
+// cleaned path, so preserving the escaped form for forwarding (see
+// TestHTTPHandlerPreservesEscapedPath) does not weaken it: a blocked request is rejected
+// before it is forwarded and the upstream is never contacted.
 func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
-	var calledPath string
+	var called bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calledPath = r.URL.Path
+		called = true
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
@@ -778,19 +782,138 @@ func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
 	h := HTTPHandler(reg, store, "")
 
 	cases := []string{
-		"/../../etc/passwd",  // literal dots
-		"/%2e%2e/etc/passwd", // percent-encoded single dot-dot
-		"/%2e%2e/%2e%2e/etc", // double-encoded
+		"/../../etc/passwd",   // literal dots
+		"/%2e%2e/etc/passwd",  // percent-encoded dot-dot
+		"/%2e%2e/%2e%2e/etc",  // repeated percent-encoded dot-dot
+		"/..%2fsecret",        // dot-dot across a percent-encoded slash
+		"/%2e%2e%2fsecret",    // fully percent-encoded ../secret
+		"/..%2f..%2fetc%2fpw", // repeated, all separators encoded
 	}
 	for _, p := range cases {
-		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		called = false
+		code, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 			ProviderKey: "svc", Method: "GET", Path: p,
 		})
 		if err != nil {
 			t.Fatalf("path %q: unexpected error: %v", p, err)
 		}
 		if code != 400 {
-			t.Fatalf("path %q: expected 400, got %d (upstream saw path: %q)", p, code, calledPath)
+			t.Fatalf("path %q: expected 400, got %d", p, code)
+		}
+		if headers[ErrorHeader] != ErrCodePathBlocked {
+			t.Fatalf("path %q: expected %s=%q, got %q", p, ErrorHeader, ErrCodePathBlocked, headers[ErrorHeader])
+		}
+		if called {
+			t.Fatalf("path %q: upstream was contacted for a blocked traversal", p)
+		}
+	}
+}
+
+// TestHTTPHandlerPreservesEscapedPath verifies that the caller's escaped path form is
+// forwarded verbatim — an escaped slash (%2F) and an escaped percent (%25) reach the
+// upstream unchanged — while a path that normalises differently (traversal, "." / ".."
+// segments, "//", or a value mixing a raw escape with an unencoded reserved byte) falls
+// back to the decoded, cleaned path. The escaped form is kept only when it single-decodes
+// to exactly the confined path, so forwarding it cannot deliver a different path than the
+// one the confinement check approved.
+func TestHTTPHandlerPreservesEscapedPath(t *testing.T) {
+	var sentURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sentURI = r.RequestURI // raw request-target, before net/http decodes it
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	cases := []struct {
+		name    string
+		base    string // appended to srv.URL
+		path    string
+		wantURI string
+	}{
+		{"escaped slash survives", "", "/group%2Fsub/repo", "/group%2Fsub/repo"},
+		{"escaped percent survives", "", "/a%25b/c", "/a%25b/c"},
+		{"lower-case escaped slash preserved verbatim", "", "/group%2fsub", "/group%2fsub"},
+		{"escaped slash under base prefix", "/api/v1", "/group%2Fsub", "/api/v1/group%2Fsub"},
+		{"escaped slash under base prefix with trailing slash", "/api/v1/", "/group%2Fsub", "/api/v1/group%2Fsub"},
+		{"escaped slash in base path preserved verbatim", "/a%2Fb", "/x", "/a%2Fb/x"},
+		{"plain path unchanged", "", "/plain/path", "/plain/path"},
+		{"query preserved alongside escaped slash", "", "/group%2Fsub?page=2", "/group%2Fsub?page=2"},
+		// Fallbacks to the decoded, cleaned path (escaped slash does not survive):
+		{"dot segment normalised", "", "/a/./b", "/a/b"},
+		{"traversal across escaped slash normalised", "", "/foo%2F..%2Fbar", "/bar"},
+		{"escaped double slash collapses under base", "/api/v1", "/x%2F%2Fy", "/api/v1/x/y"},
+		{"escaped leading double slash is not an authority", "", "/%2F%2Fevil.com", "/evil.com"},
+		{"raw escape mixed with unencoded space falls back", "", "/a%2Fb c", "/a/b%20c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := srv.URL + tc.base
+			reg := newRegistry("svc", base)
+			store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+			if err != nil {
+				t.Fatalf("creds.New: %v", err)
+			}
+			if err := store.Set("svc", creds.Credential{BaseURL: base}); err != nil {
+				t.Fatalf("store.Set: %v", err)
+			}
+			h := HTTPHandler(reg, store)
+
+			sentURI = ""
+			code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+				ProviderKey: "svc", Method: "GET", Path: tc.path,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if code != 200 {
+				t.Fatalf("code = %d, want 200", code)
+			}
+			if sentURI != tc.wantURI {
+				t.Fatalf("upstream request-target = %q, want %q", sentURI, tc.wantURI)
+			}
+		})
+	}
+}
+
+// TestHTTPHandlerRejectsAuthoritySmuggling verifies that a caller path beginning with
+// "//" — which url.Parse reads as a network-path reference carrying an authority — cannot
+// redirect the request to a different host. The path still begins with "/", so the
+// HasPrefix("/") guard passes; the host check after ResolveReference is what rejects it.
+// Preserving the escaped path form does not weaken this: the check runs on the decoded
+// target before any escaped form is re-attached. (The escaped form "/%2F%2Fevil.example"
+// is covered by TestHTTPHandlerPreservesEscapedPath: it decodes to a same-host path and
+// cannot name an authority at all.)
+func TestHTTPHandlerRejectsAuthoritySmuggling(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	reg := newRegistry("svc", srv.URL)
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store)
+
+	for _, p := range []string{
+		"//evil.example/x",      // different host
+		"//evil.example:8080/x", // different host and port
+	} {
+		called = false
+		code, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: "GET", Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 400 || headers[ErrorHeader] != ErrCodeInvalidPath {
+			t.Fatalf("path %q: expected 400 invalid_path, got code=%d marker=%q", p, code, headers[ErrorHeader])
+		}
+		if called {
+			t.Fatalf("path %q: a request was sent to a foreign host", p)
 		}
 	}
 }
