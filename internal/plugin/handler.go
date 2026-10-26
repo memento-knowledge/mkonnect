@@ -274,8 +274,9 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		reqRef.Path = base.Path + reqRef.Path
 		target := base.ResolveReference(reqRef)
 		// Run every security check on the DECODED, normalized path. Clearing RawPath makes
-		// target.String() emit the decoded path; the escaped form is re-attached only at the
-		// end, and only when it is provably equivalent to this checked path.
+		// target.String() emit the canonical re-encoding of the decoded path; the caller's
+		// escaped form is re-attached only at the end, and only when it is provably
+		// equivalent to this checked path.
 		target.RawPath = ""
 		target.Path = path.Clean(target.Path)
 		if target.Host != base.Host {
