@@ -74,9 +74,11 @@ func TestPerPluginUpstreamTimeoutHonoured(t *testing.T) {
 	if got := marker(headers); got != ErrCodeUpstreamTimeout {
 		t.Fatalf("%s = %q, want %q", ErrorHeader, got, ErrCodeUpstreamTimeout)
 	}
-	// It must trip near the 1s override, well before the 2s upstream sleep or the 10s default.
-	if elapsed > 1500*time.Millisecond {
-		t.Fatalf("took %s; the 1s per-plugin timeout was not honoured", elapsed)
+	// It must trip near the 1s override: after it (not a shorter default sneaking in) and
+	// before the 2s upstream sleep or the 10s default. The lower bound makes the test
+	// independent of test-scheduling order — it fails if anything but the 1s value fired.
+	if elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Fatalf("took %s; expected ~1s, the per-plugin override", elapsed)
 	}
 }
 

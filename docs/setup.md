@@ -353,10 +353,14 @@ limits:
   keeps its own fixed timeout.
 - It bounds the whole request, but the connect phase (30 s) and the TLS handshake (10 s) keep their
   own fixed ceilings, so a larger value does not extend those phases.
-- The effective wait is the smaller of this timeout and the platform's own caller deadline; raising
-  it here does not extend the platform's. A value above `10m` is rejected — it is a guardrail
-  against a typo, not a tuning knob, and a single request should not hold a connector worker slot
-  for longer.
+- The platform stops waiting at its own caller deadline; raising this timeout does not make the
+  platform wait longer. The connector does not shorten an in-flight request to that deadline, so a
+  long value keeps a worker slot occupied for its full duration, and a request still running when
+  the connector drains on shutdown (a 10 s window) may not return a reply.
+- A value above `10m` (or below `1s`) is rejected — the bounds are a guardrail against a typo, not
+  a tuning knob, so that a single request cannot hold a connector worker slot for an unreasonable
+  time. In a mounted Secret, an out-of-range or unit-less `upstream_timeout` is rejected when the
+  file loads, exactly like a malformed `token` or `ca_bundle`.
 
 See the [project README's Limits section](../README.md#limits) for the connector's other
 (fixed) limits — concurrency and the request/response body caps.

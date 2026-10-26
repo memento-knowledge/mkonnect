@@ -476,6 +476,10 @@ func TestConfigSetRejectsInvalidUpstreamTimeout(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected config set to reject --upstream-timeout %q", bad)
 		}
+		// Pin that it was rejected for the timeout, not some unrelated validation failure.
+		if !strings.Contains(err.Error(), "upstream_timeout") {
+			t.Fatalf("error for %q = %q, want it to mention upstream_timeout", bad, err)
+		}
 	}
 }
 

@@ -119,14 +119,13 @@ func (c Credential) Validate() error {
 	}
 	// A per-plugin upstream timeout, if given, must be a duration with a unit and within the
 	// supported range. The error is the operator's only hint, so it names the accepted form
-	// and bounds explicitly; the raw value is short operator input, so echoing it is safe and
-	// aids debugging. ParseDuration rejects a unitless value ("30"), which is the most likely
-	// typo and must not be silently reinterpreted.
+	// and the bounds explicitly (as literals, so the hint stays human-readable rather than
+	// printing MaxUpstreamTimeout as "10m0s"). ParseDuration rejects a unitless value ("30"),
+	// which is the most likely typo and must not be silently reinterpreted.
 	if c.UpstreamTimeout != "" {
 		d, err := time.ParseDuration(c.UpstreamTimeout)
 		if err != nil || d < MinUpstreamTimeout || d > MaxUpstreamTimeout {
-			return fmt.Errorf("upstream_timeout must be a duration with a unit (e.g. %q, %q), at least %s and at most %s",
-				"30s", "2m", MinUpstreamTimeout, MaxUpstreamTimeout)
+			return errors.New(`upstream_timeout must be a duration with a unit (e.g. "30s", "2m"), at least 1s and at most 10m`)
 		}
 	}
 	return nil
@@ -134,9 +133,10 @@ func (c Credential) Validate() error {
 
 // UpstreamTimeoutDuration returns the configured per-plugin upstream timeout and whether
 // one is set. An absent value returns (0, false) and the caller applies its own default.
-// Validate guarantees a stored value parses and is in range, so this never surfaces a parse
-// error; a value that somehow fails to parse is treated as unset (0, false) rather than
-// panicking, keeping request handling robust against a hand-edited store.
+// Set, New (load), and Reload all Validate every entry, so the store never holds an
+// unparseable or out-of-range value and this normally cannot fail; the defensive (0, false)
+// on a parse error is kept only so a future caller that bypasses the store cannot make
+// request handling panic.
 func (c Credential) UpstreamTimeoutDuration() (time.Duration, bool) {
 	if c.UpstreamTimeout == "" {
 		return 0, false
