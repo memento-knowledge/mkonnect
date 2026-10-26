@@ -143,15 +143,17 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		}
 	}
 
-	store, err := creds.New(credsPath())
-	if err != nil {
-		return fmt.Errorf("open creds store: %w", err)
-	}
 	// A CA bundle path, if given, must be absolute (the daemon resolves it with its own
-	// working directory). Check here for a clear CLI error before touching the store.
+	// working directory). Check before opening the store so an invalid invocation fails
+	// fast without any store side effect.
 	newCABundle := strings.TrimSpace(*caBundle)
 	if newCABundle != "" && !filepath.IsAbs(newCABundle) {
 		return errors.New("--ca-bundle must be an absolute path")
+	}
+
+	store, err := creds.New(credsPath())
+	if err != nil {
+		return fmt.Errorf("open creds store: %w", err)
 	}
 
 	// `config set` replaces the whole entry. Warn if that would silently drop a

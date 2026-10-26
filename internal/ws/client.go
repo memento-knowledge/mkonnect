@@ -543,8 +543,10 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 	case caBundle != "":
 		transport, err := httpclient.NewTransport(useDirectTransport, caBundle)
 		if err != nil {
-			// Fail closed with an address-free diagnostic (the path may embed internal
-			// detail, and the error class is all the platform needs).
+			// Log locally (path and error class are operator-facing, as in the handler)
+			// but fail closed on the wire with an address-free diagnostic: the path may
+			// embed internal detail, and the error class is all the platform needs.
+			slog.Warn("probe: upstream CA bundle could not be loaded", "ca_bundle", caBundle, "err", err)
 			result.Status = "unreachable"
 			result.Diagnostic = "CA bundle could not be loaded"
 			return result
@@ -552,6 +554,10 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		probeClient.Transport = transport
 	case useDirectTransport:
 		probeClient.Transport = httpclient.NewDirectTransport()
+	}
+	// Release any idle connections this one-shot probe leaves pooled.
+	if tr, ok := probeClient.Transport.(*http.Transport); ok {
+		defer tr.CloseIdleConnections()
 	}
 	resp, err := probeClient.Do(req)
 	if err != nil {

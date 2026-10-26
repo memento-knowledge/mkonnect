@@ -221,11 +221,22 @@ func (s *Store) Remove(plugin string) error {
 	return s.save()
 }
 
-// Reload re-reads credentials.json from disk, replacing the in-memory map.
+// Reload re-reads credentials.json from disk, replacing the in-memory map. A missing
+// file is a valid state (e.g. every plugin configured via PLUGIN_* env with only a
+// global CA_BUNDLE): it resets the store to empty and still bumps the generation, so a
+// SIGHUP picks up a rotated CA bundle even when no credentials file exists.
 func (s *Store) Reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.load()
+	if err := s.load(); err != nil {
+		if os.IsNotExist(err) {
+			s.data = make(map[string]Credential)
+			s.generation++
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // load reads and parses the JSON file. Caller must hold s.mu.

@@ -275,6 +275,23 @@ func TestStoreGenerationChangesOnMutation(t *testing.T) {
 	}
 }
 
+func TestReloadMissingFileBumpsGeneration(t *testing.T) {
+	// A store whose file never existed: Reload must succeed (empty state) and still bump
+	// the generation, so a global CA bundle is re-read on SIGHUP without a creds file.
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	g0 := s.Generation()
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload with no file must not error, got %v", err)
+	}
+	if s.Generation() == g0 {
+		t.Error("Reload with no file did not bump the generation")
+	}
+}
+
 func TestCredentialValidateRejectsBadStripHeaders(t *testing.T) {
 	cases := []struct {
 		name  string

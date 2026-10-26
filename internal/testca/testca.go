@@ -71,16 +71,16 @@ func GenerateCA(hosts ...string) (caCertPEM []byte, leaf tls.Certificate, err er
 		return nil, tls.Certificate{}, fmt.Errorf("create leaf certificate: %w", err)
 	}
 
+	leafCert, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		return nil, tls.Certificate{}, fmt.Errorf("parse leaf certificate: %w", err)
+	}
+
 	caCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
 	leaf = tls.Certificate{
 		Certificate: [][]byte{leafDER},
 		PrivateKey:  leafKey,
-		Leaf:        caCert, // unused by the server; retained for completeness
-	}
-	// The leaf's own parsed certificate is what a TLS server presents; set it so
-	// callers that inspect Leaf see the leaf, not the CA.
-	if parsed, perr := x509.ParseCertificate(leafDER); perr == nil {
-		leaf.Leaf = parsed
+		Leaf:        leafCert,
 	}
 	return caCertPEM, leaf, nil
 }

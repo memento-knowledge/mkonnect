@@ -1,3 +1,9 @@
+{{- if .Values.caBundle.secretName }}
+{{- $caMount := required "caBundle.mountPath is required when caBundle.secretName is set" .Values.caBundle.mountPath | clean }}
+{{- if or (eq $caMount "/etc/mkonnect") (hasPrefix "/etc/mkonnect/" $caMount) (eq $caMount "/data") (hasPrefix "/data/" $caMount) }}
+{{- fail "caBundle.mountPath must not be /data, /etc/mkonnect, or a path under them: it would collide with the data or credentials mount" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,7 +43,7 @@ spec:
             {{- end }}
             {{- if .Values.caBundle.secretName }}
             - name: CA_BUNDLE
-              value: {{ printf "%s/%s" (required "caBundle.mountPath is required when caBundle.secretName is set" .Values.caBundle.mountPath) (required "caBundle.key is required when caBundle.secretName is set" .Values.caBundle.key) | quote }}
+              value: {{ printf "%s/%s" (required "caBundle.mountPath is required when caBundle.secretName is set" .Values.caBundle.mountPath | clean) (required "caBundle.key is required when caBundle.secretName is set" .Values.caBundle.key) | quote }}
             {{- end }}
             {{- range $plugin, $url := .Values.plugins }}
             - name: PLUGIN_{{ $plugin | upper }}
@@ -53,7 +59,7 @@ spec:
             {{- end }}
             {{- if .Values.caBundle.secretName }}
             - name: ca-bundle
-              mountPath: {{ .Values.caBundle.mountPath | quote }}
+              mountPath: {{ .Values.caBundle.mountPath | clean | quote }}
               readOnly: true
             {{- end }}
           resources:

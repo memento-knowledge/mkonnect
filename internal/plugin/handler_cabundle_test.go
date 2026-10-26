@@ -154,6 +154,107 @@ func TestHTTPHandlerCABundleFailsClosed(t *testing.T) {
 	}
 }
 
+// writeUnrelatedCABundle writes a valid PEM for a CA that did NOT sign the test server,
+// so a transport trusting only it still rejects the server.
+func writeUnrelatedCABundle(t *testing.T) string {
+	t.Helper()
+	caPEM, _, err := testca.GenerateCA("127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "wrong-ca.pem")
+	if err := os.WriteFile(path, caPEM, 0o644); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	return path
+}
+
+// TestHTTPHandlerCABundlePerPluginOverridesGlobal verifies that a per-plugin ca_bundle
+// takes precedence over the global default.
+func TestHTTPHandlerCABundlePerPluginOverridesGlobal(t *testing.T) {
+	srv, correctBundle := newTLSServerWithTestCA(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	wrongBundle := writeUnrelatedCABundle(t)
+
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{
+		BaseURL:  srv.URL,
+		Auth:     "bearer",
+		Token:    "long-token-value-123",
+		CABundle: correctBundle, // per-plugin is correct
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	// Global default is the WRONG CA; the per-plugin bundle must win and the request
+	// succeeds.
+	status, _, _, err := HTTPHandler(newRegistry("svc", srv.URL), store, wrongBundle)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("per-plugin bundle must override the global default; got status=%d err=%v", status, err)
+	}
+}
+
+// TestHTTPHandlerCABundleGlobalDefaultInherited verifies a credentialed plugin with no
+// per-plugin ca_bundle inherits the global default over the direct transport.
+func TestHTTPHandlerCABundleGlobalDefaultInherited(t *testing.T) {
+	srv, correctBundle := newTLSServerWithTestCA(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{
+		BaseURL: srv.URL,
+		Auth:    "bearer",
+		Token:   "long-token-value-123",
+		// no per-plugin CABundle: must inherit the global default
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	// Wrong global default → fails; correct global default → succeeds.
+	wrongBundle := writeUnrelatedCABundle(t)
+	status, _, _, err := HTTPHandler(newRegistry("svc", srv.URL), store, wrongBundle)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err == nil || status != http.StatusGatewayTimeout {
+		t.Errorf("wrong global default should fail verification; got status=%d err=%v", status, err)
+	}
+
+	status, _, _, err = HTTPHandler(newRegistry("svc", srv.URL), store, correctBundle)(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("credentialed plugin must inherit the correct global default; got status=%d err=%v", status, err)
+	}
+}
+
+// TestHTTPHandlerCABundleGlobalFailsClosed verifies that an unloadable GLOBAL default
+// (not just a per-plugin bundle) fails closed before forwarding.
+func TestHTTPHandlerCABundleGlobalFailsClosed(t *testing.T) {
+	var hit bool
+	srv, _ := newTLSServerWithTestCA(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// Registry-only plugin (no credential), global default points at a missing file.
+	status, headers, _, err := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), filepath.Join(t.TempDir(), "missing.pem"))(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err != nil {
+		t.Errorf("want nil transport err for a synthesised response, got %v", err)
+	}
+	if status != 500 || headers[ErrorHeader] != ErrCodeInvalidCABundle {
+		t.Errorf("want 500 + %q, got status=%d marker=%q", ErrCodeInvalidCABundle, status, headers[ErrorHeader])
+	}
+	if hit {
+		t.Error("request must not reach the upstream when the global CA bundle cannot be loaded")
+	}
+}
+
 // TestCAClientCacheReuseAndInvalidation checks that the cache returns the same client
 // for repeated lookups under one generation and rebuilds when the generation changes.
 func TestCAClientCacheReuseAndInvalidation(t *testing.T) {

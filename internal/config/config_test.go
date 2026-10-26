@@ -12,7 +12,7 @@ import (
 // regardless of the ambient environment; the test then sets only what it needs.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "KEY_FILE", "PROTOCOL_VERSION", "ALLOW_INSECURE_GATEWAY"} {
+	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "KEY_FILE", "PROTOCOL_VERSION", "ALLOW_INSECURE_GATEWAY", "CA_BUNDLE"} {
 		t.Setenv(k, "")
 	}
 }
@@ -31,6 +31,28 @@ func TestLoadRejectsNonWebSocketScheme(t *testing.T) {
 	t.Setenv("GATEWAY_URL", "https://gateway.example.com/ws")
 	if _, err := config.Load(); err == nil {
 		t.Fatal("expected error when GATEWAY_URL is not ws:// or wss://")
+	}
+}
+
+func TestLoadCABundle(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("GATEWAY_URL", "wss://gateway.example.com/ws")
+	t.Setenv("CONNECTOR_ID", "c1")
+
+	// Absolute path is accepted and stored.
+	t.Setenv("CA_BUNDLE", "/etc/mkonnect-ca/ca-bundle.pem")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load with absolute CA_BUNDLE: %v", err)
+	}
+	if cfg.CABundle != "/etc/mkonnect-ca/ca-bundle.pem" {
+		t.Errorf("CABundle = %q, want the absolute path", cfg.CABundle)
+	}
+
+	// Relative path is rejected.
+	t.Setenv("CA_BUNDLE", "relative/ca.pem")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("expected Load to reject a relative CA_BUNDLE")
 	}
 }
 

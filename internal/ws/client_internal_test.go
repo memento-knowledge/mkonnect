@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,12 +13,53 @@ import (
 	"testing"
 	"time"
 
-	"crypto/tls"
-
+	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 	"github.com/memento-knowledge/mkonnect/internal/plugin"
 	"github.com/memento-knowledge/mkonnect/internal/testca"
 )
+
+// TestProbePluginGlobalCABundleFailsClosed verifies that an unloadable GLOBAL CA bundle
+// (from config) makes the probe fail closed with an address-free diagnostic, without
+// dialling the upstream.
+func TestProbePluginGlobalCABundleFailsClosed(t *testing.T) {
+	var hit bool
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	// A cert is required to start a TLS server; the probe must never reach it.
+	_, leaf, err := testca.GenerateCA("127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{leaf}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	c := &Client{
+		cfg:        &config.Config{CABundle: filepath.Join(t.TempDir(), "missing.pem")},
+		credsStore: store,
+	}
+	result := c.probePlugin(context.Background(), "svc")
+	if result.Status != "unreachable" {
+		t.Errorf("status = %q, want unreachable", result.Status)
+	}
+	if result.Diagnostic != "CA bundle could not be loaded" {
+		t.Errorf("diagnostic = %q, want the fixed CA-bundle message", result.Diagnostic)
+	}
+	if hit {
+		t.Error("probe must not reach the upstream when the CA bundle cannot be loaded")
+	}
+}
 
 // TestProbePluginUsesCABundle confirms the connectivity probe trusts a per-plugin CA
 // bundle: without it the probe reports a TLS failure, with it the probe connects.

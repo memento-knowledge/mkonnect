@@ -248,7 +248,19 @@ type caClientCache struct {
 func (c *caClientCache) clientFor(direct bool, path string, gen uint64) (*http.Client, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.entries == nil || gen != c.gen {
+	// Only ever move the generation forward: a stale request that observed an older
+	// generation than one a concurrent request already applied must not reset the cache
+	// back and thrash the transports.
+	if c.entries == nil || gen > c.gen {
+		// Release idle connections held by the evicted clients so a reload does not leak
+		// pooled connections until IdleConnTimeout.
+		for _, e := range c.entries {
+			if e.client != nil {
+				if tr, ok := e.client.Transport.(*http.Transport); ok {
+					tr.CloseIdleConnections()
+				}
+			}
+		}
 		c.entries = make(map[caClientCacheKey]caClientCacheEntry)
 		c.gen = gen
 	}
@@ -273,9 +285,11 @@ func (c *caClientCache) clientFor(direct bool, path string, gen uint64) (*http.C
 }
 
 // warmCACache primes the cache with the CA transports the current credentials imply, so
-// a misconfigured bundle is reported at startup (and after each reload) rather than only
-// on the first request that needs it. It is best-effort: failures are logged by clientFor
-// and never block startup, since each request still fails closed on its own.
+// a misconfigured bundle is reported at construction rather than only on the first request
+// that needs it. It runs once when the handler is built; after a later reload the cache is
+// rebuilt lazily and a bad bundle is logged (once per generation) on first use. It is
+// best-effort: failures are logged by clientFor and never block startup, since each
+// request still fails closed on its own.
 func warmCACache(cache *caClientCache, store *creds.Store, defaultCABundle string) {
 	gen := store.Generation()
 	seen := make(map[caClientCacheKey]bool)
