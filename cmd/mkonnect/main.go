@@ -65,7 +65,7 @@ func main() {
 	signal.Notify(sighupCh, syscall.SIGHUP)
 
 	client := ws.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile))
-	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store))
+	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store, cfg.CABundle))
 	client.SetCredsStore(store)
 	client.SetPluginRegistry(reg)
 

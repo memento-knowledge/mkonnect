@@ -518,6 +518,18 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 		credential.ApplyAuthorization(req)
 	}
 
+	// Effective CA bundle: a per-plugin ca_bundle overrides the global default, so the
+	// probe verifies an internal CA the same way a forwarded request does — otherwise a
+	// reachable internal-CA host would be reported as a TLS failure and push operators
+	// toward disabling verification.
+	var caBundle string
+	if c.cfg != nil {
+		caBundle = c.cfg.CABundle
+	}
+	if haveCredential && credential.CABundle != "" {
+		caBundle = credential.CABundle
+	}
+
 	// Do not follow redirects: a redirect to an auth page (e.g. SSO) would succeed
 	// with a 200 and hide an auth_failure, and following redirects could forward the
 	// local credentials to a third-party host.
@@ -527,7 +539,18 @@ func (c *Client) probePlugin(ctx context.Context, providerKey string) proto.Test
 			return http.ErrUseLastResponse
 		},
 	}
-	if useDirectTransport {
+	switch {
+	case caBundle != "":
+		transport, err := httpclient.NewTransport(useDirectTransport, caBundle)
+		if err != nil {
+			// Fail closed with an address-free diagnostic (the path may embed internal
+			// detail, and the error class is all the platform needs).
+			result.Status = "unreachable"
+			result.Diagnostic = "CA bundle could not be loaded"
+			return result
+		}
+		probeClient.Transport = transport
+	case useDirectTransport:
 		probeClient.Transport = httpclient.NewDirectTransport()
 	}
 	resp, err := probeClient.Do(req)

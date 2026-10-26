@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -71,6 +72,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	fs.String("token", "", "Unsupported; use --token-stdin")
 	tokenStdin := fs.Bool("token-stdin", false, "Read the token from stdin")
 	stripHeaders := fs.String("strip-headers", "", "Comma-separated extra inbound headers to strip before forwarding, in addition to the credential-header defaults applied when a local credential is used")
+	caBundle := fs.String("ca-bundle", "", "Absolute path to a PEM file of additional root CA(s) to trust for this plugin's upstream TLS (added to the system trust store; never disables verification)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -145,12 +147,24 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
 	}
+	// A CA bundle path, if given, must be absolute (the daemon resolves it with its own
+	// working directory). Check here for a clear CLI error before touching the store.
+	newCABundle := strings.TrimSpace(*caBundle)
+	if newCABundle != "" && !filepath.IsAbs(newCABundle) {
+		return errors.New("--ca-bundle must be an absolute path")
+	}
+
 	// `config set` replaces the whole entry. Warn if that would silently drop a
-	// previously configured strip-headers list (a security control) when the flag is
-	// omitted — e.g. during a routine token rotation.
+	// previously configured security control (strip-headers or a CA bundle) when the
+	// flag is omitted — e.g. during a routine token rotation.
 	newStrip := splitStripHeaders(*stripHeaders)
-	if existing, had := store.Get(plugin); had && len(existing.StripHeaders) > 0 && len(newStrip) == 0 {
-		fmt.Fprintf(w, "Warning: cleared the previously configured strip-headers for %q; re-pass --strip-headers to keep them.\n", plugin)
+	if existing, had := store.Get(plugin); had {
+		if len(existing.StripHeaders) > 0 && len(newStrip) == 0 {
+			fmt.Fprintf(w, "Warning: cleared the previously configured strip-headers for %q; re-pass --strip-headers to keep them.\n", plugin)
+		}
+		if existing.CABundle != "" && newCABundle == "" {
+			fmt.Fprintf(w, "Warning: cleared the previously configured ca-bundle for %q; re-pass --ca-bundle to keep it.\n", plugin)
+		}
 	}
 	if err := store.Set(plugin, creds.Credential{
 		BaseURL:      *baseURL,
@@ -158,6 +172,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		Username:     *username,
 		Token:        tokenVal,
 		StripHeaders: newStrip,
+		CABundle:     newCABundle,
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
@@ -216,6 +231,9 @@ func runConfigList(w io.Writer) error {
 		if len(cred.StripHeaders) > 0 {
 			fmt.Fprintf(w, "%-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
 		}
+		if cred.CABundle != "" {
+			fmt.Fprintf(w, "%-20s  ca-bundle: %s\n", "", cred.CABundle)
+		}
 	}
 	return nil
 }
@@ -261,6 +279,9 @@ func runStatus(_ []string, w io.Writer) error {
 		fmt.Fprintf(w, "  %-20s  %s  [%s]\n", name, cred.BaseURL, authDesc)
 		if len(cred.StripHeaders) > 0 {
 			fmt.Fprintf(w, "  %-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
+		}
+		if cred.CABundle != "" {
+			fmt.Fprintf(w, "  %-20s  ca-bundle: %s\n", "", cred.CABundle)
 		}
 	}
 	fmt.Fprintln(w, "\nBridge connection status is visible in the Memento portal.")

@@ -60,7 +60,7 @@ func TestHTTPHandlerUpstreamTimeout(t *testing.T) {
 	defer srv.Close()
 
 	reg := newRegistry("slow", srv.URL)
-	h := HTTPHandler(reg, mustStore(t))
+	h := HTTPHandler(reg, mustStore(t), "")
 
 	status, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "slow", Method: http.MethodGet, Path: "/",
@@ -94,7 +94,7 @@ func TestHTTPHandlerInjectsBearerToken(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{
 		Type: "http_request", RequestID: "r1",
@@ -139,7 +139,7 @@ func TestHTTPHandlerStripsCallerCredentialHeadersWhenLocalCredentialApplied(t *t
 	}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "gitscm", Method: http.MethodPost, Path: "/api",
@@ -181,7 +181,7 @@ func TestHTTPHandlerStripsCallerCredentialHeadersForBasicAuth(t *testing.T) {
 
 	reg := newRegistry("build-service", srv.URL)
 	store := mustStoreBasicCredential(t, "build-service", srv.URL, "local-user", "basic-token-value-123")
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "build-service", Method: http.MethodGet, Path: "/",
@@ -213,7 +213,7 @@ func TestHTTPHandlerKeepsCallerHeadersWithoutLocalCredential(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "open", Method: http.MethodGet, Path: "/",
@@ -246,7 +246,7 @@ func TestHTTPHandlerStripsExplicitHeadersWithoutLocalCredential(t *testing.T) {
 	if err := store.Set("open", creds.Credential{BaseURL: srv.URL, StripHeaders: []string{"X-Custom-Auth"}}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "open", Method: http.MethodGet, Path: "/",
@@ -280,7 +280,7 @@ func TestHTTPHandlerInjectsBasicCredentialsOnlyForConfiguredPlugin(t *testing.T)
 		"metrics":       srv.URL,
 	}}
 	store := mustStoreBasicCredential(t, "build-service", srv.URL, username, token)
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	for _, providerKey := range []string{"build-service", "metrics"} {
 		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
@@ -318,7 +318,7 @@ func TestHTTPHandlerNoAuthPassthrough(t *testing.T) {
 	if err := store.Set("prom", creds.Credential{BaseURL: srv.URL}); err != nil { // no auth
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{ProviderKey: "prom", Method: "GET", Path: "/"}
 	code, _, _, err := h(context.Background(), msg)
@@ -342,7 +342,7 @@ func TestHTTPHandlerFallsBackToRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{ProviderKey: "prom", Method: "GET", Path: "/"}
 	code, _, _, err := h(context.Background(), msg)
@@ -357,7 +357,7 @@ func TestHTTPHandlerUnknownProviderKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{ProviderKey: "unknown", Method: "GET", Path: "/"}
 	code, _, _, err := h(context.Background(), msg)
@@ -389,7 +389,7 @@ func TestHTTPHandlerRejectsCredentialBearingBaseURL(t *testing.T) {
 				t.Fatalf("store.Set: %v", err)
 			}
 
-			code, _, body, err := HTTPHandler(newRegistry("svc", upstream.URL), store)(context.Background(), proto.HTTPRequestMsg{
+			code, _, body, err := HTTPHandler(newRegistry("svc", upstream.URL), store, "")(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})
 			if err != nil || code != http.StatusInternalServerError {
@@ -418,7 +418,7 @@ func TestViaHeaderCannotBeOverwrittenByGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	// Gateway supplies a Via header — connector must overwrite it.
 	msg := proto.HTTPRequestMsg{
@@ -452,7 +452,7 @@ func TestCredentialsNeverInHTTPResponseMsg(t *testing.T) {
 	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: secret}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{ProviderKey: "svc", Method: "GET", Path: "/"}
 	code, headers, body, err := h(context.Background(), msg)
@@ -515,7 +515,7 @@ func TestHTTPHandlerBlocksBridgeResponseContainingLocalCredentials(t *testing.T)
 			}))
 			defer srv.Close()
 
-			h := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL))
+			h := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL), "")
 			code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})
@@ -556,7 +556,7 @@ func TestHTTPHandlerBlocksBridgeResponseContainingEncodedLocalCredential(t *test
 		t.Fatalf("store.Set: %v", err)
 	}
 
-	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store)(context.Background(), proto.HTTPRequestMsg{
+	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store, "")(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
 	if err != nil || code != http.StatusBadGateway {
@@ -606,7 +606,7 @@ func TestHTTPHandlerBlocksBridgeResponseContainingRawLocalToken(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL))(context.Background(), proto.HTTPRequestMsg{
+			code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), tt.store(t, srv.URL), "")(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})
 			if err != nil || code != http.StatusBadGateway {
@@ -631,7 +631,7 @@ func TestHTTPHandlerPreservesResponseWithoutCredentialReflection(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStoreBasicCredential(t, "svc", srv.URL, "id", "long-token-value-123"))
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStoreBasicCredential(t, "svc", srv.URL, "id", "long-token-value-123"), "")
 	code, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -658,7 +658,7 @@ func TestHTTPHandlerPreservesResponseWithoutFullAuthorizationReflection(t *testi
 	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: "long-token-value-123"}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store)(context.Background(), proto.HTTPRequestMsg{
+	code, headers, body, err := HTTPHandler(newRegistry("svc", srv.URL), store, "")(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
 	if err != nil || code != http.StatusOK {
@@ -684,7 +684,7 @@ func TestHTTPHandlerDoesNotUseAmbientProxy(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		defer cancel()
-		_, _, _, _ = HTTPHandler(newRegistry("svc", "http://example.invalid"), store)(ctx, proto.HTTPRequestMsg{
+		_, _, _, _ = HTTPHandler(newRegistry("svc", "http://example.invalid"), store, "")(ctx, proto.HTTPRequestMsg{
 			ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 		})
 		return
@@ -711,7 +711,7 @@ func TestHTTPHandlerUsesAmbientProxyWithoutLocalCredentials(t *testing.T) {
 	if os.Getenv("MKONNECT_PROXY_TEST_CHILD") == "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 		defer cancel()
-		code, _, _, err := HTTPHandler(newRegistry("svc", "http://example.invalid"), mustStore(t))(ctx, proto.HTTPRequestMsg{
+		code, _, _, err := HTTPHandler(newRegistry("svc", "http://example.invalid"), mustStore(t), "")(ctx, proto.HTTPRequestMsg{
 			ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 		})
 		if err != nil || code != http.StatusOK {
@@ -775,7 +775,7 @@ func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
 	if err := store.Set("svc", creds.Credential{BaseURL: baseWithPrefix}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	cases := []string{
 		"/../../etc/passwd",  // literal dots
@@ -811,7 +811,7 @@ func TestHTTPHandlerHopByHopHeadersNotForwarded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: "GET", Path: "/",
@@ -845,7 +845,7 @@ func TestHTTPHandlerResponseHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds.New: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	msg := proto.HTTPRequestMsg{ProviderKey: "svc", Method: "GET", Path: "/"}
 	_, headers, _, err := h(context.Background(), msg)

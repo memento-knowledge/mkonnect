@@ -94,8 +94,10 @@ restrictive permissions outside your checkout and remove it after the Secret has
    correct the problem and retry. Do not add it to source control.
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
-   `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), and
-   an optional `strip_headers` (a list of extra inbound headers to drop — see below).
+   `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), an
+   optional `strip_headers` (a list of extra inbound headers to drop — see below), and an optional
+   `ca_bundle` (an absolute path to a PEM bundle of extra root CA(s) to trust for this tool's
+   upstream TLS — see [Trusting an internal CA](#trusting-an-internal-ca-custom-ca-bundle)).
 
 2. Point the chart at the Secret in your values:
 
@@ -111,6 +113,76 @@ mount is read-only, `connector config set` cannot write there — manage credent
 Secret and restarting the workload (`kubectl rollout restart deployment/mkonnect`). Leaving
 `credentials.secretName` empty keeps the default behavior (a writable `/data/credentials.json` you
 manage with the CLI).
+
+## Trusting an internal CA (custom CA bundle)
+
+An on-prem tool often presents a TLS certificate signed by an **internal certificate
+authority** rather than a public one. By default the connector verifies upstream TLS
+against the host's system trust store, so such a certificate fails verification and the
+tool is unreachable. Point the connector at a PEM bundle of your internal CA(s) and it
+trusts them **in addition to** the system roots.
+
+The connector **never disables TLS verification.** There is deliberately no
+"insecure"/"skip-verify" switch — the only supported way to reach an internal-CA tool is
+to supply its CA. A bundle that cannot be read (missing, not a regular file, or holding
+no certificate) is a hard error: requests for the affected tool fail closed with an
+`invalid_ca_bundle` marker rather than silently falling back to the system store.
+
+Configure it one of two ways:
+
+- **Globally** — set `CA_BUNDLE` to the absolute path of the PEM file (the Helm chart
+  does this for you when you mount a bundle, below). It applies to every tool that does
+  not set its own.
+- **Per tool** — set `--ca-bundle <absolute-path>` on `connector config set`, or the
+  `ca_bundle` field in the credentials file. A per-tool bundle overrides the global one
+  for that tool.
+
+```bash
+<exec> connector config set gitscm \
+  --base-url https://gitscm.internal \
+  --auth bearer --token-stdin \
+  --ca-bundle /etc/mkonnect-ca/ca-bundle.pem
+```
+
+The path must be **absolute** (the long-running connector resolves it with its own
+working directory). As with other credential changes, a running connector caches this in
+memory: reload it (`docker kill -s HUP <container>` or
+`kubectl rollout restart deployment/mkonnect`) to apply a new or rotated bundle — see
+[Applying changes](#applying-changes).
+
+**With credentialed tools and the proxy.** A tool that has a local credential is reached
+over a *direct* connection that bypasses the ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`
+(so the token goes straight to the tool, never to a proxy); the CA bundle is applied to
+that direct connection. An unauthenticated tool still honours the ambient proxy settings,
+and the CA bundle is applied there too — including to the TLS connection to an
+`https://` proxy, so if a TLS-intercepting proxy sits in front of the tool, that proxy's
+CA must also be in the bundle (or the system store). The connection test shown in the
+portal verifies the same way, so a tool reachable at runtime reports `connected` rather
+than a TLS failure.
+
+### Mounting the CA bundle (Kubernetes)
+
+CA certificates are public, non-secret data, but mounting them from a `Secret` keeps the
+wiring consistent with the credential mount. Create a Secret holding the PEM bundle and
+point the chart at it:
+
+```bash
+kubectl create secret generic mkonnect-ca \
+  --from-file=ca-bundle.pem=/path/to/internal-ca-bundle.pem
+```
+
+```yaml
+caBundle:
+  secretName: mkonnect-ca
+  key: ca-bundle.pem
+  mountPath: /etc/mkonnect-ca
+```
+
+The chart mounts the Secret **read-only** at `<mountPath>/<key>` (mode `0444`) — a sibling
+of the credentials mount, not nested inside it — and sets `CA_BUNDLE` to that path so the
+bundle applies to every tool by default. To scope a different bundle to a single tool,
+set that tool's `ca_bundle` to another absolute path instead. Leaving
+`caBundle.secretName` empty keeps the default behavior (system trust store only).
 
 ## Running the connector CLI
 

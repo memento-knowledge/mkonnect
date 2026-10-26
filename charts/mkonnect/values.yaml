@@ -33,6 +33,23 @@ credentials:
   secretName: ""              # name of an existing Secret; empty disables the mount
   key: "credentials.json"     # key within that Secret holding the credentials JSON
 
+# Optionally mount a Secret holding a PEM bundle of additional root CA(s) to trust
+# for upstream plugin TLS — e.g. an internal CA that signs a self-managed service's
+# certificate. The connector ADDS these to the system trust store; it never disables
+# verification. The bundle is mounted read-only at mountPath/<key>.
+#
+# When secretName is set, the connector trusts the bundle for ALL plugins by default
+# (it sets CA_BUNDLE to the mounted file). A single plugin can instead point at a
+# different bundle with the per-plugin `ca_bundle` field in the credentials JSON, set
+# to an absolute path such as "<mountPath>/<key>".
+#
+# mountPath is a sibling of the credentials mount (not nested under it), so the two
+# Secret mounts do not overlap.
+caBundle:
+  secretName: ""              # name of an existing Secret holding the PEM bundle; empty disables
+  key: "ca-bundle.pem"        # key within that Secret holding the PEM bundle
+  mountPath: "/etc/mkonnect-ca"
+
 persistence:
   enabled: true
   size: 1Gi

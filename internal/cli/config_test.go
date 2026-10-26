@@ -375,6 +375,68 @@ func TestConfigSetStripHeadersFlagPersistsAndLists(t *testing.T) {
 	}
 }
 
+func TestConfigSetCABundleFlagPersistsAndLists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal",
+		"--auth", "bearer", "--token-stdin",
+		"--ca-bundle", "/etc/mkonnect-ca/ca-bundle.pem"},
+		strings.NewReader("token-value-abcdef12"), &stdout); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "list"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"ca-bundle", "/etc/mkonnect-ca/ca-bundle.pem"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in list output:\n%s", want, out)
+		}
+	}
+}
+
+func TestConfigSetRejectsRelativeCABundle(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var out bytes.Buffer
+	err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal",
+		"--ca-bundle", "relative/ca.pem"},
+		noStdin(), &out)
+	if err == nil {
+		t.Fatal("expected config set to reject a relative --ca-bundle")
+	}
+}
+
+func TestConfigSetWarnsWhenCABundleCleared(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var out bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal", "--auth", "bearer", "--token-stdin",
+		"--ca-bundle", "/etc/mkonnect-ca/ca-bundle.pem"},
+		strings.NewReader("token-value-abcdef12"), &out); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	out.Reset()
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal", "--auth", "bearer", "--token-stdin"},
+		strings.NewReader("token-value-rotated99"), &out); err != nil {
+		t.Fatalf("config set (rotate): %v", err)
+	}
+	if !strings.Contains(out.String(), "Warning") || !strings.Contains(out.String(), "ca-bundle") {
+		t.Fatalf("expected a warning that the CA bundle was cleared:\n%s", out.String())
+	}
+}
+
 func TestConfigSetWarnsWhenStripHeadersCleared(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
