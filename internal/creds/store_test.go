@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 )
@@ -243,6 +244,82 @@ func TestCredentialValidateRejectsRelativeCABundle(t *testing.T) {
 	ok := creds.Credential{BaseURL: "https://x", CABundle: "/etc/mkonnect-ca/ca-bundle.pem"}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("valid ca_bundle rejected: %v", err)
+	}
+}
+
+func TestStoreUpstreamTimeoutRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// The operator's literal is stored verbatim (not normalised), so the file and the CLI
+	// stay symmetric.
+	if err := s.Set("gitscm", creds.Credential{
+		BaseURL:         "https://scm.internal",
+		Auth:            "bearer",
+		Token:           "token-value-abcdef12",
+		UpstreamTimeout: "90s",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	s2, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New after write: %v", err)
+	}
+	got, ok := s2.Get("gitscm")
+	if !ok {
+		t.Fatal("Get: not found")
+	}
+	if got.UpstreamTimeout != "90s" {
+		t.Fatalf("upstream_timeout not persisted verbatim: %q", got.UpstreamTimeout)
+	}
+	d, set := got.UpstreamTimeoutDuration()
+	if !set || d != 90*time.Second {
+		t.Fatalf("UpstreamTimeoutDuration = (%s, %v), want (90s, true)", d, set)
+	}
+}
+
+func TestCredentialUpstreamTimeoutDurationUnset(t *testing.T) {
+	c := creds.Credential{BaseURL: "https://x"}
+	if d, set := c.UpstreamTimeoutDuration(); set || d != 0 {
+		t.Fatalf("unset UpstreamTimeoutDuration = (%s, %v), want (0, false)", d, set)
+	}
+}
+
+func TestCredentialValidateUpstreamTimeout(t *testing.T) {
+	base := func(ut string) creds.Credential {
+		return creds.Credential{BaseURL: "https://x", Auth: "bearer", Token: "token-value-abcdef12", UpstreamTimeout: ut}
+	}
+	bad := []struct {
+		name string
+		val  string
+	}{
+		{"unitless", "30"},       // the most likely typo; must not be reinterpreted
+		{"zero", "0s"},           // ambiguous with "use default"; below the floor
+		{"negative", "-5s"},      // nonsensical
+		{"below floor", "500ms"}, // sub-second is a misconfiguration for a proxied call
+		{"above cap", "11m"},     // beyond MaxUpstreamTimeout
+		{"garbage", "soon"},      // unparseable
+	}
+	for _, tc := range bad {
+		t.Run("rejects/"+tc.name, func(t *testing.T) {
+			if err := base(tc.val).Validate(); err == nil {
+				t.Fatalf("expected Validate to reject upstream_timeout %q", tc.val)
+			}
+		})
+	}
+	good := []string{"1s", "30s", "2m", "10m"}
+	for _, val := range good {
+		t.Run("accepts/"+val, func(t *testing.T) {
+			if err := base(val).Validate(); err != nil {
+				t.Fatalf("valid upstream_timeout %q rejected: %v", val, err)
+			}
+		})
+	}
+	// A no-auth plugin (PLUGIN_* backed) may still carry an upstream timeout.
+	if err := (creds.Credential{BaseURL: "https://x", UpstreamTimeout: "45s"}).Validate(); err != nil {
+		t.Fatalf("no-auth upstream_timeout rejected: %v", err)
 	}
 }
 

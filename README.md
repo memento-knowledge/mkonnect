@@ -26,7 +26,20 @@ Memento platform ── wss:// ──▶ Bridge Gateway ── WebSocket ──�
 3. **Report status.** On connect, on local config change (SIGHUP), and on each heartbeat, mkonnect sends a `connection_status` message listing each plugin's state. The platform can also request an on-demand connectivity probe (`test_connection`), which mkonnect runs against the plugin and answers with a `test_result` — no credential ever appears in either message.
 4. **Stay alive.** A heartbeat every 30s — a WebSocket ping (detects silent TCP drops from NAT timeouts or load balancer failures) and an application-level health message (what the gateway actually uses to track connector liveness) — keeps the connection monitored from both sides. If the connection drops, mkonnect reconnects with exponential backoff (1s → 60s cap).
 
-Up to 4 requests are handled concurrently per connector; requests beyond that receive a `429` rather than queuing unbounded.
+### Limits
+
+Each forwarded request is subject to fixed resource limits. They bound the connector's memory and stop one slow or oversized request from starving others; the platform sizes its own retries and timeouts against them. Every over-limit outcome is a **visible, marked reply** (see [Connector error markers](#connector-error-markers)) — never a silently dropped connection — except the concurrency `429`, which is unmarked.
+
+| Limit | Value | When exceeded |
+|---|---|---|
+| Concurrent requests | 4 | A `429` (unmarked); the request is refused rather than queued unbounded. |
+| Request body | 32 MiB | `413` with `X-Mkonnect-Error: request_too_large`; rejected before being forwarded. |
+| Response body | 32 MiB | `413` with `X-Mkonnect-Error: response_too_large`; the upstream was contacted and may have acted, but the oversized response is withheld. |
+| Upstream timeout | 10s (default) | `504` with `X-Mkonnect-Error: upstream_timeout` if the upstream does not respond in time (connecting, sending, or reading the response). |
+
+The 4-request concurrency limit and the 32 MiB body caps together keep the connector's peak buffering bounded — on the order of its default 128 MiB container memory limit, though a single request buffers its request body, the response, and a copy of it, so the true peak is a small multiple of 32 MiB per in-flight request. The concurrency and body limits are therefore fixed.
+
+The **upstream timeout is configurable per plugin** (the other limits are not). Set `--upstream-timeout` on `connector config set` — or the `upstream_timeout` field in the credentials file — to a Go duration with a unit between `1s` and `10m` (e.g. `30s`, `2m`); omit it to keep the 10s default. Raise it for upstreams that are legitimately slow, such as a large commit or a slow self-managed instance. It applies only to forwarded `http_request`s, not to the `test_connection` probe (which keeps its own fixed timeout); it bounds the whole request, but the connect phase (30s) and TLS handshake (10s) keep their own fixed ceilings, so a larger value does not extend them. The platform stops waiting at its own caller deadline (see `expires_at` below), so raising this timeout does not make the platform wait longer — the connector checks `expires_at` only on arrival and does not clamp an in-flight request to it, so a long value holds a worker slot for its full duration, and a request still running when the connector drains on shutdown (a 10s window) may not return a reply. A change takes effect after a reload (SIGHUP or restart). See [Tuning the upstream timeout](docs/setup.md#tuning-the-upstream-timeout) for examples.
 
 ### Connector error markers
 

@@ -95,9 +95,11 @@ restrictive permissions outside your checkout and remove it after the Secret has
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
    `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), an
-   optional `strip_headers` (a list of extra inbound headers to drop — see below), and an optional
+   optional `strip_headers` (a list of extra inbound headers to drop — see below), an optional
    `ca_bundle` (an absolute path to a PEM bundle of extra root CA(s) to trust for this tool's
-   upstream TLS — see [Trusting an internal CA](#trusting-an-internal-ca-custom-ca-bundle)).
+   upstream TLS — see [Trusting an internal CA](#trusting-an-internal-ca-custom-ca-bundle)), and an
+   optional `upstream_timeout` (a per-tool request timeout — see
+   [Tuning the upstream timeout](#tuning-the-upstream-timeout)).
 
 2. Point the chart at the Secret in your values:
 
@@ -322,6 +324,47 @@ card) in the Memento portal:
   against the tool's base URL and reports the result: `connected`, `auth_failure`, `unreachable`,
   or `timeout`. No credential is ever included in the test request or its result.
 
+## Tuning the upstream timeout
+
+By default the connector gives each forwarded request **10 seconds** to complete — connecting,
+sending, and reading the response. Some tools legitimately take longer (a large commit, a report
+or search endpoint on a slow self-managed instance). Raise the timeout **per tool** with
+`--upstream-timeout`, a Go duration with a unit between `1s` and `10m`:
+
+```bash
+<exec> connector config set gitscm \
+  --base-url https://scm.internal \
+  --auth bearer --token-stdin \
+  --upstream-timeout 2m
+```
+
+For an unauthenticated (`PLUGIN_<NAME>`) tool, register a credential entry with the base URL only
+and the timeout — it needs no `--auth`:
+
+```bash
+<exec> connector config set reports --base-url http://reports.internal:8080 --upstream-timeout 45s
+```
+
+Omitting the flag keeps the 10 s default; the equivalent in a mounted Secret is the
+`upstream_timeout` field. A change takes effect after a [reload](#applying-changes). Notes and
+limits:
+
+- The override applies only to **forwarded requests**, not to the **Test connection** probe, which
+  keeps its own fixed timeout.
+- It bounds the whole request, but the connect phase (30 s) and the TLS handshake (10 s) keep their
+  own fixed ceilings, so a larger value does not extend those phases.
+- The platform stops waiting at its own caller deadline; raising this timeout does not make the
+  platform wait longer. The connector does not shorten an in-flight request to that deadline, so a
+  long value keeps a worker slot occupied for its full duration, and a request still running when
+  the connector drains on shutdown (a 10 s window) may not return a reply.
+- A value above `10m` (or below `1s`) is rejected — the bounds are a guardrail against a typo, not
+  a tuning knob, so that a single request cannot hold a connector worker slot for an unreasonable
+  time. In a mounted Secret, an out-of-range or unit-less `upstream_timeout` is rejected when the
+  file loads, exactly like a malformed `token` or `ca_bundle`.
+
+See the [project README's Limits section](../README.md#limits) for the connector's other
+(fixed) limits — concurrency and the request/response body caps.
+
 ## Troubleshooting
 
 | Result | Meaning and fix |
@@ -329,7 +372,7 @@ card) in the Memento portal:
 | `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one with `connector config set` (or, if you mount a Secret, add the entry to it), and confirm the name matches what the platform expects. |
 | `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
 | `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. For Docker, remember that `localhost` is the connector container; see [Reaching a tool from Docker](#reaching-a-tool-from-docker). Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
-| `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. |
+| `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. If the tool is simply slow (large commits, a slow self-managed instance), raise its request timeout — see [Tuning the upstream timeout](#tuning-the-upstream-timeout). (The **Test connection** probe itself uses a fixed timeout and is not affected by that setting.) |
 | Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes). See [Applying changes](#applying-changes). |
 | A credentialed tool is unreachable but a proxy is set | Requests that carry a **local credential** deliberately bypass ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, so the token goes straight to the tool rather than to a proxy. Ensure the connector has *direct* network access to the tool's host. (Unauthenticated `PLUGIN_<NAME>` requests still honor the ambient proxy settings.) |
 

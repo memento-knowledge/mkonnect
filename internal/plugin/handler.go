@@ -174,11 +174,14 @@ func isTimeoutError(err error) bool {
 //   - A dial-phase failure — connection refused or name-resolution failure —
 //     means the connection was never established, so the request did not reach
 //     the upstream: upstream_unreachable.
-//   - Any timeout leaves the outcome unknown: upstream_timeout. Note that a
-//     connect timeout under http.Client.Timeout surfaces as a deadline error
-//     ("awaiting headers"), not a dial OpError, so a black-holed host is reported
-//     as upstream_timeout, not upstream_unreachable — the conservative direction,
-//     and the two cannot be told apart at this layer anyway.
+//   - Any timeout leaves the outcome unknown: upstream_timeout. Which timeout trips
+//     depends on the per-request budget: under a short budget a connect stall is the
+//     context deadline (preferred over the dial OpError once the context is done), so a
+//     black-holed host is reported as upstream_timeout, not upstream_unreachable — the
+//     conservative direction. Under a budget longer than the transport's own connect
+//     (30s) or TLS-handshake (10s) ceilings, those ceilings trip first instead: a connect
+//     timeout then surfaces as a dial OpError (upstream_unreachable, which is accurate —
+//     no connection was established) and a TLS-handshake timeout as upstream_timeout.
 //   - Any other transport error — a TLS handshake failure, a reset connection, or
 //     a failed proxy CONNECT (whose outer OpError Op is "proxyconnect", so the
 //     dial check below does not match it) — means the request may already have
@@ -224,23 +227,43 @@ func requestExpired(expiresAt string, now time.Time) (expired bool, deadline tim
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
 
-// upstreamTimeout bounds a single proxied request to an internal service. It is a var (not a
-// const) so tests can shorten it to exercise the timeout path without a real wait.
+// upstreamTimeout is the default bound on a single proxied request to an internal service,
+// applied when a plugin has no per-plugin override (creds.Credential.UpstreamTimeout). The
+// effective per-request bound is set as a context deadline, not on the shared client, so one
+// cached client can serve plugins with different timeouts (see effectiveUpstreamTimeout and
+// HTTPHandler). It is a var (not a const) so tests can shorten the default to exercise the
+// timeout path without a real wait.
 var upstreamTimeout = 10 * time.Second
 
-// newUpstreamClient builds an *http.Client for proxied plugin calls with the shared
-// per-request timeout and the no-follow-redirects policy. A nil transport uses Go's
-// default transport (which honours the ambient proxy). It is the single place that
-// upstream-client construction lives, so the base clients and the per-plugin
-// CA-bundle clients stay configured identically.
+// newUpstreamClient builds an *http.Client for proxied plugin calls with the no-follow-
+// redirects policy. The per-request timeout is applied by the caller as a context deadline
+// (so a shared client can serve plugins with different per-plugin timeouts); Client.Timeout
+// is set to creds.MaxUpstreamTimeout only as a belt-and-braces ceiling, so a request that
+// somehow reaches Do without a deadline cannot pin a worker slot forever. It can never fire
+// before a valid per-request deadline, and if it did the outcome (a timeout) classifies the
+// same way. A nil transport uses Go's default transport (which honours the ambient proxy).
+// It is the single place that upstream-client construction lives, so the base clients and the
+// per-plugin CA-bundle clients stay configured identically.
 func newUpstreamClient(transport http.RoundTripper) *http.Client {
 	return &http.Client{
-		Timeout:   upstreamTimeout,
+		Timeout:   creds.MaxUpstreamTimeout,
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+// effectiveUpstreamTimeout returns the per-request upstream timeout for a plugin: the
+// plugin's own UpstreamTimeout when configured and valid, otherwise the connector default.
+// haveCred reports whether cred was found in the store (a zero Credential has no override).
+func effectiveUpstreamTimeout(cred creds.Credential, haveCred bool) time.Duration {
+	if haveCred {
+		if d, ok := cred.UpstreamTimeoutDuration(); ok {
+			return d
+		}
+	}
+	return upstreamTimeout
 }
 
 // caClientCacheKey identifies a cached upstream client by transport mode and the
@@ -573,6 +596,18 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 			}
 			client = caClient
 		}
+
+		// Bound the whole exchange (connect, send, and reading the response) with a
+		// per-request deadline, honouring this plugin's configured timeout and otherwise the
+		// connector default. It is a child of ctx, so platform cancellation still fires; it is
+		// deliberately NOT assigned back onto ctx, so the ctx.Err() checks below keep
+		// distinguishing a platform cancellation (ctx itself done -> unmarked) from our own
+		// deadline (only reqCtx done -> classified as upstream_timeout). The deadline is set
+		// here, immediately before Do, so the clock starts where Client.Timeout's did; cancel
+		// runs on return, after the response body is fully read inside this closure.
+		reqCtx, cancel := context.WithTimeout(ctx, effectiveUpstreamTimeout(cred, haveCred))
+		defer cancel()
+		req = req.WithContext(reqCtx)
 
 		resp, err := client.Do(req)
 		if err != nil {
