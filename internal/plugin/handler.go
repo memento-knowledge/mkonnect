@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path"
 	"strings"
 	"time"
@@ -122,19 +121,37 @@ func responseContainsLocalCredentials(headers http.Header, body string, cred cre
 	return false
 }
 
-// transportErrorCode classifies an error from client.Do (when the request context
-// is not itself done) into an error-marker code. A dial-phase failure — connection
-// refused, name-resolution failure, or a timeout while connecting — means the
-// request never reached the upstream (upstream_unreachable). A timeout after the
-// connection was established leaves the outcome unknown (upstream_timeout), as does
-// any other transport error such as a TLS handshake failure or a reset connection
-// (upstream_error), since the request may already have been sent.
+// isTimeoutError reports whether err, or any error it wraps, is a timeout. Unlike
+// os.IsTimeout it walks the %w chain, so it stays correct even after the error has
+// been wrapped with fmt.Errorf.
+func isTimeoutError(err error) bool {
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) {
+		return timeout.Timeout()
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// transportErrorCode classifies an error from client.Do (reached only when the
+// request context is not itself done) into an error-marker code:
+//   - A dial-phase failure — connection refused or name-resolution failure —
+//     means the connection was never established, so the request did not reach
+//     the upstream: upstream_unreachable.
+//   - Any timeout leaves the outcome unknown: upstream_timeout. Note that a
+//     connect timeout under http.Client.Timeout surfaces as a deadline error
+//     ("awaiting headers"), not a dial OpError, so a black-holed host is reported
+//     as upstream_timeout, not upstream_unreachable — the conservative direction,
+//     and the two cannot be told apart at this layer anyway.
+//   - Any other transport error — a TLS handshake failure, a reset connection, or
+//     a failed proxy CONNECT (whose outer OpError Op is "proxyconnect", so the
+//     dial check below does not match it) — means the request may already have
+//     been sent: upstream_error.
 func transportErrorCode(err error) string {
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op == "dial" {
 		return ErrCodeUpstreamUnreachable
 	}
-	if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+	if isTimeoutError(err) {
 		return ErrCodeUpstreamTimeout
 	}
 	return ErrCodeUpstreamError
@@ -278,24 +295,29 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			// (upstream_unreachable); a timeout or any other transport error means the
 			// outcome is unknown. The status stays 504 for compatibility; the marker
 			// carries the distinction.
-			return 504, errHeaders(transportErrorCode(err)), errBody(`{"error":"upstream timeout or connection error"}`), err
+			return http.StatusGatewayTimeout, errHeaders(transportErrorCode(err)), errBody(`{"error":"upstream timeout or connection error"}`), err
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
 		respBytes, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
 		if err != nil {
-			// The per-request timeout also covers reading the response body, so a stall
-			// here (after headers arrived) is the case where a write may already have
-			// taken effect. Mark it so the platform can tell it apart from an upstream
-			// error: a read timeout is upstream_timeout, any other read failure is
-			// upstream_error. The non-nil err is still returned so the ws layer logs it.
-			code := ErrCodeUpstreamError
-			status := http.StatusBadGateway
-			if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
-				code = ErrCodeUpstreamTimeout
-				status = 504
+			// A done request context is platform-initiated cancellation, not an
+			// upstream failure; propagate it as the client.Do path does (unmarked).
+			if ctx.Err() != nil {
+				return 0, nil, nil, ctx.Err()
 			}
-			return status, errHeaders(code), errBody(`{"error":"error reading upstream response"}`), fmt.Errorf("read response: %w", err)
+			// The per-request timeout also covers reading the response body, so a stall
+			// here (after headers arrived) is a case where a write may already have
+			// taken effect. Mark it so the platform can tell it apart from a response
+			// relayed from the upstream: a read timeout is upstream_timeout, any other
+			// read failure upstream_error. The status stays 504 (as on the client.Do
+			// path) for compatibility; the marker carries the distinction. The non-nil
+			// err is still returned so the ws layer logs it.
+			code := ErrCodeUpstreamError
+			if isTimeoutError(err) {
+				code = ErrCodeUpstreamTimeout
+			}
+			return http.StatusGatewayTimeout, errHeaders(code), errBody(`{"error":"error reading upstream response"}`), fmt.Errorf("read response: %w", err)
 		}
 		if len(respBytes) > maxBodyBytes {
 			return 413, errHeaders(ErrCodeResponseTooLarge), errBody(`{"error":"upstream response too large"}`), nil

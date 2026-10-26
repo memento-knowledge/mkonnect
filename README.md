@@ -30,7 +30,7 @@ Up to 4 requests are handled concurrently per connector; requests beyond that re
 
 ### Connector error markers
 
-Some `http_response` replies are **synthesised by the connector** (for example when a request is rejected before it is forwarded, or when the upstream could not be reached) rather than relayed from the upstream service. Because a synthesised status such as `504` is otherwise indistinguishable from the same status returned by the upstream, mkonnect tags every synthesised response with a response header:
+Some `http_response` replies are **synthesised by the connector while forwarding a request** (for example when a request is rejected before it is forwarded, or when the upstream could not be reached) rather than relayed from the upstream service. Because a synthesised status such as `504` is otherwise indistinguishable from the same status returned by the upstream, mkonnect tags every such response with a response header:
 
 ```
 X-Mkonnect-Error: <code>
@@ -57,6 +57,8 @@ The code tells the consumer whether the request can have reached the upstream:
 A reserved code, `expired`, is part of this vocabulary for requests rejected after their deadline; the connector does not emit it yet.
 
 The status code on a synthesised response is kept for backward compatibility and is not always a precise fit (e.g. `upstream_error` reuses `504`); the `X-Mkonnect-Error` code is the authoritative signal.
+
+Connector responses produced outside the request-forwarding path — the backpressure `429` and lifecycle responses such as the suspension `503` — are not marked yet.
 
 ## Configuration
 

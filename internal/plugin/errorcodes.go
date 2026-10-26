@@ -1,11 +1,15 @@
 package plugin
 
 // ErrorHeader is the response header that marks an HTTP response as synthesised by
-// the connector itself rather than relayed from the upstream service. Its value is
-// one of the machine-readable Err* codes below. Responses relayed from the upstream
-// never carry this header (and any value the upstream sets is stripped), so the
-// platform can reliably tell a connector-produced error from an upstream one — for
-// example to decide whether a write request may have reached the upstream.
+// the connector's request-forwarding handler rather than relayed from the upstream
+// service. Its value is one of the machine-readable Err* codes below. Responses
+// relayed from the upstream never carry this header (and any value the upstream
+// sets is stripped), so the platform can reliably tell a forwarding error the
+// connector produced from one the upstream returned — for example to decide whether
+// a write request may have reached the upstream.
+//
+// It does not cover connector responses produced outside the forwarding path, such
+// as the backpressure 429 or lifecycle responses; those are not marked yet.
 //
 // The name is already in canonical form (http.CanonicalHeaderKey(ErrorHeader) ==
 // ErrorHeader); consumers must match it case-insensitively per RFC 9110.
@@ -34,7 +38,7 @@ const (
 	ErrCodeUpstreamTimeout = "upstream_timeout"
 	// ErrCodeUpstreamUnreachable: the connection to the upstream could not be
 	// established (dial failure, e.g. connection refused or name resolution
-	// failure). The request was not sent.
+	// failure), so the request almost certainly did not reach the upstream.
 	ErrCodeUpstreamUnreachable = "upstream_unreachable"
 	// ErrCodeUpstreamError: a transport-level error other than a timeout or a dial
 	// failure (e.g. TLS handshake failure, connection reset, or a malformed

@@ -2,9 +2,12 @@ package plugin
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +64,13 @@ func TestSynthesisedResponsesCarryMarker(t *testing.T) {
 			msg:        proto.HTTPRequestMsg{ProviderKey: "svc", Method: http.MethodGet, Path: "/"},
 			wantStatus: 500,
 			wantCode:   ErrCodeInvalidBaseURL,
+		},
+		{
+			name:       "malformed path escape",
+			registry:   newRegistry("svc", upstream.URL),
+			msg:        proto.HTTPRequestMsg{ProviderKey: "svc", Method: http.MethodGet, Path: "/%zz"},
+			wantStatus: 400,
+			wantCode:   ErrCodeInvalidPath,
 		},
 	}
 
@@ -197,11 +207,11 @@ func TestUpstreamCredentialLeakCarriesMarker(t *testing.T) {
 // time) is marked upstream_timeout.
 func TestUpstreamTimeoutCarriesMarker(t *testing.T) {
 	orig := upstreamTimeout
-	upstreamTimeout = 20 * time.Millisecond
-	defer func() { upstreamTimeout = orig }()
+	upstreamTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { upstreamTimeout = orig })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -226,22 +236,25 @@ func TestUpstreamTimeoutCarriesMarker(t *testing.T) {
 // where a write may already have taken effect, so it must be distinguishable.
 func TestUpstreamReadTimeoutCarriesMarker(t *testing.T) {
 	orig := upstreamTimeout
-	upstreamTimeout = 40 * time.Millisecond
-	defer func() { upstreamTimeout = orig }()
+	upstreamTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { upstreamTimeout = orig })
 
+	// Announce a body longer than what is actually sent, flush the headers, then
+	// stall well past the timeout. The handler reads headers promptly and then
+	// blocks in io.ReadAll waiting for the rest of the body, so the timeout trips
+	// in the read branch specifically (not the client.Do header-wait branch).
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1000")
 		w.WriteHeader(http.StatusOK)
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-		// Headers are delivered; stall before sending the body so the read times out.
-		time.Sleep(400 * time.Millisecond)
-		_, _ = w.Write([]byte("late"))
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		time.Sleep(2 * time.Second)
 	}))
 	defer srv.Close()
 
 	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
-	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
+	status, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
 	if err == nil {
@@ -252,6 +265,48 @@ func TestUpstreamReadTimeoutCarriesMarker(t *testing.T) {
 	}
 	if got := marker(headers); got != ErrCodeUpstreamTimeout {
 		t.Fatalf("%s = %q, want %q", ErrorHeader, got, ErrCodeUpstreamTimeout)
+	}
+	// Pin that the read branch (not the header-wait branch) produced this response.
+	if body == nil || !strings.Contains(*body, "error reading upstream response") {
+		t.Fatalf("body = %v, want the read-branch error body", body)
+	}
+}
+
+// TestUpstreamReadErrorCarriesMarker checks that a non-timeout failure while
+// reading the response body (here, the upstream closing the connection before the
+// announced body is sent) is marked upstream_error with a 504.
+func TestUpstreamReadErrorCarriesMarker(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		// Send a valid status line and headers announcing a 1000-byte body, write a
+		// few bytes, then close abruptly so the client's body read fails with EOF.
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial"))
+		_ = conn.Close()
+	}()
+
+	h := HTTPHandler(newRegistry("svc", "http://"+ln.Addr().String()), mustStore(t))
+	status, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+	})
+	if err == nil {
+		t.Fatal("expected a transport error on truncated body")
+	}
+	if status != 504 {
+		t.Fatalf("status = %d, want 504", status)
+	}
+	if got := marker(headers); got != ErrCodeUpstreamError {
+		t.Fatalf("%s = %q, want %q", ErrorHeader, got, ErrCodeUpstreamError)
+	}
+	if body == nil || !strings.Contains(*body, "error reading upstream response") {
+		t.Fatalf("body = %v, want the read-branch error body", body)
 	}
 }
 
@@ -314,30 +369,72 @@ func TestRelayedUpstreamResponsesCarryNoMarker(t *testing.T) {
 // is stripped, so a compromised or hostile upstream cannot forge the marker while
 // an ordinary response header still passes through.
 func TestUpstreamCannotSpoofMarker(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// Set via a non-canonical key to prove canonicalisation covers it.
-		w.Header().Set("x-mkonnect-error", ErrCodePathBlocked)
-		w.Header().Set("X-Ordinary", "kept")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+	for _, upstreamStatus := range []int{http.StatusOK, http.StatusInternalServerError} {
+		t.Run(http.StatusText(upstreamStatus), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				// Assign the raw map directly so a non-canonical, multi-valued marker
+				// goes out on the wire exactly as written, proving the strip covers
+				// canonicalisation and duplicate values (not just Header().Set).
+				w.Header()["x-mkonnect-error"] = []string{ErrCodePathBlocked, ErrCodeUpstreamTimeout}
+				w.Header().Set("X-Ordinary", "kept")
+				w.WriteHeader(upstreamStatus)
+			}))
+			defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
-	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
-		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if status != 200 {
-		t.Fatalf("status = %d, want 200", status)
-	}
-	for k, v := range headers {
-		if http.CanonicalHeaderKey(k) == ErrorHeader {
-			t.Fatalf("upstream-set marker must be stripped, got %q=%q", k, v)
-		}
-	}
-	if headers["X-Ordinary"] != "kept" {
-		t.Fatalf("ordinary upstream header must pass through, got %v", headers)
+			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+			status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
+				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if status != upstreamStatus {
+				t.Fatalf("status = %d, want %d", status, upstreamStatus)
+			}
+			for k, v := range headers {
+				if http.CanonicalHeaderKey(k) == ErrorHeader {
+					t.Fatalf("upstream-set marker must be stripped, got %q=%q", k, v)
+				}
+			}
+			if headers["X-Ordinary"] != "kept" {
+				t.Fatalf("ordinary upstream header must pass through, got %v", headers)
+			}
+		})
 	}
 }
+
+// TestTransportErrorCode exercises the classifier directly with synthetic wrapped
+// errors, covering the net/http error shapes without needing real sockets —
+// including the proxy-CONNECT case, whose outer OpError Op is "proxyconnect" (not
+// "dial") and so must not be read as unreachable.
+func TestTransportErrorCode(t *testing.T) {
+	dialErr := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
+	proxyErr := &url.Error{Op: "Get", URL: "http://x", Err: &net.OpError{
+		Op: "proxyconnect", Err: &net.OpError{Op: "dial", Err: errors.New("refused")},
+	}}
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"dial failure", dialErr, ErrCodeUpstreamUnreachable},
+		{"wrapped dial failure", fmt.Errorf("do: %w", dialErr), ErrCodeUpstreamUnreachable},
+		{"proxy connect failure", proxyErr, ErrCodeUpstreamError},
+		{"timeout", &net.OpError{Op: "read", Err: timeoutErr{}}, ErrCodeUpstreamTimeout},
+		{"deadline exceeded", fmt.Errorf("do: %w", context.DeadlineExceeded), ErrCodeUpstreamTimeout},
+		{"other", errors.New("tls: handshake failure"), ErrCodeUpstreamError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := transportErrorCode(tt.err); got != tt.want {
+				t.Fatalf("transportErrorCode(%v) = %q, want %q", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// timeoutErr is a synthetic net-style timeout error for TestTransportErrorCode.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string { return "i/o timeout" }
+func (timeoutErr) Timeout() bool { return true }
