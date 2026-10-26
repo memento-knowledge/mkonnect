@@ -43,6 +43,41 @@ var sensitiveResponseHeaders = map[string]bool{
 	"Set-Cookie":          true,
 }
 
+// stripHeaderKey normalises a header name for credential-strip matching: it folds the
+// underscore spelling (e.g. Private_token) onto the dash form that some upstreams treat as
+// equivalent, then canonicalises — so a lookup matches regardless of casing or separator,
+// and a configured name and a caller's name match whichever spelling each uses.
+func stripHeaderKey(name string) string {
+	return http.CanonicalHeaderKey(strings.ReplaceAll(name, "_", "-"))
+}
+
+// stripHeaderSet builds a set of header names keyed by stripHeaderKey.
+func stripHeaderSet(names ...string) map[string]bool {
+	s := make(map[string]bool, len(names))
+	for _, n := range names {
+		s[stripHeaderKey(n)] = true
+	}
+	return s
+}
+
+// defaultCredentialHeaders are inbound credential-bearing headers that must never reach
+// the upstream when mkonnect applies its own local credential: a buggy or hostile message
+// could otherwise add or override credentials the upstream honours. They are always
+// stripped for a credentialed plugin; a plugin may strip additional headers via its
+// StripHeaders config. Proxy-Authorization is also hop-by-hop; it is listed here to make
+// the intent explicit and survive any future edit to hopByHopHeaders. This is not an
+// exhaustive list of every service's credential header — add service-specific ones (e.g.
+// X-Vault-Token, X-Amz-Security-Token) per plugin via StripHeaders.
+var defaultCredentialHeaders = stripHeaderSet(
+	"Authorization",
+	"Proxy-Authorization",
+	"Cookie",
+	"PRIVATE-TOKEN",
+	"JOB-TOKEN",
+	"X-Api-Key",
+	"X-Auth-Token",
+)
+
 const unsafeCredentialResponse = `{"error":"upstream response contains local credentials"}`
 
 // credentialRepresentations returns encoded and complete-authorization forms of
@@ -167,7 +202,8 @@ var upstreamTimeout = 10 * time.Second
 
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
-//  2. Injects an Authorization header if local credentials are configured.
+//  2. Strips caller-supplied credential headers, then injects an Authorization header
+//     when local credentials are configured, so the local credential is the only one used.
 //  3. Forwards the HTTP request and returns status, headers, and body.
 func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 	httpClient := &http.Client{
@@ -266,20 +302,46 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			return 0, nil, nil, fmt.Errorf("build request: %w", err)
 		}
 
-		// Forward inbound headers from the gateway (cloud-side credentials arrive here),
-		// excluding hop-by-hop headers that must not be forwarded (CL.TE smuggling risk).
-		for k, v := range msg.Headers {
-			if !hopByHopHeaders[http.CanonicalHeaderKey(k)] {
-				req.Header.Set(k, v)
+		// Decide which inbound credential-bearing headers to drop before forwarding.
+		// A plugin's explicit StripHeaders are honoured whenever the entry exists. The
+		// credential-header defaults are added only when a local credential is actually
+		// applied, so the local credential is the one credential the upstream sees; for a
+		// plugin without a local credential a caller-supplied Authorization is intentional
+		// (platform-held credentials) and is left untouched.
+		useDirectTransport := haveCred && cred.HasAuthorization()
+		var stripHeaders map[string]bool
+		if haveCred && len(cred.StripHeaders) > 0 {
+			stripHeaders = stripHeaderSet(cred.StripHeaders...)
+		}
+		if useDirectTransport {
+			if stripHeaders == nil {
+				stripHeaders = make(map[string]bool, len(defaultCredentialHeaders))
 			}
+			for h := range defaultCredentialHeaders {
+				stripHeaders[h] = true
+			}
+		}
+
+		// Forward inbound headers from the gateway (cloud-side credentials arrive here),
+		// excluding hop-by-hop headers (CL.TE smuggling risk) and the credential-bearing
+		// headers selected above. The underscore spelling (e.g. Private_token) is matched
+		// against the dash form too, since some upstreams treat the two as equivalent.
+		for k, v := range msg.Headers {
+			if hopByHopHeaders[http.CanonicalHeaderKey(k)] {
+				continue
+			}
+			if stripHeaders[stripHeaderKey(k)] {
+				continue
+			}
+			req.Header.Set(k, v)
 		}
 
 		req.Header.Set("Via", "1.1 mkonnect")
 
-		// Inject local credentials only for this configured plugin. This happens
-		// after bridge headers are copied so the local credential cannot be replaced.
+		// Inject local credentials for this configured plugin. The credential-bearing
+		// inbound headers were stripped above, so the local credential is the only
+		// credential the upstream receives.
 		client := httpClient
-		useDirectTransport := haveCred && cred.HasAuthorization()
 		if useDirectTransport {
 			cred.ApplyAuthorization(req)
 			client = directHTTPClient

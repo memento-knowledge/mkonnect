@@ -112,6 +112,157 @@ func TestHTTPHandlerInjectsBearerToken(t *testing.T) {
 	}
 }
 
+// captureHeaders returns an httptest server that records the inbound request headers.
+func captureHeaders(t *testing.T, got *http.Header) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*got = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+func TestHTTPHandlerStripsCallerCredentialHeadersWhenLocalCredentialApplied(t *testing.T) {
+	var got http.Header
+	srv := captureHeaders(t, &got)
+	defer srv.Close()
+
+	reg := newRegistry("gitscm", srv.URL)
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("gitscm", creds.Credential{
+		BaseURL:      srv.URL,
+		Auth:         "bearer",
+		Token:        "local-token-value-abc",
+		StripHeaders: []string{"X-Custom-Auth"}, // configured extra
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store)
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "gitscm", Method: http.MethodPost, Path: "/api",
+		Headers: map[string]string{
+			"Authorization": "Bearer attacker",
+			"aUtHoRiZaTiOn": "attacker-odd-case", // casing must not bypass the strip
+			"PRIVATE-TOKEN": "p",
+			"JOB-TOKEN":     "j",
+			"Cookie":        "session=x",
+			"X-Api-Key":     "k",
+			"X-Auth-Token":  "a",
+			"Private_token": "u", // underscore spelling of a default
+			"X-Custom-Auth": "c", // the configured extra
+			"Content-Type":  "application/json",
+			"Accept":        "application/json",
+		},
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+
+	if got.Get("Authorization") != "Bearer local-token-value-abc" {
+		t.Fatalf("Authorization reaching upstream = %q, want only the local credential", got.Get("Authorization"))
+	}
+	for _, name := range []string{"Private-Token", "Job-Token", "Cookie", "X-Api-Key", "X-Auth-Token", "X-Custom-Auth", "Private_token"} {
+		if vs := got.Values(name); len(vs) != 0 {
+			t.Errorf("caller credential header %s leaked to upstream (value redacted, %d value(s))", name, len(vs))
+		}
+	}
+	if got.Get("Content-Type") != "application/json" || got.Get("Accept") != "application/json" {
+		t.Errorf("non-credential headers not forwarded: Content-Type=%q Accept=%q", got.Get("Content-Type"), got.Get("Accept"))
+	}
+}
+
+func TestHTTPHandlerStripsCallerCredentialHeadersForBasicAuth(t *testing.T) {
+	var got http.Header
+	srv := captureHeaders(t, &got)
+	defer srv.Close()
+
+	reg := newRegistry("build-service", srv.URL)
+	store := mustStoreBasicCredential(t, "build-service", srv.URL, "local-user", "basic-token-value-123")
+	h := HTTPHandler(reg, store)
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "build-service", Method: http.MethodGet, Path: "/",
+		Headers: map[string]string{"PRIVATE-TOKEN": "p", "Cookie": "s=x", "Proxy-Authorization": "Basic zzz"},
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("local-user:basic-token-value-123"))
+	if got.Get("Authorization") != expected {
+		t.Fatalf("Authorization = %q, want the local basic credential", got.Get("Authorization"))
+	}
+	for _, name := range []string{"Private-Token", "Cookie", "Proxy-Authorization"} {
+		if vs := got.Values(name); len(vs) != 0 {
+			t.Errorf("caller credential header %s leaked to upstream (%d value(s))", name, len(vs))
+		}
+	}
+}
+
+func TestHTTPHandlerKeepsCallerHeadersWithoutLocalCredential(t *testing.T) {
+	var got http.Header
+	srv := captureHeaders(t, &got)
+	defer srv.Close()
+
+	// Registry-only plugin: no local credential, so caller-supplied headers (platform-held
+	// credentials) are forwarded unchanged — the issue's "keep current behaviour" case.
+	reg := newRegistry("open", srv.URL)
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	h := HTTPHandler(reg, store)
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "open", Method: http.MethodGet, Path: "/",
+		Headers: map[string]string{"Authorization": "Bearer bridge", "PRIVATE-TOKEN": "p"},
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if got.Get("Authorization") != "Bearer bridge" {
+		t.Errorf("Authorization = %q, want the caller header forwarded unchanged", got.Get("Authorization"))
+	}
+	if got.Get("Private-Token") != "p" {
+		t.Errorf("Private-Token = %q, want the caller header forwarded unchanged", got.Get("Private-Token"))
+	}
+}
+
+func TestHTTPHandlerStripsExplicitHeadersWithoutLocalCredential(t *testing.T) {
+	var got http.Header
+	srv := captureHeaders(t, &got)
+	defer srv.Close()
+
+	// A plugin entry with no auth but an explicit StripHeaders list: the explicit header is
+	// dropped, while the credential-header defaults are NOT applied (no local credential), so
+	// a caller Authorization still passes through.
+	reg := newRegistry("open", srv.URL)
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("open", creds.Credential{BaseURL: srv.URL, StripHeaders: []string{"X-Custom-Auth"}}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store)
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "open", Method: http.MethodGet, Path: "/",
+		Headers: map[string]string{"Authorization": "Bearer bridge", "X-Custom-Auth": "c"},
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if vs := got.Values("X-Custom-Auth"); len(vs) != 0 {
+		t.Errorf("explicitly stripped header leaked to upstream (%d value(s))", len(vs))
+	}
+	if got.Get("Authorization") != "Bearer bridge" {
+		t.Errorf("Authorization = %q, want the caller header forwarded (defaults must not apply without a local credential)", got.Get("Authorization"))
+	}
+}
+
 func TestHTTPHandlerInjectsBasicCredentialsOnlyForConfiguredPlugin(t *testing.T) {
 	const username = "local-user"
 	const token = "basic-token-value-123"

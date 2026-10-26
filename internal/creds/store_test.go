@@ -171,3 +171,55 @@ func TestStoreNewMissingFileOK(t *testing.T) {
 		t.Fatalf("expected empty list, got %d entries", len(list))
 	}
 }
+
+func TestStoreStripHeadersRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("gitscm", creds.Credential{
+		BaseURL:      "http://scm.internal",
+		Auth:         "bearer",
+		Token:        "token-value-abcdef12",
+		StripHeaders: []string{"X-Custom-Auth", "X-Gitlab-Token"},
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// Reload from disk in a fresh store to confirm the field persists.
+	s2, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New after write: %v", err)
+	}
+	got, ok := s2.Get("gitscm")
+	if !ok {
+		t.Fatal("Get: not found")
+	}
+	if len(got.StripHeaders) != 2 || got.StripHeaders[0] != "X-Custom-Auth" || got.StripHeaders[1] != "X-Gitlab-Token" {
+		t.Fatalf("strip_headers not persisted: %v", got.StripHeaders)
+	}
+}
+
+func TestCredentialValidateRejectsBadStripHeaders(t *testing.T) {
+	cases := []struct {
+		name  string
+		strip []string
+	}{
+		{"empty", []string{""}},
+		{"whitespace", []string{"   "}},
+		{"embedded space", []string{"X Bad"}},
+		{"colon", []string{"X-Bad: y"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := creds.Credential{BaseURL: "http://x", Auth: "bearer", Token: "token-value-abcdef12", StripHeaders: tc.strip}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("expected Validate to reject strip_headers %v", tc.strip)
+			}
+		})
+	}
+	ok := creds.Credential{BaseURL: "http://x", Auth: "bearer", Token: "token-value-abcdef12", StripHeaders: []string{"X-Custom-Auth"}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid strip_headers rejected: %v", err)
+	}
+}

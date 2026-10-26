@@ -17,12 +17,20 @@ import (
 // credentials or mistaken for ordinary response content.
 const MinTokenLength = 16
 
-// Credential holds a plugin's base URL and optional local HTTP authentication.
+// Credential is the per-plugin configuration entry: a plugin's base URL, its optional
+// local HTTP authentication, and optional per-plugin policy. It is the home for
+// per-plugin settings generally — future per-plugin options (e.g. a custom CA bundle or
+// an upstream timeout) extend this struct.
 type Credential struct {
 	BaseURL  string `json:"base_url"`
 	Auth     string `json:"auth,omitempty"` // "bearer", "basic", or ""
 	Username string `json:"username,omitempty"`
 	Token    string `json:"token,omitempty"`
+	// StripHeaders lists extra inbound request headers to drop before forwarding, in
+	// addition to the credential-header defaults the plugin handler always enforces when a
+	// local credential is applied. Names are matched case-insensitively. Entries are
+	// honoured whenever this entry exists, so a no-auth plugin can opt into stripping too.
+	StripHeaders []string `json:"strip_headers,omitempty"`
 }
 
 // Validate checks the local authentication fields without including credential
@@ -52,6 +60,18 @@ func (c Credential) Validate() error {
 		}
 	default:
 		return errors.New("unsupported authentication mode")
+	}
+	// Validate (but do not mutate — value receiver) any extra headers to strip. The
+	// plugin handler canonicalises these at lookup time, so only reject names that are
+	// not usable header names at all. HasAuthorization depends on Validate, but Set and
+	// load both validate before persisting, so the store never holds an invalid entry.
+	for _, h := range c.StripHeaders {
+		if strings.TrimSpace(h) == "" {
+			return errors.New("strip_headers entries must not be empty")
+		}
+		if strings.ContainsAny(h, " \t\r\n:") {
+			return errors.New("strip_headers entries must be valid header names")
+		}
 	}
 	return nil
 }
