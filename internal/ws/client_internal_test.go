@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,9 +13,102 @@ import (
 	"testing"
 	"time"
 
+	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/creds"
 	"github.com/memento-knowledge/mkonnect/internal/plugin"
+	"github.com/memento-knowledge/mkonnect/internal/testca"
 )
+
+// TestProbePluginGlobalCABundleFailsClosed verifies that an unloadable GLOBAL CA bundle
+// (from config) makes the probe fail closed with an address-free diagnostic, without
+// dialling the upstream.
+func TestProbePluginGlobalCABundleFailsClosed(t *testing.T) {
+	var hit bool
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	// A cert is required to start a TLS server; the probe must never reach it.
+	_, leaf, err := testca.GenerateCA("127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{leaf}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+
+	c := &Client{
+		cfg:        &config.Config{CABundle: filepath.Join(t.TempDir(), "missing.pem")},
+		credsStore: store,
+	}
+	result := c.probePlugin(context.Background(), "svc")
+	if result.Status != "unreachable" {
+		t.Errorf("status = %q, want unreachable", result.Status)
+	}
+	if result.Diagnostic != "CA bundle could not be loaded" {
+		t.Errorf("diagnostic = %q, want the fixed CA-bundle message", result.Diagnostic)
+	}
+	if hit {
+		t.Error("probe must not reach the upstream when the CA bundle cannot be loaded")
+	}
+}
+
+// TestProbePluginUsesCABundle confirms the connectivity probe trusts a per-plugin CA
+// bundle: without it the probe reports a TLS failure, with it the probe connects.
+func TestProbePluginUsesCABundle(t *testing.T) {
+	caPEM, leaf, err := testca.GenerateCA("127.0.0.1")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{leaf}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	bundle := filepath.Join(t.TempDir(), "ca-bundle.pem")
+	if err := os.WriteFile(bundle, caPEM, 0o644); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+
+	mkStore := func(caBundle string) *creds.Store {
+		s, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+		if err != nil {
+			t.Fatalf("creds.New: %v", err)
+		}
+		if err := s.Set("svc", creds.Credential{
+			BaseURL:  srv.URL,
+			Auth:     "bearer",
+			Token:    "long-token-value-123",
+			CABundle: caBundle,
+		}); err != nil {
+			t.Fatalf("store.Set: %v", err)
+		}
+		return s
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	noCA := (&Client{credsStore: mkStore("")}).probePlugin(ctx, "svc")
+	if noCA.Status != "unreachable" {
+		t.Errorf("without the CA bundle, status = %q, want unreachable", noCA.Status)
+	}
+
+	withCA := (&Client{credsStore: mkStore(bundle)}).probePlugin(ctx, "svc")
+	if withCA.Status != "connected" {
+		t.Errorf("with the CA bundle, status = %q (diagnostic %q), want connected", withCA.Status, withCA.Diagnostic)
+	}
+}
 
 func TestProbePluginRejectsCredentialBearingBaseURL(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

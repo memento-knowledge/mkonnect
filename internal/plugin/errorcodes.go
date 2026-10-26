@@ -25,8 +25,8 @@ const ErrorHeader = "X-Mkonnect-Error"
 //   - Not forwarded (the connector rejected the request before contacting the
 //     upstream, so no write can have happened): ErrCodeProviderNotFound,
 //     ErrCodeMethodNotAllowed, ErrCodeInvalidPath, ErrCodePathBlocked,
-//     ErrCodeInvalidBaseURL, ErrCodeRequestTooLarge, ErrCodeExpired, and
-//     ErrCodeUpstreamUnreachable (connection never established).
+//     ErrCodeInvalidBaseURL, ErrCodeInvalidCABundle, ErrCodeRequestTooLarge,
+//     ErrCodeExpired, and ErrCodeUpstreamUnreachable (connection never established).
 //   - Forwarded, response withheld (the upstream was contacted and may have acted,
 //     but the connector did not relay its response): ErrCodeResponseTooLarge,
 //     ErrCodeUpstreamCredentialLeak.
@@ -65,6 +65,11 @@ const (
 	// ErrCodeInvalidBaseURL: the configured base URL for the provider is invalid
 	// (connector misconfiguration). Not forwarded.
 	ErrCodeInvalidBaseURL = "invalid_base_url"
+	// ErrCodeInvalidCABundle: a CA bundle is configured for the provider's upstream
+	// TLS but could not be loaded (missing, unreadable, or contains no certificate).
+	// The connector fails closed rather than falling back to the system trust store,
+	// so the request is not forwarded (connector misconfiguration).
+	ErrCodeInvalidCABundle = "invalid_ca_bundle"
 	// ErrCodeUpstreamCredentialLeak: the upstream response reflected locally-held
 	// credentials and was withheld to keep them on-prem. The upstream may already
 	// have acted on the request.

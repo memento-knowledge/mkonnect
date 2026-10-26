@@ -200,6 +200,98 @@ func TestStoreStripHeadersRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreCABundleRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("gitscm", creds.Credential{
+		BaseURL:  "https://scm.internal",
+		Auth:     "bearer",
+		Token:    "token-value-abcdef12",
+		CABundle: "/etc/mkonnect-ca/ca-bundle.pem",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	s2, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New after write: %v", err)
+	}
+	got, ok := s2.Get("gitscm")
+	if !ok {
+		t.Fatal("Get: not found")
+	}
+	if got.CABundle != "/etc/mkonnect-ca/ca-bundle.pem" {
+		t.Fatalf("ca_bundle not persisted: %q", got.CABundle)
+	}
+}
+
+func TestCredentialValidateRejectsRelativeCABundle(t *testing.T) {
+	bad := creds.Credential{BaseURL: "https://x", CABundle: "relative/ca.pem"}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("expected Validate to reject a relative ca_bundle path")
+	}
+	empty := creds.Credential{BaseURL: "https://x", CABundle: "   "}
+	if err := empty.Validate(); err == nil {
+		t.Fatal("expected Validate to reject a whitespace-only ca_bundle path")
+	}
+	nul := creds.Credential{BaseURL: "https://x", CABundle: "/etc/ca\x00.pem"}
+	if err := nul.Validate(); err == nil {
+		t.Fatal("expected Validate to reject a ca_bundle path with a NUL byte")
+	}
+	ok := creds.Credential{BaseURL: "https://x", CABundle: "/etc/mkonnect-ca/ca-bundle.pem"}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid ca_bundle rejected: %v", err)
+	}
+}
+
+func TestStoreGenerationChangesOnMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	g0 := s.Generation()
+	if err := s.Set("p", creds.Credential{BaseURL: "https://x"}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	g1 := s.Generation()
+	if g1 == g0 {
+		t.Error("Generation did not change after Set")
+	}
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if s.Generation() == g1 {
+		t.Error("Generation did not change after Reload")
+	}
+	g2 := s.Generation()
+	if err := s.Remove("p"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if s.Generation() == g2 {
+		t.Error("Generation did not change after Remove")
+	}
+}
+
+func TestReloadMissingFileBumpsGeneration(t *testing.T) {
+	// A store whose file never existed: Reload must succeed (empty state) and still bump
+	// the generation, so a global CA bundle is re-read on SIGHUP without a creds file.
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	g0 := s.Generation()
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Reload with no file must not error, got %v", err)
+	}
+	if s.Generation() == g0 {
+		t.Error("Reload with no file did not bump the generation")
+	}
+}
+
 func TestCredentialValidateRejectsBadStripHeaders(t *testing.T) {
 	cases := []struct {
 		name  string

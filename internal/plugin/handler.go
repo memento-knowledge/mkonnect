@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/creds"
@@ -200,25 +202,135 @@ type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode i
 // const) so tests can shorten it to exercise the timeout path without a real wait.
 var upstreamTimeout = 10 * time.Second
 
+// newUpstreamClient builds an *http.Client for proxied plugin calls with the shared
+// per-request timeout and the no-follow-redirects policy. A nil transport uses Go's
+// default transport (which honours the ambient proxy). It is the single place that
+// upstream-client construction lives, so the base clients and the per-plugin
+// CA-bundle clients stay configured identically.
+func newUpstreamClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:   upstreamTimeout,
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// caClientCacheKey identifies a cached upstream client by transport mode and the
+// configured CA-bundle path.
+type caClientCacheKey struct {
+	direct bool
+	path   string
+}
+
+type caClientCacheEntry struct {
+	client *http.Client
+	err    error
+}
+
+// caClientCache memoises the *http.Client used for a given (transport mode, CA-bundle
+// path), so a per-plugin TLS transport — each with its own connection pool — is built
+// once rather than per request. It is invalidated wholesale when the credential store's
+// generation changes (a SIGHUP reload or a CLI change), so a rotated or corrected bundle
+// is re-read on the next request. Build failures are cached too and logged once per
+// generation, so a bad bundle does not log on every request.
+type caClientCache struct {
+	mu        sync.Mutex
+	gen       uint64
+	entries   map[caClientCacheKey]caClientCacheEntry
+	newClient func(http.RoundTripper) *http.Client
+}
+
+// clientFor returns the client for (direct, path) under store generation gen, building
+// and caching it (or its build error) on first use. The whole operation holds the lock
+// so concurrent first use cannot build two transports with two idle connection pools.
+func (c *caClientCache) clientFor(direct bool, path string, gen uint64) (*http.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Only ever move the generation forward: a stale request that observed an older
+	// generation than one a concurrent request already applied must not reset the cache
+	// back and thrash the transports.
+	if c.entries == nil || gen > c.gen {
+		// Release idle connections held by the evicted clients so a reload does not leak
+		// pooled connections until IdleConnTimeout.
+		for _, e := range c.entries {
+			if e.client != nil {
+				if tr, ok := e.client.Transport.(*http.Transport); ok {
+					tr.CloseIdleConnections()
+				}
+			}
+		}
+		c.entries = make(map[caClientCacheKey]caClientCacheEntry)
+		c.gen = gen
+	}
+	key := caClientCacheKey{direct: direct, path: path}
+	if e, ok := c.entries[key]; ok {
+		return e.client, e.err
+	}
+	transport, err := httpclient.NewTransport(direct, path)
+	var entry caClientCacheEntry
+	if err != nil {
+		entry.err = err
+		// Log once per generation per bundle: later requests hit the cached entry. Only
+		// the path and error class are logged (consistent with the connector's policy of
+		// never surfacing bundle contents); the request sees a generic error body.
+		slog.Error("upstream CA bundle could not be loaded; requests for affected plugins will fail",
+			"ca_bundle", path, "err", err)
+	} else {
+		entry.client = c.newClient(transport)
+	}
+	c.entries[key] = entry
+	return entry.client, entry.err
+}
+
+// warmCACache primes the cache with the CA transports the current credentials imply, so
+// a misconfigured bundle is reported at construction rather than only on the first request
+// that needs it. It runs once when the handler is built; after a later reload the cache is
+// rebuilt lazily and a bad bundle is logged (once per generation) on first use. It is
+// best-effort: failures are logged by clientFor and never block startup, since each
+// request still fails closed on its own.
+func warmCACache(cache *caClientCache, store *creds.Store, defaultCABundle string) {
+	gen := store.Generation()
+	seen := make(map[caClientCacheKey]bool)
+	warm := func(direct bool, path string) {
+		if path == "" {
+			return
+		}
+		key := caClientCacheKey{direct: direct, path: path}
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		_, _ = cache.clientFor(direct, path, gen)
+	}
+	// The global default can apply to either transport mode.
+	warm(false, defaultCABundle)
+	warm(true, defaultCABundle)
+	for _, cred := range store.List() {
+		path := defaultCABundle
+		if cred.CABundle != "" {
+			path = cred.CABundle
+		}
+		warm(cred.HasAuthorization(), path)
+	}
+}
+
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
 //  2. Strips caller-supplied credential headers, then injects an Authorization header
 //     when local credentials are configured, so the local credential is the only one used.
-//  3. Forwards the HTTP request and returns status, headers, and body.
-func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
-	httpClient := &http.Client{
-		Timeout: upstreamTimeout,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	directHTTPClient := &http.Client{
-		Timeout:   upstreamTimeout,
-		Transport: httpclient.NewDirectTransport(),
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+//  3. Applies a custom CA bundle (per-plugin ca_bundle, else the global defaultCABundle)
+//     for upstream TLS verification, failing closed if a configured bundle cannot load.
+//  4. Forwards the HTTP request and returns status, headers, and body.
+//
+// defaultCABundle is the global CA-bundle path (CA_BUNDLE env) applied to any plugin
+// without its own ca_bundle; empty means the system trust store only.
+func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string) HTTPPluginHandler {
+	httpClient := newUpstreamClient(nil)
+	directHTTPClient := newUpstreamClient(httpclient.NewDirectTransport())
+	caClients := &caClientCache{newClient: newUpstreamClient}
+	warmCACache(caClients, store, defaultCABundle)
 
 	errBody := func(s string) *string { return &s }
 
@@ -226,6 +338,14 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		// Resolve the credential once and reuse it for both base-URL resolution and
 		// Authorization injection below (avoids a second store lock per request).
 		cred, haveCred := store.Get(msg.ProviderKey)
+
+		// Effective CA bundle for this plugin's upstream TLS: a per-plugin ca_bundle
+		// overrides the global default. Both are operator configuration, never a value
+		// from the inbound message.
+		caBundle := defaultCABundle
+		if haveCred && cred.CABundle != "" {
+			caBundle = cred.CABundle
+		}
 
 		// Resolve base URL: creds store takes priority over registry.
 		var baseURL string
@@ -345,6 +465,18 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if useDirectTransport {
 			cred.ApplyAuthorization(req)
 			client = directHTTPClient
+		}
+
+		// Apply a custom CA bundle for upstream TLS when one is configured for this
+		// plugin (or globally). Fail closed: a configured-but-unloadable bundle must
+		// never silently fall back to the system trust store. The store generation keys
+		// the cache so a reload (SIGHUP) or CLI change re-reads the bundle.
+		if caBundle != "" {
+			caClient, caErr := caClients.clientFor(useDirectTransport, caBundle, store.Generation())
+			if caErr != nil {
+				return 500, errHeaders(ErrCodeInvalidCABundle), errBody(`{"error":"invalid CA bundle"}`), nil
+			}
+			client = caClient
 		}
 
 		resp, err := client.Do(req)
