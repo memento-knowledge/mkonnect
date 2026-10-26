@@ -83,6 +83,17 @@ type HealthMsg struct {
 // SQS MessageGroupId so the response routes to the correct replica. Omitting it causes the
 // platform to silently drop the response and time out after 30 s.
 // Body is plain UTF-8 text (or nil), NOT base64 — use *string, not []byte.
+// ExpiresAt is an OPTIONAL caller-supplied deadline in RFC 3339 format with a UTC offset
+// (e.g. "2026-10-20T12:00:00Z"; fractional seconds are allowed). When it is present and has
+// already passed by the time the connector receives the request, the connector does not
+// forward the request to the upstream and instead returns a synthesised response marked with
+// the X-Mkonnect-Error "expired" code — a safe default against the outbound queue
+// redelivering a request the caller has already abandoned. When the field is absent (older
+// platform messages) or cannot be parsed, the request is handled exactly as before, so the
+// field is backward-compatible and simply ignored by older connectors. The value MUST be a
+// JSON string: a non-string value (e.g. a number) makes the whole frame unreadable and it is
+// dropped. The deadline is compared against the connector host's clock, which should be
+// NTP-synced for the check to be meaningful.
 type HTTPRequestMsg struct {
 	Type        string            `json:"type"`
 	RequestID   string            `json:"request_id"`
@@ -92,6 +103,7 @@ type HTTPRequestMsg struct {
 	Path        string            `json:"path"`
 	Headers     map[string]string `json:"headers,omitempty"`
 	Body        *string           `json:"body"`
+	ExpiresAt   string            `json:"expires_at,omitempty"`
 }
 
 // HTTPResponseMsg is the outbound reply to an HTTPRequestMsg.

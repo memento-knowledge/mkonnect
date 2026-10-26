@@ -194,6 +194,32 @@ func transportErrorCode(err error) string {
 	return ErrCodeUpstreamError
 }
 
+// requestExpired reports whether the inbound request carries an expires_at deadline that has
+// already passed at now. It returns the parsed deadline and any parse error so the caller can
+// log a skew/format diagnostic without re-parsing:
+//
+//   - expiresAt == ""       -> (false, zero, nil): no deadline (absent field / older messages).
+//   - unparseable value     -> (false, zero, err): malformed; the caller forwards (fail open).
+//   - parseable, in future  -> (false, deadline, nil).
+//   - parseable, in the past -> (true, deadline, nil).
+//
+// A value equal to now is NOT expired (now.After is strict). expires_at is RFC 3339 and must
+// carry a UTC offset; a value without one does not parse and is treated as absent. Malformed
+// values fail open deliberately: expiry is a safety default, not an authorization control (a
+// hostile sender would simply omit the field), and rejecting on a platform formatting bug
+// would take the write path offline — worse than the pre-T5 behaviour of always forwarding,
+// which the platform's writes already tolerate.
+func requestExpired(expiresAt string, now time.Time) (expired bool, deadline time.Time, err error) {
+	if expiresAt == "" {
+		return false, time.Time{}, nil
+	}
+	deadline, err = time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		return false, time.Time{}, err
+	}
+	return now.After(deadline), deadline, nil
+}
+
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
@@ -335,6 +361,33 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 	errBody := func(s string) *string { return &s }
 
 	return func(ctx context.Context, msg proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
+		// Reject a request whose caller-supplied deadline has already passed before doing
+		// anything else: it must not reach the upstream even though the outbound queue may
+		// still be redelivering it after the platform's caller timeout. This is terminal and
+		// independent of the provider, method, or path, so it is evaluated first and belongs
+		// to the "not forwarded" marker group. An absent or unparseable deadline falls
+		// through to normal handling (see requestExpired).
+		if msg.ExpiresAt != "" {
+			now := time.Now()
+			expired, deadline, perr := requestExpired(msg.ExpiresAt, now)
+			switch {
+			case perr != nil:
+				// Fail open on a malformed deadline, but surface it: clock skew and platform
+				// serialization bugs are only diagnosable on-prem here. The raw value is never
+				// logged (only its length) so a large or hostile field cannot amplify logs or
+				// inject content.
+				slog.Warn("ignoring malformed expires_at on http_request; forwarding as if absent",
+					"request_id", msg.RequestID, "expires_at_len", len(msg.ExpiresAt))
+			case expired:
+				// A deadline that is constant late_by across many requests is the signature of
+				// a skewed connector clock; deadline and late_by are Go-formatted, never raw.
+				slog.Warn("request expired before forwarding",
+					"request_id", msg.RequestID, "deadline", deadline, "late_by", now.Sub(deadline))
+				return http.StatusGatewayTimeout, errHeaders(ErrCodeExpired),
+					errBody(`{"error":"request expired before forwarding"}`), nil
+			}
+		}
+
 		// Resolve the credential once and reuse it for both base-URL resolution and
 		// Authorization injection below (avoids a second store lock per request).
 		cred, haveCred := store.Get(msg.ProviderKey)
