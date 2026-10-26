@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -119,6 +122,24 @@ func responseContainsLocalCredentials(headers http.Header, body string, cred cre
 	return false
 }
 
+// transportErrorCode classifies an error from client.Do (when the request context
+// is not itself done) into an error-marker code. A dial-phase failure — connection
+// refused, name-resolution failure, or a timeout while connecting — means the
+// request never reached the upstream (upstream_unreachable). A timeout after the
+// connection was established leaves the outcome unknown (upstream_timeout), as does
+// any other transport error such as a TLS handshake failure or a reset connection
+// (upstream_error), since the request may already have been sent.
+func transportErrorCode(err error) string {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return ErrCodeUpstreamUnreachable
+	}
+	if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+		return ErrCodeUpstreamTimeout
+	}
+	return ErrCodeUpstreamError
+}
+
 // HTTPPluginHandler processes an inbound HTTPRequestMsg, returning status, response headers,
 // body (plain text, nil for empty), and any transport-level error.
 type HTTPPluginHandler func(context.Context, proto.HTTPRequestMsg) (statusCode int, headers map[string]string, body *string, err error)
@@ -162,7 +183,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		} else {
 			b, _ := json.Marshal(map[string]string{"error": fmt.Sprintf("provider %q not found", msg.ProviderKey)})
 			s := string(b)
-			return 404, nil, &s, nil
+			return 404, errHeaders(ErrCodeProviderNotFound), &s, nil
 		}
 
 		// Validate method.
@@ -173,22 +194,22 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		switch method {
 		case "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT":
 		default:
-			return 405, nil, errBody(`{"error":"method not allowed"}`), nil
+			return 405, errHeaders(ErrCodeMethodNotAllowed), errBody(`{"error":"method not allowed"}`), nil
 		}
 
 		// Validate path and resolve against base URL, preserving the base path prefix
 		// (confinement) and any query string supplied by the caller.
 		if !strings.HasPrefix(msg.Path, "/") {
-			return 400, nil, errBody(`{"error":"path must begin with /"}`), nil
+			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"path must begin with /"}`), nil
 		}
 		base, err := url.Parse(baseURL)
 		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
-			return 500, nil, errBody(`{"error":"invalid base URL"}`), nil
+			return 500, errHeaders(ErrCodeInvalidBaseURL), errBody(`{"error":"invalid base URL"}`), nil
 		}
 		// url.Parse correctly splits path and raw query from msg.Path (e.g. "/api?k=v").
 		reqRef, err := url.Parse(msg.Path)
 		if err != nil {
-			return 400, nil, errBody(`{"error":"invalid path"}`), nil
+			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
 		}
 		// Prepend the base path so a base URL of https://host/api/v1 + /jobs stays confined
 		// under /api/v1/ and doesn't resolve to /jobs on the root.
@@ -201,12 +222,12 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		target.RawPath = ""
 		target.Path = path.Clean(target.Path)
 		if target.Host != base.Host {
-			return 400, nil, errBody(`{"error":"invalid path"}`), nil
+			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
 		}
 		// Verify that the normalized path still starts with the configured base path prefix.
 		if base.Path != "" && base.Path != "/" {
 			if !strings.HasPrefix(target.Path+"/", strings.TrimRight(base.Path, "/")+"/") {
-				return 400, nil, errBody(`{"error":"path traversal not allowed"}`), nil
+				return 400, errHeaders(ErrCodePathBlocked), errBody(`{"error":"path traversal not allowed"}`), nil
 			}
 		}
 
@@ -216,7 +237,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		var reqBodyReader *strings.Reader
 		if msg.Body != nil {
 			if len(*msg.Body) > maxBodyBytes {
-				return 413, nil, errBody(`{"error":"request body too large"}`), nil
+				return 413, errHeaders(ErrCodeRequestTooLarge), errBody(`{"error":"request body too large"}`), nil
 			}
 			reqBodyReader = strings.NewReader(*msg.Body)
 		} else {
@@ -252,26 +273,45 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			if ctx.Err() != nil {
 				return 0, nil, nil, ctx.Err()
 			}
-			return 504, nil, errBody(`{"error":"upstream timeout or connection error"}`), err
+			// Distinguish the error so the platform can judge whether the request may
+			// have reached the upstream: a dial failure means it never did
+			// (upstream_unreachable); a timeout or any other transport error means the
+			// outcome is unknown. The status stays 504 for compatibility; the marker
+			// carries the distinction.
+			return 504, errHeaders(transportErrorCode(err)), errBody(`{"error":"upstream timeout or connection error"}`), err
 		}
 		defer resp.Body.Close() //nolint:errcheck
 
 		respBytes, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBodyBytes)+1))
 		if err != nil {
-			return 0, nil, nil, fmt.Errorf("read response: %w", err)
+			// The per-request timeout also covers reading the response body, so a stall
+			// here (after headers arrived) is the case where a write may already have
+			// taken effect. Mark it so the platform can tell it apart from an upstream
+			// error: a read timeout is upstream_timeout, any other read failure is
+			// upstream_error. The non-nil err is still returned so the ws layer logs it.
+			code := ErrCodeUpstreamError
+			status := http.StatusBadGateway
+			if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
+				code = ErrCodeUpstreamTimeout
+				status = 504
+			}
+			return status, errHeaders(code), errBody(`{"error":"error reading upstream response"}`), fmt.Errorf("read response: %w", err)
 		}
 		if len(respBytes) > maxBodyBytes {
-			return 413, nil, errBody(`{"error":"upstream response too large"}`), nil
+			return 413, errHeaders(ErrCodeResponseTooLarge), errBody(`{"error":"upstream response too large"}`), nil
 		}
 		body := string(respBytes)
 		if useDirectTransport && responseContainsLocalCredentials(resp.Header, body, cred) {
-			return http.StatusBadGateway, nil, errBody(unsafeCredentialResponse), nil
+			return http.StatusBadGateway, errHeaders(ErrCodeUpstreamCredentialLeak), errBody(unsafeCredentialResponse), nil
 		}
 
-		// Collect response headers (first value per header name).
+		// Collect response headers (first value per header name). ErrorHeader is
+		// stripped here so a hostile or compromised upstream cannot forge the
+		// connector's synthesised-error marker on a relayed response.
 		respHeaders := make(map[string]string, len(resp.Header))
 		for k, vs := range resp.Header {
-			if len(vs) > 0 && !sensitiveResponseHeaders[http.CanonicalHeaderKey(k)] {
+			canonical := http.CanonicalHeaderKey(k)
+			if len(vs) > 0 && !sensitiveResponseHeaders[canonical] && canonical != ErrorHeader {
 				respHeaders[k] = vs[0]
 			}
 		}
