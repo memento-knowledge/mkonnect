@@ -178,3 +178,72 @@ func TestConnectionStatusMsgRoundtrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch: %+v", got)
 	}
 }
+
+// TestHTTPRequestMsgExpiresAtRoundtrip checks the optional expires_at field survives a
+// marshal/unmarshal cycle when set.
+func TestHTTPRequestMsgExpiresAtRoundtrip(t *testing.T) {
+	orig := proto.HTTPRequestMsg{
+		Type:        "http_request",
+		RequestID:   "req-1",
+		ProviderKey: "svc",
+		Method:      "GET",
+		Path:        "/api",
+		ExpiresAt:   "2026-10-20T12:00:00Z",
+	}
+	b, err := json.Marshal(orig)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !bytes.Contains(b, []byte(`"expires_at":"2026-10-20T12:00:00Z"`)) {
+		t.Fatalf("expires_at not present in JSON: %s", b)
+	}
+	var got proto.HTTPRequestMsg
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ExpiresAt != orig.ExpiresAt {
+		t.Fatalf("ExpiresAt = %q, want %q", got.ExpiresAt, orig.ExpiresAt)
+	}
+}
+
+// TestHTTPRequestMsgExpiresAtOmittedWhenEmpty checks that an unset expires_at is left off
+// the wire (omitempty), so the encoding stays byte-identical to a message without the field.
+func TestHTTPRequestMsgExpiresAtOmittedWhenEmpty(t *testing.T) {
+	b, err := json.Marshal(proto.HTTPRequestMsg{Type: "http_request", RequestID: "req-1", Path: "/"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(b, []byte("expires_at")) {
+		t.Fatalf("empty ExpiresAt must be omitted from JSON, got: %s", b)
+	}
+}
+
+// TestHTTPRequestMsgOldFrameWithoutExpiresAt checks that a message produced by an older
+// platform — a raw frame with no expires_at field — still decodes, leaving ExpiresAt empty.
+func TestHTTPRequestMsgOldFrameWithoutExpiresAt(t *testing.T) {
+	raw := `{"type":"http_request","request_id":"req-1","responder_id":"r-1","provider_key":"svc","method":"GET","path":"/api","body":null}`
+	var got proto.HTTPRequestMsg
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal old frame: %v", err)
+	}
+	if got.ExpiresAt != "" {
+		t.Fatalf("ExpiresAt = %q, want empty for a frame without the field", got.ExpiresAt)
+	}
+	if got.ProviderKey != "svc" || got.Path != "/api" {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+}
+
+// TestHTTPRequestMsgNumericExpiresAtRejected documents the existing frame contract: like
+// every other field, expires_at is typed (string), so a non-string value (e.g. an epoch
+// number) fails to decode the whole frame rather than being coerced. The format-level
+// fail-open on a parseable-but-malformed string (handled in the plugin handler) does NOT
+// extend to a type mismatch at the JSON layer — the platform must send a string. This pins
+// current behaviour so a future change to it is deliberate, not accidental.
+func TestHTTPRequestMsgNumericExpiresAtRejected(t *testing.T) {
+	raw := `{"type":"http_request","provider_key":"svc","path":"/","expires_at":1700000000}`
+	var got proto.HTTPRequestMsg
+	if err := json.Unmarshal([]byte(raw), &got); err == nil {
+		t.Fatalf("expected unmarshal error for numeric expires_at, got none: %+v", got)
+	}
+}

@@ -74,10 +74,11 @@ const (
 	// credentials and was withheld to keep them on-prem. The upstream may already
 	// have acted on the request.
 	ErrCodeUpstreamCredentialLeak = "upstream_credential_leak"
-	// ErrCodeExpired is reserved for a request that is rejected because it arrived
-	// after its deadline. It is part of the vocabulary so consumers can handle it,
-	// but the connector does not emit it yet; a later contract item adds the
-	// expiry check that produces it.
+	// ErrCodeExpired: the request carried an expires_at deadline (RFC 3339) that had
+	// already passed when the connector received it, so it was not forwarded to the
+	// upstream. This guards against the outbound queue redelivering a request the caller
+	// has already abandoned after its timeout. A request with no expires_at, or one whose
+	// value cannot be parsed, is handled normally (the field is optional and fails open).
 	ErrCodeExpired = "expired"
 )
 
