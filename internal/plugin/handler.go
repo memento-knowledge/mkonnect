@@ -264,14 +264,18 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if err != nil {
 			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
 		}
+		// Capture the caller's escaped path form before we mutate reqRef.Path below. Once
+		// Path is reassigned, EscapedPath() would no longer match it and would recompute from
+		// the decoded path, losing escapes such as %2F. We re-attach this escaped form to the
+		// outbound request further down, but only after the decoded path clears every check.
+		callerRawPath := reqRef.EscapedPath()
 		// Prepend the base path so a base URL of https://host/api/v1 + /jobs stays confined
 		// under /api/v1/ and doesn't resolve to /jobs on the root.
 		reqRef.Path = base.Path + reqRef.Path
 		target := base.ResolveReference(reqRef)
-		// Clear RawPath so the outbound request always uses the decoded, normalized path.
-		// url.Parse preserves encoded segments (e.g. %2e%2e) in RawPath; target.String()
-		// emits them verbatim, letting an upstream that decodes %2e%2e to ".." escape the
-		// configured prefix even after our traversal check.
+		// Run every security check on the DECODED, normalized path. Clearing RawPath makes
+		// target.String() emit the decoded path; the escaped form is re-attached only at the
+		// end, and only when it is provably equivalent to this checked path.
 		target.RawPath = ""
 		target.Path = path.Clean(target.Path)
 		if target.Host != base.Host {
@@ -282,6 +286,31 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 			if !strings.HasPrefix(target.Path+"/", strings.TrimRight(base.Path, "/")+"/") {
 				return 400, errHeaders(ErrCodePathBlocked), errBody(`{"error":"path traversal not allowed"}`), nil
 			}
+		}
+
+		// Forward the caller's escaped path verbatim so an escaped slash (%2F) or escaped
+		// percent (%25) survives to the upstream — some providers encode a reserved byte
+		// inside a single path segment (e.g. a nested project path), and the decoded,
+		// normalized path built above would otherwise flatten it. This is applied only after all
+		// checks on the decoded path have passed, and is gated so it can never widen them:
+		//
+		// url.URL.EscapedPath() (used by target.String()) returns RawPath verbatim only when
+		// RawPath is a valid encoding AND unescape(RawPath) == target.Path; otherwise it
+		// recomputes from the decoded Path. We assign the candidate and keep it only if that
+		// gate accepts it. So a kept RawPath is guaranteed to single-decode to exactly the
+		// confined path we just checked — a single-decoding upstream sees that path and
+		// nothing else. A ".."/"."/"//" that path.Clean collapsed, or a byte that is not
+		// validly encoded, makes unescape differ and the candidate is dropped, falling back
+		// to the decoded path. (A base path that ends in "/" is trimmed so the candidate does
+		// not gain a "//" that Clean removed from the decoded join; a base path whose own
+		// escaped form is preserved reaches the upstream verbatim too.) Defense in depth: an
+		// upstream that decodes twice is outside this contract — the decoded-once path is the
+		// boundary — and such input (e.g. %252e%252e) is forwarded verbatim by this handler
+		// regardless, exactly as before this change.
+		candidateRawPath := strings.TrimSuffix(base.EscapedPath(), "/") + callerRawPath
+		target.RawPath = candidateRawPath
+		if target.EscapedPath() != candidateRawPath {
+			target.RawPath = ""
 		}
 
 		const maxBodyBytes = 32 << 20
