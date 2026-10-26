@@ -960,6 +960,47 @@ func TestHTTPHandlerRejectsCallerPathUserinfo(t *testing.T) {
 	}
 }
 
+// TestHTTPHandlerAllowsAtSignInPathSegment verifies that the caller-path userinfo
+// rejection does not over-reject a legitimate path whose segment merely contains an
+// "@" (e.g. /users/@me, or an npm-style scoped /@scope/pkg). Such a single-leading-slash
+// path is an absolute-path reference, so url.Parse never populates reqRef.User and the
+// request reaches the upstream unchanged. This locks in the no-false-positive behaviour
+// against a future over-broad tightening of the userinfo guard.
+func TestHTTPHandlerAllowsAtSignInPathSegment(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	reg := newRegistry("svc", srv.URL)
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store, "")
+
+	for _, p := range []string{
+		"/users/@me",  // "@" inside a path segment
+		"/@scope/pkg", // npm-style scoped path
+	} {
+		gotPath = ""
+		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: "GET", Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 200 {
+			t.Fatalf("path %q: expected 200, got %d", p, code)
+		}
+		if gotPath != p {
+			t.Fatalf("path %q: upstream saw %q", p, gotPath)
+		}
+	}
+}
+
 // TestHTTPHandlerHopByHopHeadersNotForwarded verifies that hop-by-hop headers
 // (CL.TE smuggling vectors) are not forwarded to the upstream service.
 func TestHTTPHandlerHopByHopHeadersNotForwarded(t *testing.T) {
