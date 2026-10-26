@@ -29,6 +29,14 @@ outbound request *inside your network*. They are never sent to the Memento platf
 additionally strips credential-bearing response headers and refuses to return a response that
 reflects your local token back through the tunnel.
 
+**Caller credential headers are stripped.** When a plugin has a local credential, the connector
+drops any credential-bearing header on the inbound request before injecting its own — the defaults
+are `Authorization`, `Proxy-Authorization`, `Cookie`, `PRIVATE-TOKEN`, `JOB-TOKEN`, `X-Api-Key` and
+`X-Auth-Token` — so the locally configured credential is the only one the tool ever sees, even if a
+request arrives carrying another. Add tool-specific headers to the list with `--strip-headers`
+(comma-separated) on `connector config set`, or the `strip_headers` field in the credentials file;
+the defaults are always enforced and cannot be removed.
+
 ## How your credentials are stored
 
 Be clear-eyed about where these secrets live:
@@ -86,7 +94,8 @@ restrictive permissions outside your checkout and remove it after the Secret has
    correct the problem and retry. Do not add it to source control.
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
-   `basic`, or omit for none), `username` (basic auth only), and `token` (at least 16 characters).
+   `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), and
+   an optional `strip_headers` (a list of extra inbound headers to drop — see below).
 
 2. Point the chart at the Secret in your values:
 

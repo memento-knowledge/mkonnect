@@ -346,3 +346,31 @@ func TestStatusShowsConfiguredPlugins(t *testing.T) {
 		t.Fatalf("expected jenkins in status output:\n%s", stdout.String())
 	}
 }
+
+func TestConfigSetStripHeadersFlagPersistsAndLists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "http://scm.internal",
+		"--auth", "bearer", "--token-stdin",
+		"--strip-headers", "X-Custom-Auth, X-Gitlab-Token"},
+		strings.NewReader("token-value-abcdef12"), &stdout); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "list"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"strip-headers", "X-Custom-Auth", "X-Gitlab-Token"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in list output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "token-value-abcdef12") {
+		t.Fatalf("token must not appear in list output:\n%s", out)
+	}
+}

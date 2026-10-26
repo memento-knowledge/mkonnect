@@ -70,6 +70,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	// older releases. Tokens are intentionally never accepted through command args.
 	fs.String("token", "", "Unsupported; use --token-stdin")
 	tokenStdin := fs.Bool("token-stdin", false, "Read the token from stdin")
+	stripHeaders := fs.String("strip-headers", "", "Comma-separated extra inbound headers to strip before forwarding, in addition to the credential-header defaults applied when a local credential is used")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -145,16 +146,29 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		return fmt.Errorf("open creds store: %w", err)
 	}
 	if err := store.Set(plugin, creds.Credential{
-		BaseURL:  *baseURL,
-		Auth:     *auth,
-		Username: *username,
-		Token:    tokenVal,
+		BaseURL:      *baseURL,
+		Auth:         *auth,
+		Username:     *username,
+		Token:        tokenVal,
+		StripHeaders: splitStripHeaders(*stripHeaders),
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
 	fmt.Fprintf(w, "Credential for %q saved.\n", plugin)
 	printReloadReminder(w)
 	return nil
+}
+
+// splitStripHeaders parses a comma-separated --strip-headers value into a trimmed,
+// empty-free list (nil when none are given).
+func splitStripHeaders(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if h := strings.TrimSpace(part); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // printReloadReminder tells the operator that an already-running connector must be reloaded
@@ -192,6 +206,9 @@ func runConfigList(w io.Writer) error {
 			auth = cred.Auth + " ***"
 		}
 		fmt.Fprintf(w, "%-20s  %-40s  %s\n", name, cred.BaseURL, auth)
+		if len(cred.StripHeaders) > 0 {
+			fmt.Fprintf(w, "%-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
+		}
 	}
 	return nil
 }
@@ -235,6 +252,9 @@ func runStatus(_ []string, w io.Writer) error {
 			authDesc = cred.Auth
 		}
 		fmt.Fprintf(w, "  %-20s  %s  [%s]\n", name, cred.BaseURL, authDesc)
+		if len(cred.StripHeaders) > 0 {
+			fmt.Fprintf(w, "  %-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
+		}
 	}
 	fmt.Fprintln(w, "\nBridge connection status is visible in the Memento portal.")
 	return nil
