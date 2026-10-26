@@ -43,12 +43,19 @@ var sensitiveResponseHeaders = map[string]bool{
 	"Set-Cookie":          true,
 }
 
-// canonicalHeaderSet builds a set of canonical header names, so that lookups with
-// http.CanonicalHeaderKey always match regardless of the input casing.
-func canonicalHeaderSet(names ...string) map[string]bool {
+// stripHeaderKey normalises a header name for credential-strip matching: it folds the
+// underscore spelling (e.g. Private_token) onto the dash form that some upstreams treat as
+// equivalent, then canonicalises — so a lookup matches regardless of casing or separator,
+// and a configured name and a caller's name match whichever spelling each uses.
+func stripHeaderKey(name string) string {
+	return http.CanonicalHeaderKey(strings.ReplaceAll(name, "_", "-"))
+}
+
+// stripHeaderSet builds a set of header names keyed by stripHeaderKey.
+func stripHeaderSet(names ...string) map[string]bool {
 	s := make(map[string]bool, len(names))
 	for _, n := range names {
-		s[http.CanonicalHeaderKey(n)] = true
+		s[stripHeaderKey(n)] = true
 	}
 	return s
 }
@@ -58,8 +65,10 @@ func canonicalHeaderSet(names ...string) map[string]bool {
 // could otherwise add or override credentials the upstream honours. They are always
 // stripped for a credentialed plugin; a plugin may strip additional headers via its
 // StripHeaders config. Proxy-Authorization is also hop-by-hop; it is listed here to make
-// the intent explicit and survive any future edit to hopByHopHeaders.
-var defaultCredentialHeaders = canonicalHeaderSet(
+// the intent explicit and survive any future edit to hopByHopHeaders. This is not an
+// exhaustive list of every service's credential header — add service-specific ones (e.g.
+// X-Vault-Token, X-Amz-Security-Token) per plugin via StripHeaders.
+var defaultCredentialHeaders = stripHeaderSet(
 	"Authorization",
 	"Proxy-Authorization",
 	"Cookie",
@@ -302,7 +311,7 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		useDirectTransport := haveCred && cred.HasAuthorization()
 		var stripHeaders map[string]bool
 		if haveCred && len(cred.StripHeaders) > 0 {
-			stripHeaders = canonicalHeaderSet(cred.StripHeaders...)
+			stripHeaders = stripHeaderSet(cred.StripHeaders...)
 		}
 		if useDirectTransport {
 			if stripHeaders == nil {
@@ -318,11 +327,10 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		// headers selected above. The underscore spelling (e.g. Private_token) is matched
 		// against the dash form too, since some upstreams treat the two as equivalent.
 		for k, v := range msg.Headers {
-			canonical := http.CanonicalHeaderKey(k)
-			if hopByHopHeaders[canonical] {
+			if hopByHopHeaders[http.CanonicalHeaderKey(k)] {
 				continue
 			}
-			if stripHeaders[canonical] || stripHeaders[http.CanonicalHeaderKey(strings.ReplaceAll(k, "_", "-"))] {
+			if stripHeaders[stripHeaderKey(k)] {
 				continue
 			}
 			req.Header.Set(k, v)

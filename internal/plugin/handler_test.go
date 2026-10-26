@@ -145,6 +145,7 @@ func TestHTTPHandlerStripsCallerCredentialHeadersWhenLocalCredentialApplied(t *t
 		ProviderKey: "gitscm", Method: http.MethodPost, Path: "/api",
 		Headers: map[string]string{
 			"Authorization": "Bearer attacker",
+			"aUtHoRiZaTiOn": "attacker-odd-case", // casing must not bypass the strip
 			"PRIVATE-TOKEN": "p",
 			"JOB-TOKEN":     "j",
 			"Cookie":        "session=x",

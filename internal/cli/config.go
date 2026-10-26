@@ -145,12 +145,19 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
 	}
+	// `config set` replaces the whole entry. Warn if that would silently drop a
+	// previously configured strip-headers list (a security control) when the flag is
+	// omitted — e.g. during a routine token rotation.
+	newStrip := splitStripHeaders(*stripHeaders)
+	if existing, had := store.Get(plugin); had && len(existing.StripHeaders) > 0 && len(newStrip) == 0 {
+		fmt.Fprintf(w, "Warning: cleared the previously configured strip-headers for %q; re-pass --strip-headers to keep them.\n", plugin)
+	}
 	if err := store.Set(plugin, creds.Credential{
 		BaseURL:      *baseURL,
 		Auth:         *auth,
 		Username:     *username,
 		Token:        tokenVal,
-		StripHeaders: splitStripHeaders(*stripHeaders),
+		StripHeaders: newStrip,
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
