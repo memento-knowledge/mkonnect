@@ -264,6 +264,15 @@ func HTTPHandler(registry *Registry, store *creds.Store) HTTPPluginHandler {
 		if err != nil {
 			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
 		}
+		// Reject a caller path that carries URL userinfo (e.g. //user:pw@host/x). It begins
+		// with "/" so it passes the prefix guard above, and ResolveReference carries ref.User
+		// into the resolved target, where Go's HTTP client would turn it into a Basic
+		// Authorization header when none is set — letting a caller inject upstream credentials
+		// via the path. base.User is rejected above (invalid_base_url); this is the symmetric
+		// check on the caller-supplied path.
+		if reqRef.User != nil {
+			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
+		}
 		// Prepend the base path so a base URL of https://host/api/v1 + /jobs stays confined
 		// under /api/v1/ and doesn't resolve to /jobs on the root.
 		reqRef.Path = base.Path + reqRef.Path

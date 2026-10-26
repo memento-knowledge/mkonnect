@@ -795,6 +795,51 @@ func TestHTTPHandlerPathTraversalBlocked(t *testing.T) {
 	}
 }
 
+// TestHTTPHandlerRejectsCallerPathUserinfo verifies that a caller path carrying URL
+// userinfo (e.g. //user:pw@host/x) is rejected with the invalid_path marker and never
+// reaches the upstream. Such a path begins with "/" so it passes the prefix guard, and
+// ResolveReference would otherwise carry the userinfo into the outbound target, where
+// Go's HTTP client turns it into a Basic Authorization header — a path-based upstream
+// credential-injection vector.
+func TestHTTPHandlerRejectsCallerPathUserinfo(t *testing.T) {
+	var called atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called.Store(true)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	host := srv.Listener.Addr().String()
+	reg := newRegistry("svc", srv.URL)
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store)
+
+	cases := []string{
+		"//user@" + host + "/x",
+		"//user:pw@" + host + "/x",
+	}
+	for _, p := range cases {
+		code, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: http.MethodGet, Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 400 {
+			t.Fatalf("path %q: expected 400, got %d", p, code)
+		}
+		if got := headers[ErrorHeader]; got != ErrCodeInvalidPath {
+			t.Fatalf("path %q: expected %q marker, got %q", p, ErrCodeInvalidPath, got)
+		}
+		if called.Load() {
+			t.Fatalf("path %q: upstream was contacted", p)
+		}
+	}
+}
+
 // TestHTTPHandlerHopByHopHeadersNotForwarded verifies that hop-by-hop headers
 // (CL.TE smuggling vectors) are not forwarded to the upstream service.
 func TestHTTPHandlerHopByHopHeadersNotForwarded(t *testing.T) {
