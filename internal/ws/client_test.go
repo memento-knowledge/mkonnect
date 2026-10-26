@@ -883,6 +883,102 @@ func TestRunLoopDispatchesHTTPRequest(t *testing.T) {
 	}
 }
 
+// TestRunLoopRelaysErrorMarkerToWire proves that a connector-synthesised error marker
+// reaches the platform in the http_response headers: an over-limit response is a VISIBLE
+// failure (a 413 carrying X-Mkonnect-Error: response_too_large), not a dropped connection.
+// It uses a handler stub so the assertion is on the ws relay of the marker; the handler's own
+// production of the marker is covered by the plugin package's unit tests.
+func TestRunLoopRelaysErrorMarkerToWire(t *testing.T) {
+	serverKey := genPrivKey(t)
+	keyBytes := make([]byte, mldsa65.PrivateKeySize)
+	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
+
+	var gotResponse proto.HTTPResponseMsg
+	done := make(chan struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var challengeNonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		if err := wsjson.Write(r.Context(), conn, gatewayHandshakeOkMsg{
+			Type:       "handshake_ok",
+			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
+		}); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+		if err := wsjson.Write(r.Context(), conn, proto.HTTPRequestMsg{
+			Type: "http_request", RequestID: "r99",
+			ProviderKey: "svc", Method: "GET", Path: "/",
+		}); err != nil {
+			t.Logf("write http_request: %v", err)
+			return
+		}
+		for {
+			var raw json.RawMessage
+			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
+				return
+			}
+			var tm proto.TypedMessage
+			if err := json.Unmarshal(raw, &tm); err != nil {
+				continue
+			}
+			if tm.Type == "http_response" {
+				if err := json.Unmarshal(raw, &gotResponse); err != nil {
+					t.Logf("unmarshal http_response: %v", err)
+				}
+				close(done)
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	keyFile := filepath.Join(t.TempDir(), "key")
+	cfg := newTestConfig(srv.URL, keyFile)
+	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
+	// Stub handler standing in for an over-limit response: a withheld body plus the marker.
+	errBody := `{"error":"upstream response too large"}`
+	client.SetHTTPPluginHandler(func(_ context.Context, _ proto.HTTPRequestMsg) (int, map[string]string, *string, error) {
+		return 413, map[string]string{plugin.ErrorHeader: plugin.ErrCodeResponseTooLarge}, &errBody, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go client.Connect(ctx) //nolint:errcheck
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("timed out waiting for http_response (the error must be a visible reply, not a dropped connection)")
+	}
+	cancel()
+
+	if gotResponse.RequestID != "r99" {
+		t.Fatalf("expected request_id r99, got %q", gotResponse.RequestID)
+	}
+	if gotResponse.StatusCode != 413 {
+		t.Fatalf("expected status 413, got %d", gotResponse.StatusCode)
+	}
+	if got := gotResponse.Headers[plugin.ErrorHeader]; got != plugin.ErrCodeResponseTooLarge {
+		t.Fatalf("%s = %q, want %q — the marker must reach the wire", plugin.ErrorHeader, got, plugin.ErrCodeResponseTooLarge)
+	}
+}
+
 // TestConnectionStatusEmittedOnConnect verifies that the connector sends a connection_status
 // message after the handshake, and that a credential stored in the creds store appears in
 // the plugins list.

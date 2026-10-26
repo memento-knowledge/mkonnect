@@ -10,12 +10,26 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
 // MinTokenLength prevents ambiguous, short strings from being used as local
 // credentials or mistaken for ordinary response content.
 const MinTokenLength = 16
+
+// MinUpstreamTimeout and MaxUpstreamTimeout bound a per-plugin upstream timeout
+// (Credential.UpstreamTimeout). The feature exists to RAISE the timeout for
+// legitimately slow upstreams (large commits, a slow self-managed instance), so a
+// sub-second value is treated as a misconfiguration. The upper bound is a guardrail,
+// not a tuning knob: it caps the blast radius of a typo (e.g. "10h"), keeps a single
+// request from occupying one of the connector's few worker slots for an unreasonable
+// time, and stays within what the calling platform could plausibly wait for. It is
+// deliberately not configurable — a configurable cap is no cap.
+const (
+	MinUpstreamTimeout = 1 * time.Second
+	MaxUpstreamTimeout = 10 * time.Minute
+)
 
 // Credential is the per-plugin configuration entry: a plugin's base URL, its optional
 // local HTTP authentication, and optional per-plugin policy. It is the home for
@@ -40,6 +54,15 @@ type Credential struct {
 	// so the path is not attacker-chosen; the file is read lazily by the plugin handler,
 	// which fails closed if it cannot be loaded.
 	CABundle string `json:"ca_bundle,omitempty"`
+	// UpstreamTimeout overrides, for this plugin only, the connector's default per-request
+	// upstream timeout. It is a Go duration string with a unit (e.g. "30s", "2m"); the
+	// operator's literal is stored verbatim. Empty means the built-in default applies. A set
+	// value must parse and fall in [MinUpstreamTimeout, MaxUpstreamTimeout] (see Validate).
+	// It bounds the whole forwarded request (connect, send, and reading the response); the
+	// dialer's connect timeout and the TLS-handshake timeout keep their own fixed ceilings,
+	// so a value above those does not extend them. It is operator configuration, never taken
+	// from an inbound message, and applies only to forwarded http_request calls.
+	UpstreamTimeout string `json:"upstream_timeout,omitempty"`
 }
 
 // Validate checks the local authentication fields without including credential
@@ -94,7 +117,35 @@ func (c Credential) Validate() error {
 			return errors.New("ca_bundle must be an absolute path")
 		}
 	}
+	// A per-plugin upstream timeout, if given, must be a duration with a unit and within the
+	// supported range. The error is the operator's only hint, so it names the accepted form
+	// and bounds explicitly; the raw value is short operator input, so echoing it is safe and
+	// aids debugging. ParseDuration rejects a unitless value ("30"), which is the most likely
+	// typo and must not be silently reinterpreted.
+	if c.UpstreamTimeout != "" {
+		d, err := time.ParseDuration(c.UpstreamTimeout)
+		if err != nil || d < MinUpstreamTimeout || d > MaxUpstreamTimeout {
+			return fmt.Errorf("upstream_timeout must be a duration with a unit (e.g. %q, %q), at least %s and at most %s",
+				"30s", "2m", MinUpstreamTimeout, MaxUpstreamTimeout)
+		}
+	}
 	return nil
+}
+
+// UpstreamTimeoutDuration returns the configured per-plugin upstream timeout and whether
+// one is set. An absent value returns (0, false) and the caller applies its own default.
+// Validate guarantees a stored value parses and is in range, so this never surfaces a parse
+// error; a value that somehow fails to parse is treated as unset (0, false) rather than
+// panicking, keeping request handling robust against a hand-edited store.
+func (c Credential) UpstreamTimeoutDuration() (time.Duration, bool) {
+	if c.UpstreamTimeout == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(c.UpstreamTimeout)
+	if err != nil {
+		return 0, false
+	}
+	return d, true
 }
 
 // HasAuthorization reports whether this credential has the local fields needed

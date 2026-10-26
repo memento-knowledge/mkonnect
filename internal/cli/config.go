@@ -73,6 +73,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	tokenStdin := fs.Bool("token-stdin", false, "Read the token from stdin")
 	stripHeaders := fs.String("strip-headers", "", "Comma-separated extra inbound headers to strip before forwarding, in addition to the credential-header defaults applied when a local credential is used")
 	caBundle := fs.String("ca-bundle", "", "Absolute path to a PEM file of additional root CA(s) to trust for this plugin's upstream TLS (added to the system trust store; never disables verification)")
+	upstreamTimeout := fs.String("upstream-timeout", "", "Per-plugin upstream request timeout as a Go duration with a unit (e.g. 30s, 2m), between 1s and 10m; omit to use the connector default (10s). Applies only to forwarded requests, not the test-connection probe")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -151,14 +152,21 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		return errors.New("--ca-bundle must be an absolute path")
 	}
 
+	// Store the operator's literal timeout verbatim so the file and the CLI stay symmetric;
+	// creds.Credential.Validate is the single source of truth for its form and bounds, and
+	// rejects the entry below if it is malformed or out of range.
+	newUpstreamTimeout := strings.TrimSpace(*upstreamTimeout)
+
 	store, err := creds.New(credsPath())
 	if err != nil {
 		return fmt.Errorf("open creds store: %w", err)
 	}
 
-	// `config set` replaces the whole entry. Warn if that would silently drop a
-	// previously configured security control (strip-headers or a CA bundle) when the
-	// flag is omitted — e.g. during a routine token rotation.
+	// `config set` replaces the whole entry. Warn if that would silently drop a previously
+	// configured setting (a strip-headers or CA-bundle security control, or a non-default
+	// upstream timeout) when the flag is omitted — e.g. during a routine token rotation. The
+	// timeout is a reliability setting, not a security boundary, but reverting it to the 10s
+	// default unnoticed is equally surprising, so it is warned about too.
 	newStrip := splitStripHeaders(*stripHeaders)
 	if existing, had := store.Get(plugin); had {
 		if len(existing.StripHeaders) > 0 && len(newStrip) == 0 {
@@ -167,14 +175,18 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		if existing.CABundle != "" && newCABundle == "" {
 			fmt.Fprintf(w, "Warning: cleared the previously configured ca-bundle for %q; re-pass --ca-bundle to keep it.\n", plugin)
 		}
+		if existing.UpstreamTimeout != "" && newUpstreamTimeout == "" {
+			fmt.Fprintf(w, "Warning: cleared the previously configured upstream-timeout for %q; re-pass --upstream-timeout to keep it.\n", plugin)
+		}
 	}
 	if err := store.Set(plugin, creds.Credential{
-		BaseURL:      *baseURL,
-		Auth:         *auth,
-		Username:     *username,
-		Token:        tokenVal,
-		StripHeaders: newStrip,
-		CABundle:     newCABundle,
+		BaseURL:         *baseURL,
+		Auth:            *auth,
+		Username:        *username,
+		Token:           tokenVal,
+		StripHeaders:    newStrip,
+		CABundle:        newCABundle,
+		UpstreamTimeout: newUpstreamTimeout,
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
@@ -236,6 +248,9 @@ func runConfigList(w io.Writer) error {
 		if cred.CABundle != "" {
 			fmt.Fprintf(w, "%-20s  ca-bundle: %s\n", "", cred.CABundle)
 		}
+		if cred.UpstreamTimeout != "" {
+			fmt.Fprintf(w, "%-20s  upstream-timeout: %s\n", "", cred.UpstreamTimeout)
+		}
 	}
 	return nil
 }
@@ -284,6 +299,9 @@ func runStatus(_ []string, w io.Writer) error {
 		}
 		if cred.CABundle != "" {
 			fmt.Fprintf(w, "  %-20s  ca-bundle: %s\n", "", cred.CABundle)
+		}
+		if cred.UpstreamTimeout != "" {
+			fmt.Fprintf(w, "  %-20s  upstream-timeout: %s\n", "", cred.UpstreamTimeout)
 		}
 	}
 	fmt.Fprintln(w, "\nBridge connection status is visible in the Memento portal.")

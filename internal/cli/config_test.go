@@ -437,6 +437,73 @@ func TestConfigSetWarnsWhenCABundleCleared(t *testing.T) {
 	}
 }
 
+func TestConfigSetUpstreamTimeoutFlagPersistsAndLists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal",
+		"--auth", "bearer", "--token-stdin",
+		"--upstream-timeout", "90s"},
+		strings.NewReader("token-value-abcdef12"), &stdout); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "list"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"upstream-timeout", "90s"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in list output:\n%s", want, out)
+		}
+	}
+}
+
+func TestConfigSetRejectsInvalidUpstreamTimeout(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	// Unitless, out of range, and unparseable values are all rejected by Validate.
+	for _, bad := range []string{"30", "500ms", "11m", "soon"} {
+		var out bytes.Buffer
+		err := cli.Run([]string{"config", "set", "gitscm",
+			"--base-url", "https://scm.internal",
+			"--upstream-timeout", bad},
+			noStdin(), &out)
+		if err == nil {
+			t.Fatalf("expected config set to reject --upstream-timeout %q", bad)
+		}
+	}
+}
+
+func TestConfigSetWarnsWhenUpstreamTimeoutCleared(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var out bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal", "--auth", "bearer", "--token-stdin",
+		"--upstream-timeout", "2m"},
+		strings.NewReader("token-value-abcdef12"), &out); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	// Re-set without --upstream-timeout (e.g. a token rotation): the override reverts to the
+	// default, and the operator must be warned.
+	out.Reset()
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "https://scm.internal", "--auth", "bearer", "--token-stdin"},
+		strings.NewReader("token-value-rotated99"), &out); err != nil {
+		t.Fatalf("config set (rotate): %v", err)
+	}
+	if !strings.Contains(out.String(), "Warning") || !strings.Contains(out.String(), "upstream-timeout") {
+		t.Fatalf("expected a warning that upstream-timeout was cleared:\n%s", out.String())
+	}
+}
+
 func TestConfigSetWarnsWhenStripHeadersCleared(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
