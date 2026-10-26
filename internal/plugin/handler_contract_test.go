@@ -52,8 +52,10 @@ package plugin
 // here, since the plaintext httptest harness never negotiates h2.
 
 import (
+	"bufio"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -228,9 +230,49 @@ func TestContractPOSTForwardsBodyContentTypeAndCredential(t *testing.T) {
 	}
 }
 
+// captureRawRequest starts a one-shot raw TCP upstream that records the exact bytes of the
+// request line and headers the connector puts on the wire, then returns a minimal bodyless 200
+// so the connector's round trip completes. net/http's server-side r.Header is a parsed view of
+// the request (and r.ContentLength collapses "Content-Length: 0" and "no length" to the same 0),
+// so the true wire framing — the literal Content-Length and Transfer-Encoding headers — is only
+// visible in the raw bytes. recv blocks until the request has been read and returns those bytes.
+// A sibling test (TestUpstreamReadErrorCarriesMarker) uses the same raw-listener approach.
+func captureRawRequest(t *testing.T) (baseURL string, recv func() string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	reqCh := make(chan string, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		var sb strings.Builder
+		// Read the request line and headers up to and including the terminating blank line. An
+		// empty write has no body after it, so this is the whole request.
+		for {
+			line, rerr := br.ReadString('\n')
+			sb.WriteString(line)
+			if rerr != nil || line == "\r\n" {
+				break
+			}
+		}
+		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+		reqCh <- sb.String()
+	}()
+	return "http://" + ln.Addr().String(), func() string { return <-reqCh }
+}
+
 // TestContractEmptyWriteBodyForwarded pins that an empty write (nil or empty body) is forwarded
-// with Content-Length: 0 and no chunked framing, for POST and PUT. Strict upstreams reject a
-// bodyless POST that omits Content-Length, so the explicit zero length is part of the contract.
+// with an explicit Content-Length: 0 and no chunked framing, for POST and PUT. Strict upstreams
+// reject a bodyless POST that omits Content-Length, so the explicit zero length is part of the
+// contract. The assertion is made against the raw wire bytes, not net/http's parsed r.Header.
 func TestContractEmptyWriteBodyForwarded(t *testing.T) {
 	empty := ""
 	cases := []struct {
@@ -244,31 +286,8 @@ func TestContractEmptyWriteBodyForwarded(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var (
-				mu       sync.Mutex
-				hits     int
-				gotLen   int
-				cl       int64
-				clHeader []string
-				te       []string
-			)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				b, _ := io.ReadAll(r.Body)
-				mu.Lock()
-				hits++
-				gotLen = len(b)
-				cl = r.ContentLength
-				// The server leaves a received Content-Length in r.Header; r.ContentLength alone
-				// cannot distinguish "sent Content-Length: 0" from "sent no length at all" (both
-				// parse to 0), so assert the header value explicitly.
-				clHeader = r.Header.Values("Content-Length")
-				te = r.TransferEncoding
-				mu.Unlock()
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer srv.Close()
-
-			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
+			baseURL, recv := captureRawRequest(t)
+			h := HTTPHandler(newRegistry("svc", baseURL), mustStore(t), "")
 			status, respHeaders, _, err := h(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: tc.method, Path: "/write", Body: tc.body,
 			})
@@ -282,22 +301,15 @@ func TestContractEmptyWriteBodyForwarded(t *testing.T) {
 				t.Fatalf("relayed response must not be marked, got %s=%q", ErrorHeader, m)
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
-			if hits != 1 {
-				t.Fatalf("upstream received %d requests, want exactly 1", hits)
+			raw := recv()
+			if want := tc.method + " /write HTTP/1.1\r\n"; !strings.HasPrefix(raw, want) {
+				t.Fatalf("wire request line does not start with %q; raw request:\n%s", want, raw)
 			}
-			if gotLen != 0 {
-				t.Fatalf("upstream body length = %d, want 0", gotLen)
+			if n := strings.Count(raw, "Content-Length: 0\r\n"); n != 1 {
+				t.Fatalf("wire Content-Length: 0 header appears %d time(s), want exactly 1 — an empty write must send an explicit Content-Length: 0; raw request:\n%s", n, raw)
 			}
-			if len(clHeader) != 1 || clHeader[0] != "0" {
-				t.Fatalf("upstream Content-Length header = %v, want exactly [\"0\"] — an empty write must send an explicit Content-Length: 0 that strict upstreams require", clHeader)
-			}
-			if cl != 0 {
-				t.Fatalf("upstream r.ContentLength = %d, want 0", cl)
-			}
-			if len(te) != 0 {
-				t.Fatalf("upstream Transfer-Encoding = %v, want none", te)
+			if strings.Contains(strings.ToLower(raw), "transfer-encoding") {
+				t.Fatalf("empty write must not be chunked; raw request:\n%s", raw)
 			}
 		})
 	}
