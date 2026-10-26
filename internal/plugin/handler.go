@@ -207,8 +207,8 @@ func transportErrorCode(err error) string {
 // carry a UTC offset; a value without one does not parse and is treated as absent. Malformed
 // values fail open deliberately: expiry is a safety default, not an authorization control (a
 // hostile sender would simply omit the field), and rejecting on a platform formatting bug
-// would take the write path offline — worse than the pre-T5 behaviour of always forwarding,
-// which the platform's writes already tolerate.
+// would take the write path offline — worse than the earlier behaviour (before expiry
+// support) of always forwarding, which the platform's writes already tolerate.
 func requestExpired(expiresAt string, now time.Time) (expired bool, deadline time.Time, err error) {
 	if expiresAt == "" {
 		return false, time.Time{}, nil
@@ -379,9 +379,12 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 				slog.Warn("ignoring malformed expires_at on http_request; forwarding as if absent",
 					"request_id", msg.RequestID, "expires_at_len", len(msg.ExpiresAt))
 			case expired:
-				// A deadline that is constant late_by across many requests is the signature of
-				// a skewed connector clock; deadline and late_by are Go-formatted, never raw.
-				slog.Warn("request expired before forwarding",
+				// Logged at Info, not Warn: rejecting an expired request is expected, handled
+				// behaviour, and post-outage queue drains can deliver these in bursts — Warn
+				// would storm exactly when the feature is doing its job. A constant late_by
+				// across many requests is the signature of a skewed connector clock; deadline
+				// and late_by are Go-formatted, never the raw value.
+				slog.Info("request expired before forwarding",
 					"request_id", msg.RequestID, "deadline", deadline, "late_by", now.Sub(deadline))
 				return http.StatusGatewayTimeout, errHeaders(ErrCodeExpired),
 					errBody(`{"error":"request expired before forwarding"}`), nil

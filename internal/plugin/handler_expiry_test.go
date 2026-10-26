@@ -36,6 +36,10 @@ func TestRequestExpired(t *testing.T) {
 		// Future instant written in a far-west offset: the literal reads like the past, but
 		// the UTC instant (2026-10-20T13:00:00Z) is in the future, so it must NOT be expired.
 		{"future instant via -12:00 offset", "2026-10-20T01:00:00-12:00", false, false},
+		// The value is not trimmed or spelled leniently: surrounding whitespace and a
+		// lowercase zone designator are malformed and fail open rather than being coerced.
+		{"leading whitespace is malformed", " 2026-10-20T11:00:00Z", false, true},
+		{"lowercase z is malformed", "2026-10-20T11:00:00z", false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -119,7 +123,7 @@ func TestHTTPHandlerUnexpiredRequestForwarded(t *testing.T) {
 }
 
 // TestHTTPHandlerAbsentExpiresAtUnchanged checks that omitting expires_at preserves the
-// pre-T5 behaviour: the request is forwarded normally.
+// behaviour from before expiry support: the request is forwarded normally.
 func TestHTTPHandlerAbsentExpiresAtUnchanged(t *testing.T) {
 	srv, hit := recordingUpstream(t)
 	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
