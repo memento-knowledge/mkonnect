@@ -28,6 +28,38 @@ Memento platform ── wss:// ──▶ Bridge Gateway ── WebSocket ──�
 
 Up to 4 requests are handled concurrently per connector; requests beyond that receive a `429` rather than queuing unbounded.
 
+### Connector error markers
+
+Some `http_response` replies are **synthesised by the connector while forwarding a request** (for example when a request is rejected before it is forwarded, or when the upstream could not be reached) rather than relayed from the upstream service. Because a synthesised status such as `504` is otherwise indistinguishable from the same status returned by the upstream, mkonnect tags every such response with a response header:
+
+```
+X-Mkonnect-Error: <code>
+```
+
+Responses relayed from the upstream never carry this header; any `X-Mkonnect-Error` the upstream itself sets is stripped before relaying, so the marker is always trustworthy. Match the header name case-insensitively. The header is optional and additive — older platforms that do not read it are unaffected.
+
+The code tells the consumer whether the request can have reached the upstream:
+
+| Code | Status | Request reached upstream? | Meaning |
+|---|---|---|---|
+| `provider_not_found` | 404 | No | No backend is configured for the requested provider. |
+| `method_not_allowed` | 405 | No | The HTTP method is not permitted. |
+| `invalid_path` | 400 | No | The request path was malformed or did not resolve to the configured host. |
+| `path_blocked` | 400 | No | The path was rejected by path-confinement checks (e.g. traversal outside the base path). |
+| `invalid_base_url` | 500 | No | The configured base URL for the provider is invalid (misconfiguration). |
+| `request_too_large` | 413 | No | The request body exceeded the size limit. |
+| `upstream_unreachable` | 504 | No | The connection could not be established (dial failure). |
+| `response_too_large` | 413 | Yes (response withheld) | The upstream response exceeded the size limit. The upstream may already have acted. |
+| `upstream_credential_leak` | 502 | Yes (response withheld) | The upstream response reflected locally-held credentials and was withheld to keep them on-prem. |
+| `upstream_timeout` | 504 | Unknown | The upstream did not respond in time (connecting, sending, or reading the response). |
+| `upstream_error` | 504 | Unknown | A transport error other than a timeout or dial failure (e.g. TLS failure or reset); the request may already have been sent. |
+
+A reserved code, `expired`, is part of this vocabulary for requests rejected after their deadline; the connector does not emit it yet.
+
+The status code on a synthesised response is kept for backward compatibility and is not always a precise fit (e.g. `upstream_error` reuses `504`); the `X-Mkonnect-Error` code is the authoritative signal.
+
+Connector responses produced outside the request-forwarding path — the backpressure `429` and lifecycle responses such as the suspension `503` — are not marked yet.
+
 ## Configuration
 
 Runtime configuration comes from environment variables (internal-tool credentials are configured separately via the `connector` CLI — see [Internal tool credentials](#internal-tool-credentials)):
