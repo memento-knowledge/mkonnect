@@ -384,6 +384,15 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 		if err != nil {
 			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
 		}
+		// Reject a caller path that carries URL userinfo (e.g. //user:pw@host/x). It begins
+		// with "/" so it passes the prefix guard above, and ResolveReference carries ref.User
+		// into the resolved target, where Go's HTTP client would turn it into a Basic
+		// Authorization header when none is set — letting a caller inject upstream credentials
+		// via the path. base.User is rejected above (invalid_base_url); this is the symmetric
+		// check on the caller-supplied path.
+		if reqRef.User != nil {
+			return 400, errHeaders(ErrCodeInvalidPath), errBody(`{"error":"invalid path"}`), nil
+		}
 		// Capture the caller's escaped path form before we mutate reqRef.Path below. Once
 		// Path is reassigned, EscapedPath() would no longer match it and would recompute from
 		// the decoded path, losing escapes such as %2F. We re-attach this escaped form to the

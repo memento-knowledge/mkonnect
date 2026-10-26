@@ -856,7 +856,7 @@ func TestHTTPHandlerPreservesEscapedPath(t *testing.T) {
 			if err := store.Set("svc", creds.Credential{BaseURL: base}); err != nil {
 				t.Fatalf("store.Set: %v", err)
 			}
-			h := HTTPHandler(reg, store)
+			h := HTTPHandler(reg, store, "")
 
 			sentURI = ""
 			code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
@@ -896,7 +896,7 @@ func TestHTTPHandlerRejectsAuthoritySmuggling(t *testing.T) {
 	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(reg, store)
+	h := HTTPHandler(reg, store, "")
 
 	for _, p := range []string{
 		"//evil.example/x",      // different host
@@ -914,6 +914,89 @@ func TestHTTPHandlerRejectsAuthoritySmuggling(t *testing.T) {
 		}
 		if called {
 			t.Fatalf("path %q: a request was sent to a foreign host", p)
+		}
+	}
+}
+
+// TestHTTPHandlerRejectsCallerPathUserinfo verifies that a caller path carrying URL
+// userinfo (e.g. //user:pw@host/x) is rejected with the invalid_path marker and never
+// reaches the upstream. Such a path begins with "/" so it passes the prefix guard, and
+// ResolveReference would otherwise carry the userinfo into the outbound target, where
+// Go's HTTP client turns it into a Basic Authorization header — a path-based upstream
+// credential-injection vector.
+func TestHTTPHandlerRejectsCallerPathUserinfo(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	host := srv.Listener.Addr().String()
+	reg := newRegistry("svc", srv.URL)
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store, "")
+
+	for _, p := range []string{
+		"//user@" + host + "/x",    // userinfo without password
+		"//user:pw@" + host + "/x", // userinfo with password
+	} {
+		called = false
+		code, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: "GET", Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 400 || headers[ErrorHeader] != ErrCodeInvalidPath {
+			t.Fatalf("path %q: expected 400 invalid_path, got code=%d marker=%q", p, code, headers[ErrorHeader])
+		}
+		if called {
+			t.Fatalf("path %q: upstream was contacted", p)
+		}
+	}
+}
+
+// TestHTTPHandlerAllowsAtSignInPathSegment verifies that the caller-path userinfo
+// rejection does not over-reject a legitimate path whose segment merely contains an
+// "@" (e.g. /users/@me, or an npm-style scoped /@scope/pkg). Such a single-leading-slash
+// path is an absolute-path reference, so url.Parse never populates reqRef.User and the
+// request reaches the upstream unchanged. This locks in the no-false-positive behaviour
+// against a future over-broad tightening of the userinfo guard.
+func TestHTTPHandlerAllowsAtSignInPathSegment(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	reg := newRegistry("svc", srv.URL)
+	store := mustStore(t)
+	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store, "")
+
+	for _, p := range []string{
+		"/users/@me",  // "@" inside a path segment
+		"/@scope/pkg", // npm-style scoped path
+	} {
+		gotPath = ""
+		code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+			ProviderKey: "svc", Method: "GET", Path: p,
+		})
+		if err != nil {
+			t.Fatalf("path %q: unexpected error: %v", p, err)
+		}
+		if code != 200 {
+			t.Fatalf("path %q: expected 200, got %d", p, code)
+		}
+		if gotPath != p {
+			t.Fatalf("path %q: upstream saw %q", p, gotPath)
 		}
 	}
 }
