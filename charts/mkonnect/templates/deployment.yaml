@@ -1,3 +1,9 @@
+{{- if .Values.caBundle.secretName }}
+{{- $caMount := required "caBundle.mountPath is required when caBundle.secretName is set" .Values.caBundle.mountPath | clean }}
+{{- if or (eq $caMount "/etc/mkonnect") (hasPrefix "/etc/mkonnect/" $caMount) (eq $caMount "/data") (hasPrefix "/data/" $caMount) }}
+{{- fail "caBundle.mountPath must not be /data, /etc/mkonnect, or a path under them: it would collide with the data or credentials mount" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,6 +41,10 @@ spec:
             - name: CREDS_FILE
               value: {{ printf "/etc/mkonnect/%s" (required "credentials.key is required when credentials.secretName is set" .Values.credentials.key) | quote }}
             {{- end }}
+            {{- if .Values.caBundle.secretName }}
+            - name: CA_BUNDLE
+              value: {{ printf "%s/%s" (required "caBundle.mountPath is required when caBundle.secretName is set" .Values.caBundle.mountPath | clean) (required "caBundle.key is required when caBundle.secretName is set" .Values.caBundle.key) | quote }}
+            {{- end }}
             {{- range $plugin, $url := .Values.plugins }}
             - name: PLUGIN_{{ $plugin | upper }}
               value: {{ $url | quote }}
@@ -45,6 +55,11 @@ spec:
             {{- if .Values.credentials.secretName }}
             - name: credentials
               mountPath: /etc/mkonnect
+              readOnly: true
+            {{- end }}
+            {{- if .Values.caBundle.secretName }}
+            - name: ca-bundle
+              mountPath: {{ .Values.caBundle.mountPath | clean | quote }}
               readOnly: true
             {{- end }}
           resources:
@@ -76,4 +91,16 @@ spec:
             items:
               - key: {{ required "credentials.key is required when credentials.secretName is set" .Values.credentials.key | quote }}
                 path: {{ .Values.credentials.key | quote }}
+        {{- end }}
+        {{- if .Values.caBundle.secretName }}
+        - name: ca-bundle
+          secret:
+            secretName: {{ .Values.caBundle.secretName | quote }}
+            # 0444 (r--r--r--): CA certificates are public, non-secret data, so unlike
+            # the credentials mount (0440) no access restriction is needed. The
+            # connector only reads the bundle.
+            defaultMode: 0444
+            items:
+              - key: {{ required "caBundle.key is required when caBundle.secretName is set" .Values.caBundle.key | quote }}
+                path: {{ .Values.caBundle.key | quote }}
         {{- end }}

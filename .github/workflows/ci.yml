@@ -83,6 +83,9 @@ jobs:
       - name: Run release asset bundle tests
         run: bash scripts/release-asset-bundle_test.sh
 
+      - name: Run chart CA-bundle render tests
+        run: bash scripts/chart-ca-bundle_test.sh
+
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
 

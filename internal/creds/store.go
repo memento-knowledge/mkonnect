@@ -31,6 +31,15 @@ type Credential struct {
 	// local credential is applied. Names are matched case-insensitively. Entries are
 	// honoured whenever this entry exists, so a no-auth plugin can opt into stripping too.
 	StripHeaders []string `json:"strip_headers,omitempty"`
+	// CABundle is the absolute path to a PEM file of additional root CA(s) to trust when
+	// verifying this plugin's upstream TLS certificate — e.g. an internal CA for a
+	// self-managed service. Its certificates are ADDED to the system trust store, never a
+	// replacement for it, and there is deliberately no option to disable verification.
+	// Empty means the system trust store only (optionally a global CA_BUNDLE default). This
+	// value is operator configuration and is never taken from an inbound gateway message,
+	// so the path is not attacker-chosen; the file is read lazily by the plugin handler,
+	// which fails closed if it cannot be loaded.
+	CABundle string `json:"ca_bundle,omitempty"`
 }
 
 // Validate checks the local authentication fields without including credential
@@ -73,6 +82,18 @@ func (c Credential) Validate() error {
 			return errors.New("strip_headers entries must be valid header names")
 		}
 	}
+	// A CA bundle path, if given, must be absolute: the connector daemon's working
+	// directory differs from the CLI's, so a relative path would resolve unpredictably.
+	// The file itself is read (and failures surfaced) lazily at request time, not here,
+	// so Validate stays filesystem-free and a not-yet-mounted bundle does not block load.
+	if c.CABundle != "" {
+		if strings.TrimSpace(c.CABundle) == "" || strings.ContainsRune(c.CABundle, '\x00') {
+			return errors.New("ca_bundle must be a non-empty path without NUL bytes")
+		}
+		if !filepath.IsAbs(c.CABundle) {
+			return errors.New("ca_bundle must be an absolute path")
+		}
+	}
 	return nil
 }
 
@@ -103,6 +124,11 @@ type Store struct {
 	mu   sync.RWMutex
 	path string
 	data map[string]Credential
+	// generation increments on every change to data (load, Set, Remove). Consumers
+	// that cache state derived from a credential — such as the plugin handler's
+	// per-plugin TLS transports — read it to detect when a SIGHUP reload or a CLI
+	// change means their cache must be rebuilt.
+	generation uint64
 }
 
 // New loads or creates a credential store at path.
@@ -145,6 +171,16 @@ func readOnlyModeAcceptable(mode os.FileMode) bool {
 	return mode.Perm()&0o027 == 0
 }
 
+// Generation returns a counter that increments whenever the credential set changes
+// (via load, Set, or Remove). It never decreases within a process. A consumer that
+// caches work derived from credentials can compare it to the value it last built
+// under and rebuild when it differs.
+func (s *Store) Generation() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.generation
+}
+
 // Get returns the credential for plugin, or false if not found.
 func (s *Store) Get(plugin string) (Credential, bool) {
 	s.mu.RLock()
@@ -172,6 +208,7 @@ func (s *Store) Set(plugin string, cred Credential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[plugin] = cred
+	s.generation++
 	return s.save()
 }
 
@@ -180,14 +217,26 @@ func (s *Store) Remove(plugin string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, plugin)
+	s.generation++
 	return s.save()
 }
 
-// Reload re-reads credentials.json from disk, replacing the in-memory map.
+// Reload re-reads credentials.json from disk, replacing the in-memory map. A missing
+// file is a valid state (e.g. every plugin configured via PLUGIN_* env with only a
+// global CA_BUNDLE): it resets the store to empty and still bumps the generation, so a
+// SIGHUP picks up a rotated CA bundle even when no credentials file exists.
 func (s *Store) Reload() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.load()
+	if err := s.load(); err != nil {
+		if os.IsNotExist(err) {
+			s.data = make(map[string]Credential)
+			s.generation++
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // load reads and parses the JSON file. Caller must hold s.mu.
@@ -209,6 +258,7 @@ func (s *Store) load() error {
 		}
 	}
 	s.data = m
+	s.generation++
 	return nil
 }
 

@@ -76,7 +76,7 @@ func TestSynthesisedResponsesCarryMarker(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := HTTPHandler(tt.registry, mustStore(t))
+			h := HTTPHandler(tt.registry, mustStore(t), "")
 			status, headers, _, err := h(context.Background(), tt.msg)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -104,7 +104,7 @@ func TestPathBlockedCarriesMarker(t *testing.T) {
 	if err := store.Set("svc", creds.Credential{BaseURL: baseWithPrefix}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(newRegistry("svc", baseWithPrefix), store)
+	h := HTTPHandler(newRegistry("svc", baseWithPrefix), store, "")
 
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/../../etc/passwd",
@@ -130,7 +130,7 @@ func TestRequestBodyTooLargeCarriesMarker(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
 	big := strings.Repeat("a", (32<<20)+1)
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodPost, Path: "/", Body: &big,
@@ -158,7 +158,7 @@ func TestResponseTooLargeCarriesMarker(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -187,7 +187,7 @@ func TestUpstreamCredentialLeakCarriesMarker(t *testing.T) {
 	if err := store.Set("svc", creds.Credential{BaseURL: srv.URL, Auth: "bearer", Token: "a-secret-token-value"}); err != nil {
 		t.Fatalf("store.Set: %v", err)
 	}
-	h := HTTPHandler(newRegistry("svc", srv.URL), store)
+	h := HTTPHandler(newRegistry("svc", srv.URL), store, "")
 
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
@@ -216,7 +216,7 @@ func TestUpstreamTimeoutCarriesMarker(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("slow", srv.URL), mustStore(t))
+	h := HTTPHandler(newRegistry("slow", srv.URL), mustStore(t), "")
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "slow", Method: http.MethodGet, Path: "/",
 	})
@@ -253,7 +253,7 @@ func TestUpstreamReadTimeoutCarriesMarker(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+	h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
 	status, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -292,7 +292,7 @@ func TestUpstreamReadErrorCarriesMarker(t *testing.T) {
 		_ = conn.Close()
 	}()
 
-	h := HTTPHandler(newRegistry("svc", "http://"+ln.Addr().String()), mustStore(t))
+	h := HTTPHandler(newRegistry("svc", "http://"+ln.Addr().String()), mustStore(t), "")
 	status, headers, body, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -322,7 +322,7 @@ func TestUpstreamUnreachableCarriesMarker(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	h := HTTPHandler(newRegistry("svc", "http://"+addr), mustStore(t))
+	h := HTTPHandler(newRegistry("svc", "http://"+addr), mustStore(t), "")
 	status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 	})
@@ -348,7 +348,7 @@ func TestRelayedUpstreamResponsesCarryNoMarker(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
 			status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})
@@ -381,7 +381,7 @@ func TestUpstreamCannotSpoofMarker(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t))
+			h := HTTPHandler(newRegistry("svc", srv.URL), mustStore(t), "")
 			status, headers, _, err := h(context.Background(), proto.HTTPRequestMsg{
 				ProviderKey: "svc", Method: http.MethodGet, Path: "/",
 			})

@@ -33,6 +33,13 @@ type Config struct {
 	// ProtocolVersion is the wire protocol version to negotiate.
 	// Defaults to "v1".
 	ProtocolVersion string
+
+	// CABundle is an optional absolute path to a PEM file of additional root CA(s) to
+	// trust for ALL upstream plugin TLS, used for any plugin that does not set its own
+	// per-plugin ca_bundle. Its certificates are added to the system trust store, never
+	// a replacement, and there is no option to disable verification. Empty means the
+	// system trust store only.
+	CABundle string
 }
 
 // Load reads configuration from environment variables and applies defaults.
@@ -44,6 +51,7 @@ func Load() (*Config, error) {
 		RegistrationToken: os.Getenv("REGISTRATION_TOKEN"),
 		KeyFile:           os.Getenv("KEY_FILE"),
 		ProtocolVersion:   os.Getenv("PROTOCOL_VERSION"),
+		CABundle:          os.Getenv("CA_BUNDLE"),
 	}
 
 	if cfg.GatewayURL == "" {
@@ -78,6 +86,13 @@ func Load() (*Config, error) {
 
 	if cfg.ProtocolVersion == "" {
 		cfg.ProtocolVersion = DefaultProtocolVersion
+	}
+
+	// A global CA bundle, if set, must be an absolute path: it is resolved by the
+	// long-running daemon, whose working directory a relative path cannot be relied on
+	// to match. The file itself is read (and failures surfaced) at request time.
+	if cfg.CABundle != "" && !filepath.IsAbs(cfg.CABundle) {
+		return nil, fmt.Errorf("CA_BUNDLE must be an absolute path")
 	}
 
 	return cfg, nil

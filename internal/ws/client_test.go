@@ -862,7 +862,7 @@ func TestRunLoopDispatchesHTTPRequest(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "key")
 	cfg := newTestConfig(srv.URL, keyFile)
 	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
-	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store))
+	client.SetHTTPPluginHandler(plugin.HTTPHandler(reg, store, ""))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
