@@ -45,6 +45,19 @@ type Credential struct {
 	// local credential is applied. Names are matched case-insensitively. Entries are
 	// honoured whenever this entry exists, so a no-auth plugin can opt into stripping too.
 	StripHeaders []string `json:"strip_headers,omitempty"`
+	// StripQueryParams lists extra inbound URL query-parameter names to drop before
+	// forwarding, in addition to the credential-parameter defaults the plugin handler
+	// enforces when a local credential is applied. A configured name is normalised the same
+	// way as an inbound key before matching — case-folded, and with '.'/space folded to '_'
+	// (PHP mangles those) — so whatever spelling the operator writes (private.token,
+	// private_token, Private_Token) matches whatever spelling the caller sends. The matching
+	// is deliberately broad because query-parameter names are case-sensitive per the URL spec
+	// yet some upstreams (e.g. ASP.NET) read them case-insensitively, so the denylist must be
+	// at least as broad as the sloppiest upstream — the only cost is that a non-credential
+	// parameter whose normalised name equals a stripped name is also dropped when a local
+	// credential is applied. Entries are honoured whenever this entry exists, so a no-auth
+	// plugin can opt into stripping too.
+	StripQueryParams []string `json:"strip_query_params,omitempty"`
 	// CABundle is the absolute path to a PEM file of additional root CA(s) to trust when
 	// verifying this plugin's upstream TLS certificate — e.g. an internal CA for a
 	// self-managed service. Its certificates are ADDED to the system trust store, never a
@@ -103,6 +116,21 @@ func (c Credential) Validate() error {
 		}
 		if strings.ContainsAny(h, " \t\r\n:") {
 			return errors.New("strip_headers entries must be valid header names")
+		}
+	}
+	// Validate any extra query-parameter names to strip. They are matched against the
+	// percent-DECODED, bracket-trimmed, case-folded parameter name at request time, so an
+	// entry is required to be a plain parameter name: reject separators, percent-escapes, and
+	// brackets. A bracket entry truly could never match (names are cut at a bracket); the
+	// others could match a percent-encoded caller key, but rejecting them keeps the config
+	// unambiguous and turns a likely typo into a clear error rather than a silent surprise in
+	// a security control.
+	for _, q := range c.StripQueryParams {
+		if strings.TrimSpace(q) == "" {
+			return errors.New("strip_query_params entries must not be empty")
+		}
+		if strings.ContainsAny(q, " \t\r\n&=?#%+;[]") {
+			return errors.New("strip_query_params entries must be plain query-parameter names (no separators, percent-escapes, or brackets)")
 		}
 	}
 	// A CA bundle path, if given, must be absolute: the connector daemon's working

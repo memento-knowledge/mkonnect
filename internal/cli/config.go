@@ -72,6 +72,7 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	fs.String("token", "", "Unsupported; use --token-stdin")
 	tokenStdin := fs.Bool("token-stdin", false, "Read the token from stdin")
 	stripHeaders := fs.String("strip-headers", "", "Comma-separated extra inbound headers to strip before forwarding, in addition to the credential-header defaults applied when a local credential is used")
+	stripQueryParams := fs.String("strip-query-params", "", "Comma-separated extra inbound URL query-parameter names to strip before forwarding, in addition to the credential-parameter defaults applied when a local credential is used")
 	caBundle := fs.String("ca-bundle", "", "Absolute path to a PEM file of additional root CA(s) to trust for this plugin's upstream TLS (added to the system trust store; never disables verification)")
 	upstreamTimeout := fs.String("upstream-timeout", "", "Per-plugin upstream request timeout as a Go duration with a unit (e.g. 30s, 2m), between 1s and 10m; omit to use the connector default (10s). Applies only to forwarded requests, not the test-connection probe")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -163,14 +164,18 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	}
 
 	// `config set` replaces the whole entry. Warn if that would silently drop a previously
-	// configured setting (a strip-headers or CA-bundle security control, or a non-default
-	// upstream timeout) when the flag is omitted — e.g. during a routine token rotation. The
-	// timeout is a reliability setting, not a security boundary, but reverting it to the 10s
-	// default unnoticed is equally surprising, so it is warned about too.
-	newStrip := splitStripHeaders(*stripHeaders)
+	// configured setting (a strip-headers, strip-query-params, or CA-bundle security control,
+	// or a non-default upstream timeout) when the flag is omitted — e.g. during a routine token
+	// rotation. The timeout is a reliability setting, not a security boundary, but reverting it
+	// to the 10s default unnoticed is equally surprising, so it is warned about too.
+	newStrip := splitCommaList(*stripHeaders)
+	newStripQuery := splitCommaList(*stripQueryParams)
 	if existing, had := store.Get(plugin); had {
 		if len(existing.StripHeaders) > 0 && len(newStrip) == 0 {
 			fmt.Fprintf(w, "Warning: cleared the previously configured strip-headers for %q; re-pass --strip-headers to keep them.\n", plugin)
+		}
+		if len(existing.StripQueryParams) > 0 && len(newStripQuery) == 0 {
+			fmt.Fprintf(w, "Warning: cleared the previously configured strip-query-params for %q; re-pass --strip-query-params to keep them.\n", plugin)
 		}
 		if existing.CABundle != "" && newCABundle == "" {
 			fmt.Fprintf(w, "Warning: cleared the previously configured ca-bundle for %q; re-pass --ca-bundle to keep it.\n", plugin)
@@ -180,13 +185,14 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		}
 	}
 	if err := store.Set(plugin, creds.Credential{
-		BaseURL:         *baseURL,
-		Auth:            *auth,
-		Username:        *username,
-		Token:           tokenVal,
-		StripHeaders:    newStrip,
-		CABundle:        newCABundle,
-		UpstreamTimeout: newUpstreamTimeout,
+		BaseURL:          *baseURL,
+		Auth:             *auth,
+		Username:         *username,
+		Token:            tokenVal,
+		StripHeaders:     newStrip,
+		StripQueryParams: newStripQuery,
+		CABundle:         newCABundle,
+		UpstreamTimeout:  newUpstreamTimeout,
 	}); err != nil {
 		return fmt.Errorf("save credential: %w", err)
 	}
@@ -195,9 +201,9 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	return nil
 }
 
-// splitStripHeaders parses a comma-separated --strip-headers value into a trimmed,
-// empty-free list (nil when none are given).
-func splitStripHeaders(s string) []string {
+// splitCommaList parses a comma-separated flag value (e.g. --strip-headers,
+// --strip-query-params) into a trimmed, empty-free list (nil when none are given).
+func splitCommaList(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
 		if h := strings.TrimSpace(part); h != "" {
@@ -244,6 +250,9 @@ func runConfigList(w io.Writer) error {
 		fmt.Fprintf(w, "%-20s  %-40s  %s\n", name, cred.BaseURL, auth)
 		if len(cred.StripHeaders) > 0 {
 			fmt.Fprintf(w, "%-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
+		}
+		if len(cred.StripQueryParams) > 0 {
+			fmt.Fprintf(w, "%-20s  strip-query-params: %s\n", "", strings.Join(cred.StripQueryParams, ", "))
 		}
 		if cred.CABundle != "" {
 			fmt.Fprintf(w, "%-20s  ca-bundle: %s\n", "", cred.CABundle)
@@ -296,6 +305,9 @@ func runStatus(_ []string, w io.Writer) error {
 		fmt.Fprintf(w, "  %-20s  %s  [%s]\n", name, cred.BaseURL, authDesc)
 		if len(cred.StripHeaders) > 0 {
 			fmt.Fprintf(w, "  %-20s  strip-headers: %s\n", "", strings.Join(cred.StripHeaders, ", "))
+		}
+		if len(cred.StripQueryParams) > 0 {
+			fmt.Fprintf(w, "  %-20s  strip-query-params: %s\n", "", strings.Join(cred.StripQueryParams, ", "))
 		}
 		if cred.CABundle != "" {
 			fmt.Fprintf(w, "  %-20s  ca-bundle: %s\n", "", cred.CABundle)
