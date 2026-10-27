@@ -47,11 +47,14 @@ type Credential struct {
 	StripHeaders []string `json:"strip_headers,omitempty"`
 	// StripQueryParams lists extra inbound URL query-parameter names to drop before
 	// forwarding, in addition to the credential-parameter defaults the plugin handler
-	// enforces when a local credential is applied. The handler folds case when matching:
-	// query-parameter names are case-sensitive per the URL spec, but some upstreams (e.g.
-	// ASP.NET) read them case-insensitively, so a credential denylist must be at least as
-	// broad as the sloppiest upstream — the only cost is that a non-credential parameter
-	// whose name case-insensitively equals a stripped name is also dropped when a local
+	// enforces when a local credential is applied. A configured name is normalised the same
+	// way as an inbound key before matching — case-folded, and with '.'/space folded to '_'
+	// (PHP mangles those) — so whatever spelling the operator writes (private.token,
+	// private_token, Private_Token) matches whatever spelling the caller sends. The matching
+	// is deliberately broad because query-parameter names are case-sensitive per the URL spec
+	// yet some upstreams (e.g. ASP.NET) read them case-insensitively, so the denylist must be
+	// at least as broad as the sloppiest upstream — the only cost is that a non-credential
+	// parameter whose normalised name equals a stripped name is also dropped when a local
 	// credential is applied. Entries are honoured whenever this entry exists, so a no-auth
 	// plugin can opt into stripping too.
 	StripQueryParams []string `json:"strip_query_params,omitempty"`

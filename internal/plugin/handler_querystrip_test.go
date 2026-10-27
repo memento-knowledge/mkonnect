@@ -323,6 +323,36 @@ func TestHTTPHandlerDropsUndecodableQueryKeyWhenCredentialApplied(t *testing.T) 
 	}
 }
 
+func TestHTTPHandlerExplicitQueryParamConfigIsNormalizedLikeInbound(t *testing.T) {
+	var rawQuery string
+	srv := captureRequest(t, &rawQuery, nil)
+	defer srv.Close()
+
+	// No-auth plugin so only the explicit entry applies (defaults are not added). The entry is
+	// written in dotted form; an inbound dotted key canonicalises to the underscore form, and
+	// the configured name must be normalised the same way so the two still match.
+	reg := newRegistry("open", srv.URL)
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	if err := store.Set("open", creds.Credential{BaseURL: srv.URL, StripQueryParams: []string{"custom.token"}}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store, "")
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "open", Method: http.MethodGet,
+		Path: "/api?custom.token=c&keep=ok",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if rawQuery != "keep=ok" {
+		t.Fatalf("forwarded query = %q, want %q", rawQuery, "keep=ok")
+	}
+}
+
 func TestHTTPHandlerExplicitQueryParamMatchesCaseInsensitively(t *testing.T) {
 	var rawQuery string
 	srv := captureRequest(t, &rawQuery, nil)

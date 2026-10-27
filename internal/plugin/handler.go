@@ -189,17 +189,26 @@ func canonicalQueryParamName(key string) (name string, ok bool) {
 	return strings.ToLower(decoded), true
 }
 
-// queryStripSet builds the set of query-parameter names (lowercase) to strip for a request.
-// A plugin's explicit StripQueryParams are honoured whenever the entry exists; the
+// queryStripSet builds the set of query-parameter names (in canonical form) to strip for a
+// request. A plugin's explicit StripQueryParams are honoured whenever the entry exists; the
 // credential-parameter defaults are added only when a local credential is actually applied
-// (useDirectTransport), mirroring the header denylist. Returns nil when nothing is to be
-// stripped, so stripQueryParamsFromRaw short-circuits and forwards the query verbatim.
+// (useDirectTransport), mirroring the header denylist. Configured names are run through the
+// SAME canonicalQueryParamName normalisation as inbound keys, so a configured "private.token"
+// or "Private_Token" matches an inbound private.token / private_token regardless of the
+// spelling either side uses (as the header denylist canonicalises both sides). Returns nil
+// when nothing is to be stripped, so stripQueryParamsFromRaw short-circuits and forwards the
+// query verbatim.
 func queryStripSet(cred creds.Credential, haveCred, useDirectTransport bool) map[string]bool {
 	var set map[string]bool
 	if haveCred && len(cred.StripQueryParams) > 0 {
 		set = make(map[string]bool, len(cred.StripQueryParams)+len(defaultCredentialQueryParams))
 		for _, n := range cred.StripQueryParams {
-			set[strings.ToLower(n)] = true
+			// Validate rejects the inputs that could make canonicalisation fail or behave
+			// surprisingly (percent-escapes, separators, brackets), so ok is always true here;
+			// skip defensively if it is not, rather than inserting an un-normalised name.
+			if name, ok := canonicalQueryParamName(n); ok {
+				set[name] = true
+			}
 		}
 	}
 	if useDirectTransport {
