@@ -76,19 +76,19 @@ Connector responses produced outside the request-forwarding path — the backpre
 
 ### Request paths
 
-The request `path` is forwarded with its percent-encoding **preserved**, so the request-target the upstream receives is the one the platform sent — provided it round-trips cleanly (see the fallback below). A single `%2F` reaches the upstream as `%2F`, not as a decoded `/`.
+The request `path` is forwarded with its percent-encoding **preserved**, so the request-target the upstream receives is the one the platform sent (after any base-URL path prefix is prepended) — provided it round-trips cleanly (see the fallback below). A single `%2F` reaches the upstream as `%2F`, not as a decoded `/`.
 
 - **Encode each segment once.** An escaped `%25` is itself preserved, so double-encoding (`%252F`) would arrive literally as `%252F`, not `%2F`. Percent-encode each path segment exactly once. This assumes the upstream decodes the path once, as HTTP servers normally do; an upstream that decodes twice is outside this contract.
 - **Base-URL path prefix.** A non-default path prefix on the plugin's base URL is prepended with its own encoding preserved — `/api/v1` + `/group%2Fsub` → `/api/v1/group%2Fsub` (a trailing slash on the base is not doubled).
 - **Query string** is passed through as received.
-- **Plain paths are unchanged**, and lower-case escapes such as `%2f` are kept as written.
+- **Plain paths without a trailing slash are unchanged**, and lower-case escapes such as `%2f` are kept as written.
 
 Security and confinement checks run on the **decoded, normalized** path, not the escaped form:
 
-- A path that is malformed, does not begin with `/`, does not resolve to the configured host, or carries userinfo or an authority (`//host/…`, `//user:pw@host/…`) is rejected with [`invalid_path`](#connector-error-markers) and never forwarded. An encoded `//` is not treated as an authority, so it cannot redirect the request to another host — `/%2F%2Fexample` is handled as the path `/example` on the configured upstream.
+- A path that is malformed, does not begin with `/`, does not resolve to the configured host, or carries userinfo or an authority (`//host/…`, `//user:pw@host/…`) is rejected with [`invalid_path`](#connector-error-markers) and never forwarded. An encoded `//` is not treated as an authority, so it cannot redirect the request to another host — `/%2F%2Fexample` is handled as the same-host path `/example` (or `/<prefix>/example` under a base-URL path prefix).
 - A `..` traversal that escapes a non-root base-URL path prefix is rejected with [`path_blocked`](#connector-error-markers). With a root base URL there is no prefix to escape, so `..` segments are simply normalized away rather than rejected.
 
-**Fallback.** If the escaped path is not an unambiguous round-trip — for example it mixes a raw reserved byte with escapes (`/a%2Fb c`), or contains `.`, `..`, or `//` segments — the connector forwards the **decoded, cleaned** path instead. In that case an escaped slash does not survive and segment boundaries change (`/a%2Fb c` → `/a/b%20c`). To keep `%2F` intact, send fully-encoded paths with no raw reserved bytes and no `.`, `..`, or `//` segments.
+**Fallback.** If the escaped path is not an unambiguous round-trip — for example it mixes escapes with an unencoded character that must itself be escaped in a path (a space, `|`, `{`, `}`, or any non-ASCII character, as in `/a%2Fb c`), contains `.`, `..`, or `//` segments, or ends in a trailing `/` (a trailing slash is not preserved, even on an otherwise plain path) — the connector forwards the **decoded, cleaned** path instead. In that case an escaped slash does not survive and segment boundaries change (`/a%2Fb c` → `/a/b%20c`; `/group%2Fsub/` → `/group/sub`). To keep `%2F` intact, send fully-encoded paths with no trailing slash, no `.`, `..`, or `//` segments, and no unencoded characters that require escaping. (Sub-delimiters such as `:`, `;`, `=`, and `@` are valid in a path and do not trigger the fallback.)
 
 ## Configuration
 
