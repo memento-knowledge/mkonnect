@@ -45,10 +45,19 @@ func TestStripQueryParamsFromRaw(t *testing.T) {
 		{"bracket array syntax truncated to base name", "private_token[]=x", ""},
 		{"bracket operator syntax truncated to base name", "token[$ne]=x", ""},
 		{"encoded brackets truncated too", "private_token%5B%5D=x", ""},
+		{"leading bracket key folds to base name", "[token]=x", ""},
+		{"leading encoded bracket key folds to base name", "%5Btoken%5D=x", ""},
+		{"leading close-bracket key folds to base name", "]token=x", ""},
+		{"plural name is not a prefix match", "tokens=1", "tokens=1"},
 		{"uppercase folded to match", "TOKEN=x", ""},
 		{"mixed case folded to match", "Private_Token=x", ""},
-		{"semicolon separator inspected (Rack 2.x / PHP)", "a=1;token=x&b=2", "a=1&b=2"},
+		{"php dot-mangled name folds to underscore", "private.token=x", ""},
+		{"php plus-mangled name folds to underscore", "private+token=x", ""},
+		{"php encoded-space-mangled name folds to underscore", "private%20token=x", ""},
+		{"semicolon separator inspected (Rack 2.x)", "a=1;token=x&b=2", "a=1&b=2"},
 		{"semicolon with no credential left verbatim", "a=1;b=2", "a=1;b=2"},
+		{"literal semicolon in surviving value preserved", "filter=a;b&token=x", "filter=a;b"},
+		{"empty token dropped only once something is stripped", "a=1&&token=x", "a=1"},
 		{"undecodable key fails closed (dropped)", "tok%zzen=1", ""},
 		{"undecodable key among others dropped, rest kept", "keep=1&tok%zzen=2", "keep=1"},
 	}
@@ -253,8 +262,9 @@ func TestHTTPHandlerDropsQueryAndFragmentWithLocalCredential(t *testing.T) {
 	store := mustStoreBasicCredential(t, "gitscm", srv.URL, "local-user", "basic-token-value-123")
 	h := HTTPHandler(reg, store, "")
 
-	// Stripping the sole credential parameter empties the query (the '?' is dropped); a
-	// fragment never reaches the wire regardless.
+	// Stripping the sole credential parameter empties the query (the '?' is dropped). A
+	// fragment is never placed on the wire by Go's client regardless of this change; this
+	// asserts the observable result (empty query, and nothing after '#' reaching the server).
 	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
 		ProviderKey: "gitscm", Method: http.MethodGet,
 		Path: "/api?token=a#token=secret",
@@ -264,5 +274,85 @@ func TestHTTPHandlerDropsQueryAndFragmentWithLocalCredential(t *testing.T) {
 	}
 	if rawQuery != "" {
 		t.Fatalf("forwarded query = %q, want empty", rawQuery)
+	}
+}
+
+func TestHTTPHandlerStripsLeadingBracketAndMangledQueryParams(t *testing.T) {
+	var rawQuery string
+	srv := captureRequest(t, &rawQuery, nil)
+	defer srv.Close()
+
+	reg := newRegistry("gitscm", srv.URL)
+	store := mustStoreBasicCredential(t, "gitscm", srv.URL, "local-user", "basic-token-value-123")
+	h := HTTPHandler(reg, store, "")
+
+	// A leading-bracket key (Rack 2.x / Express+qs fold it to the base name) and a PHP
+	// dot-mangled key must both be stripped; only the genuine parameter survives.
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "gitscm", Method: http.MethodGet,
+		Path: "/api?[token]=a&private.token=b&keep=ok",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if rawQuery != "keep=ok" {
+		t.Fatalf("forwarded query = %q, want %q", rawQuery, "keep=ok")
+	}
+}
+
+func TestHTTPHandlerDropsUndecodableQueryKeyWhenCredentialApplied(t *testing.T) {
+	var rawQuery string
+	srv := captureRequest(t, &rawQuery, nil)
+	defer srv.Close()
+
+	reg := newRegistry("gitscm", srv.URL)
+	store := mustStoreBasicCredential(t, "gitscm", srv.URL, "local-user", "basic-token-value-123")
+	h := HTTPHandler(reg, store, "")
+
+	// A key that is not valid percent-encoding cannot be interpreted, so it is dropped (fail
+	// closed) rather than forwarded past the credential filter.
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "gitscm", Method: http.MethodGet,
+		Path: "/api?tok%zzen=1&keep=ok",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if rawQuery != "keep=ok" {
+		t.Fatalf("forwarded query = %q, want %q", rawQuery, "keep=ok")
+	}
+}
+
+func TestHTTPHandlerExplicitQueryParamMatchesCaseInsensitively(t *testing.T) {
+	var rawQuery string
+	srv := captureRequest(t, &rawQuery, nil)
+	defer srv.Close()
+
+	reg := newRegistry("gitscm", srv.URL)
+	store, err := creds.New(filepath.Join(t.TempDir(), "credentials.json"))
+	if err != nil {
+		t.Fatalf("creds.New: %v", err)
+	}
+	// Configured with mixed-case; a lower-case caller key must still match (matching folds
+	// case on both the configured name and the caller's).
+	if err := store.Set("gitscm", creds.Credential{
+		BaseURL:          srv.URL,
+		Auth:             "bearer",
+		Token:            "local-token-value-abc",
+		StripQueryParams: []string{"X_Custom"},
+	}); err != nil {
+		t.Fatalf("store.Set: %v", err)
+	}
+	h := HTTPHandler(reg, store, "")
+
+	code, _, _, err := h(context.Background(), proto.HTTPRequestMsg{
+		ProviderKey: "gitscm", Method: http.MethodGet,
+		Path: "/api?x_custom=c&keep=ok",
+	})
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("request: code=%d err=%v", code, err)
+	}
+	if rawQuery != "keep=ok" {
+		t.Fatalf("forwarded query = %q, want %q", rawQuery, "keep=ok")
 	}
 }

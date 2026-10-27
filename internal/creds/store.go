@@ -117,8 +117,11 @@ func (c Credential) Validate() error {
 	}
 	// Validate any extra query-parameter names to strip. They are matched against the
 	// percent-DECODED, bracket-trimmed, case-folded parameter name at request time, so an
-	// entry containing a percent-escape, a separator, or a bracket could never match — reject
-	// those so a typo is a clear error, not a silent no-op in a security control.
+	// entry is required to be a plain parameter name: reject separators, percent-escapes, and
+	// brackets. A bracket entry truly could never match (names are cut at a bracket); the
+	// others could match a percent-encoded caller key, but rejecting them keeps the config
+	// unambiguous and turns a likely typo into a clear error rather than a silent surprise in
+	// a security control.
 	for _, q := range c.StripQueryParams {
 		if strings.TrimSpace(q) == "" {
 			return errors.New("strip_query_params entries must not be empty")

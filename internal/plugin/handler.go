@@ -99,63 +99,93 @@ var defaultCredentialQueryParams = map[string]bool{
 
 // stripQueryParamsFromRaw removes query parameters whose name is in strip from a raw
 // (still-percent-encoded) query string, returning the result. It preserves the original
-// order and exact bytes of the parameters it keeps, and returns rawQuery unchanged when
-// nothing matches — so the common no-match path forwards the caller's query verbatim.
+// order, bytes, AND separators of the parameters it keeps, and returns rawQuery unchanged
+// when nothing matches — so the common no-match path forwards the caller's query verbatim.
 //
-// Matching mirrors how a permissive upstream reads the query, so a credential cannot hide
-// behind an encoding or separator quirk:
-//   - Each parameter name is percent-decoded before comparison (so %74oken matches token).
-//   - A trailing bracket group is dropped (private_token[] / token[$ne] match their base
-//     name), closing the Rack/Express array-and-operator syntax.
-//   - Comparison folds case (see defaultCredentialQueryParams).
-//   - Pairs are split on both '&' and ';': Go does not treat ';' as a separator, but some
-//     upstreams (Rack 2.x, PHP) do, so a credential after ';' is still removed. Surviving
-//     ';'-separated pairs are only rejoined with '&' when something was actually stripped;
-//     an untouched query keeps its ';' verbatim.
-//   - A name that fails to percent-decode is dropped (fail closed): forwarding a parameter
-//     this filter could not interpret would defeat it, and such a value is rejected by
-//     strict upstreams anyway.
+// Matching mirrors how a permissive upstream reads a parameter name (see
+// canonicalQueryParamName), so a credential cannot hide behind an encoding, casing, bracket,
+// key-mangling, or separator quirk of the framework behind the plugin. A name that fails to
+// percent-decode is dropped (fail closed): forwarding a parameter this filter could not
+// interpret would defeat it, and such a value is rejected by strict upstreams anyway.
 //
-// All occurrences of a matched name are removed, so a repeated parameter cannot survive.
-// Defense in depth stops at a single decode: an upstream that decodes twice is outside this
-// contract, exactly as for the request path.
+// Separators: pairs are delimited by both '&' and ';'. Go does not treat ';' as a separator,
+// but some upstreams (Rack 2.x) do, so a credential hidden after ';' is still removed. When a
+// pair is kept, the exact separator byte that preceded it in the input is preserved, so a
+// literal ';' inside a surviving value or key (legal per RFC 3986) is not rewritten to '&';
+// only when a ';'-delimited sub-token is itself a credential is it dropped (over-stripping
+// toward safety for that case). All occurrences of a matched name are removed, so a repeated
+// parameter cannot survive. Empty tokens (e.g. from "a&&b") are dropped only once something
+// else is stripped; an otherwise-unchanged query is returned verbatim. Defense in depth stops
+// at a single decode: an upstream that decodes twice is outside this contract, as for the path.
 func stripQueryParamsFromRaw(rawQuery string, strip map[string]bool) string {
 	if rawQuery == "" || len(strip) == 0 {
 		return rawQuery
 	}
-	parts := strings.FieldsFunc(rawQuery, func(r rune) bool { return r == '&' || r == ';' })
-	kept := make([]string, 0, len(parts))
+	var b strings.Builder
+	b.Grow(len(rawQuery))
 	changed := false
-	for _, p := range parts {
-		key := p
-		if i := strings.IndexByte(p, '='); i >= 0 {
-			key = p[:i]
+	start := 0     // start index of the current token
+	sep := byte(0) // separator byte that preceded the current token (0 for the first)
+	flush := func(end int, nextSep byte) {
+		token := rawQuery[start:end]
+		if token == "" {
+			// An empty token can never be a credential; skip it without marking a change, so
+			// an otherwise-untouched query is still returned verbatim below.
+			sep = nextSep
+			return
+		}
+		key := token
+		if e := strings.IndexByte(token, '='); e >= 0 {
+			key = token[:e]
 		}
 		name, ok := canonicalQueryParamName(key)
 		if !ok || strip[name] {
 			changed = true
-			continue
+		} else {
+			if b.Len() > 0 && sep != 0 {
+				b.WriteByte(sep)
+			}
+			b.WriteString(token)
 		}
-		kept = append(kept, p)
+		sep = nextSep
 	}
+	for i := 0; i < len(rawQuery); i++ {
+		if c := rawQuery[i]; c == '&' || c == ';' {
+			flush(i, c)
+			start = i + 1
+		}
+	}
+	flush(len(rawQuery), 0)
 	if !changed {
 		return rawQuery
 	}
-	return strings.Join(kept, "&")
+	return b.String()
 }
 
 // canonicalQueryParamName decodes a raw query-parameter key to the normalised form used for
-// strip matching: percent-decoded, truncated at any first '[' (array/operator syntax), and
-// lower-cased. ok is false when the key is not valid percent-encoding, which the caller
-// treats as a parameter to drop (fail closed).
+// strip matching, folding the key the way the sloppiest in-scope upstream would so a
+// credential cannot slip through on a spelling the upstream still honours:
+//   - percent-decoded (so %74oken matches token), failing closed (ok=false) on invalid
+//     encoding, which the caller treats as a parameter to drop;
+//   - any leading run of '['/']' is removed and the name is cut at the next '[' or ']', so
+//     array/operator syntax folds to the base name — token[], token[$ne], [token], ]token
+//     and the encoded forms all match token, matching Rack's and Express/qs's own nesting;
+//   - '.' and ' ' are folded to '_', which PHP always does to request-parameter names;
+//   - lower-cased, since query names are case-sensitive per spec but some upstreams (e.g.
+//     ASP.NET) read them case-insensitively.
+//
+// (The header denylist instead folds '_'<->'-'; the two sides mirror their respective
+// upstream-parsing quirks, which is why the normalisations differ.)
 func canonicalQueryParamName(key string) (name string, ok bool) {
 	decoded, err := url.QueryUnescape(key)
 	if err != nil {
 		return "", false
 	}
-	if i := strings.IndexByte(decoded, '['); i >= 0 {
+	decoded = strings.TrimLeft(decoded, "[]")
+	if i := strings.IndexAny(decoded, "[]"); i >= 0 {
 		decoded = decoded[:i]
 	}
+	decoded = strings.NewReplacer(".", "_", " ", "_").Replace(decoded)
 	return strings.ToLower(decoded), true
 }
 
