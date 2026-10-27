@@ -22,7 +22,7 @@ Memento platform ── wss:// ──▶ Bridge Gateway ── WebSocket ──�
 1. **Connect.** mkonnect dials the Bridge Gateway over `wss://`. The gateway sends a random challenge nonce first, on every connection attempt.
    - **First run:** mkonnect sends a one-time `REGISTRATION_TOKEN` (the challenge is unused on this path). The gateway responds with a freshly generated ML-DSA-65 private key, which mkonnect persists to disk (`KEY_FILE`, `0600` permissions).
    - **Every reconnect after that:** mkonnect proves possession of its private key by signing the challenge (ML-DSA-65, a post-quantum signature scheme). No long-lived secret crosses the wire again.
-2. **Serve requests.** The platform sends `http_request` messages down the tunnel, each naming a plugin (e.g. `jenkins`) plus an HTTP method, path, headers, body, and an optional `expires_at` deadline (see [Connector error markers](#connector-error-markers)). mkonnect resolves the plugin name to an internal base URL (from a local credential entry, else the `PLUGIN_*` registry), optionally injects locally-stored Bearer or Basic credentials, forwards the request to the internal service, and returns the result as an `http_response`. Credentials configured locally (see [Internal tool credentials](#internal-tool-credentials)) are injected on-prem and never transit the tunnel.
+2. **Serve requests.** The platform sends `http_request` messages down the tunnel, each naming a plugin (e.g. `jenkins`) plus an HTTP method, path (see [Request paths](#request-paths)), headers, body, and an optional `expires_at` deadline (see [Connector error markers](#connector-error-markers)). mkonnect resolves the plugin name to an internal base URL (from a local credential entry, else the `PLUGIN_*` registry), optionally injects locally-stored Bearer or Basic credentials, forwards the request to the internal service, and returns the result as an `http_response`. Credentials configured locally (see [Internal tool credentials](#internal-tool-credentials)) are injected on-prem and never transit the tunnel.
 3. **Report status.** On connect, on local config change (SIGHUP), and on each heartbeat, mkonnect sends a `connection_status` message listing each plugin's state. The platform can also request an on-demand connectivity probe (`test_connection`), which mkonnect runs against the plugin and answers with a `test_result` — no credential ever appears in either message.
 4. **Stay alive.** A heartbeat every 30s — a WebSocket ping (detects silent TCP drops from NAT timeouts or load balancer failures) and an application-level health message (what the gateway actually uses to track connector liveness) — keeps the connection monitored from both sides. If the connection drops, mkonnect reconnects with exponential backoff (1s → 60s cap).
 
@@ -73,6 +73,22 @@ A request may carry an optional `expires_at` deadline (RFC 3339 with a UTC offse
 The status code on a synthesised response is kept for backward compatibility and is not always a precise fit (e.g. `upstream_error` reuses `504`); the `X-Mkonnect-Error` code is the authoritative signal.
 
 Connector responses produced outside the request-forwarding path — the backpressure `429` and lifecycle responses such as the suspension `503` — are not marked yet.
+
+### Request paths
+
+The request `path` is forwarded with its percent-encoding **preserved**, so the request-target the upstream receives is the one the platform sent — provided it round-trips cleanly (see the fallback below). A single `%2F` reaches the upstream as `%2F`, not as a decoded `/`.
+
+- **Encode each segment once.** An escaped `%25` is itself preserved, so double-encoding (`%252F`) would arrive literally as `%252F`, not `%2F`. Percent-encode each path segment exactly once. This assumes the upstream decodes the path once, as HTTP servers normally do; an upstream that decodes twice is outside this contract.
+- **Base-URL path prefix.** A non-default path prefix on the plugin's base URL is prepended with its own encoding preserved — `/api/v1` + `/group%2Fsub` → `/api/v1/group%2Fsub` (a trailing slash on the base is not doubled).
+- **Query string** is passed through as received.
+- **Plain paths are unchanged**, and lower-case escapes such as `%2f` are kept as written.
+
+Security and confinement checks run on the **decoded, normalized** path, not the escaped form:
+
+- A path that is malformed, does not begin with `/`, does not resolve to the configured host, or carries userinfo or an authority (`//host/…`, `//user:pw@host/…`) is rejected with [`invalid_path`](#connector-error-markers) and never forwarded. An encoded `//` is not treated as an authority, so it cannot redirect the request to another host — `/%2F%2Fexample` is handled as the path `/example` on the configured upstream.
+- A `..` traversal that escapes a non-root base-URL path prefix is rejected with [`path_blocked`](#connector-error-markers). With a root base URL there is no prefix to escape, so `..` segments are simply normalized away rather than rejected.
+
+**Fallback.** If the escaped path is not an unambiguous round-trip — for example it mixes a raw reserved byte with escapes (`/a%2Fb c`), or contains `.`, `..`, or `//` segments — the connector forwards the **decoded, cleaned** path instead. In that case an escaped slash does not survive and segment boundaries change (`/a%2Fb c` → `/a/b%20c`). To keep `%2F` intact, send fully-encoded paths with no raw reserved bytes and no `.`, `..`, or `//` segments.
 
 ## Configuration
 
