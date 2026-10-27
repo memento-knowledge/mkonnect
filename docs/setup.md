@@ -37,6 +37,24 @@ request arrives carrying another. Add tool-specific headers to the list with `--
 (comma-separated) on `connector config set`, or the `strip_headers` field in the credentials file;
 the defaults are always enforced and cannot be removed.
 
+**Caller credential query parameters are stripped too.** Some tools accept a credential in the URL
+query string as well as a header — a REST API that honours `?private_token=`, `?job_token=` or
+`?access_token=`, sometimes in preference to the `Authorization` header. So when a plugin has a local
+credential, the connector also drops credential-bearing query parameters on the inbound request
+before forwarding — the defaults are `private_token`, `job_token`, `access_token` and `token` — so
+the locally configured credential is the only one the tool honours, in the query string as well as
+the headers. Add tool-specific parameter names (for example a trigger token) with
+`--strip-query-params` (comma-separated) on `connector config set`, or the `strip_query_params` field
+in the credentials file; the defaults are always enforced and cannot be removed. Matching folds case
+and ignores any `name[...]` array/operator suffix, so a casing or array-syntax variant cannot slip a
+credential through. Note two boundaries: a credential in the **request body** (a form or JSON field)
+is forwarded unchanged — bodies are the tool's own boundary — and a parameter that selects a
+different principal rather than authenticating (for example GitLab's `?sudo=` with an admin token) is
+not a credential and is not stripped; add it to `strip_query_params` if your tool honours it. A
+documented consequence: a call that deliberately relies on a URL credential, such as GitLab's
+`POST /projects/:id/trigger/pipeline?token=…`, no longer works through a plugin that has its own
+local credential — that is the intended guarantee, not a regression.
+
 ## How your credentials are stored
 
 Be clear-eyed about where these secrets live:
@@ -96,7 +114,8 @@ restrictive permissions outside your checkout and remove it after the Secret has
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
    `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), an
    optional `strip_headers` (a list of extra inbound headers to drop — see below), an optional
-   `ca_bundle` (an absolute path to a PEM bundle of extra root CA(s) to trust for this tool's
+   `strip_query_params` (a list of extra inbound query-parameter names to drop — see below), an
+   optional `ca_bundle` (an absolute path to a PEM bundle of extra root CA(s) to trust for this tool's
    upstream TLS — see [Trusting an internal CA](#trusting-an-internal-ca-custom-ca-bundle)), and an
    optional `upstream_timeout` (a per-tool request timeout — see
    [Tuning the upstream timeout](#tuning-the-upstream-timeout)).

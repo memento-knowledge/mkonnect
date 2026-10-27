@@ -533,3 +533,56 @@ func TestConfigSetWarnsWhenStripHeadersCleared(t *testing.T) {
 		t.Fatalf("expected a warning that strip-headers were cleared:\n%s", out.String())
 	}
 }
+
+func TestConfigSetStripQueryParamsFlagPersistsAndLists(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "http://scm.internal",
+		"--auth", "bearer", "--token-stdin",
+		"--strip-query-params", "trigger_token, x_custom"},
+		strings.NewReader("token-value-abcdef12"), &stdout); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	stdout.Reset()
+	if err := cli.Run([]string{"config", "list"}, noStdin(), &stdout); err != nil {
+		t.Fatalf("config list: %v", err)
+	}
+	out := stdout.String()
+	for _, want := range []string{"strip-query-params", "trigger_token", "x_custom"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in list output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "token-value-abcdef12") {
+		t.Fatalf("token must not appear in list output:\n%s", out)
+	}
+}
+
+func TestConfigSetWarnsWhenStripQueryParamsCleared(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CREDS_FILE", filepath.Join(dir, "credentials.json"))
+
+	var out bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "http://scm.internal", "--auth", "bearer", "--token-stdin",
+		"--strip-query-params", "trigger_token"},
+		strings.NewReader("token-value-abcdef12"), &out); err != nil {
+		t.Fatalf("config set: %v", err)
+	}
+
+	// Re-set without --strip-query-params (e.g. a token rotation): the list is dropped, and
+	// the operator must be warned.
+	out.Reset()
+	if err := cli.Run([]string{"config", "set", "gitscm",
+		"--base-url", "http://scm.internal", "--auth", "bearer", "--token-stdin"},
+		strings.NewReader("token-value-rotated99"), &out); err != nil {
+		t.Fatalf("config set (rotate): %v", err)
+	}
+	if !strings.Contains(out.String(), "Warning") || !strings.Contains(out.String(), "strip-query-params") {
+		t.Fatalf("expected a warning that strip-query-params were cleared:\n%s", out.String())
+	}
+}

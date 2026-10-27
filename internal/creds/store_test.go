@@ -392,3 +392,61 @@ func TestCredentialValidateRejectsBadStripHeaders(t *testing.T) {
 		t.Fatalf("valid strip_headers rejected: %v", err)
 	}
 }
+
+func TestStoreStripQueryParamsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	s, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := s.Set("gitscm", creds.Credential{
+		BaseURL:          "http://scm.internal",
+		Auth:             "bearer",
+		Token:            "token-value-abcdef12",
+		StripQueryParams: []string{"trigger_token", "x_custom"},
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	// Reload from disk in a fresh store to confirm the field persists.
+	s2, err := creds.New(path)
+	if err != nil {
+		t.Fatalf("New after write: %v", err)
+	}
+	got, ok := s2.Get("gitscm")
+	if !ok {
+		t.Fatal("Get: not found")
+	}
+	if len(got.StripQueryParams) != 2 || got.StripQueryParams[0] != "trigger_token" || got.StripQueryParams[1] != "x_custom" {
+		t.Fatalf("strip_query_params not persisted: %v", got.StripQueryParams)
+	}
+}
+
+func TestCredentialValidateRejectsBadStripQueryParams(t *testing.T) {
+	cases := []struct {
+		name  string
+		strip []string
+	}{
+		{"empty", []string{""}},
+		{"whitespace", []string{"   "}},
+		{"ampersand", []string{"a&b"}},
+		{"equals", []string{"a=b"}},
+		{"percent", []string{"a%62"}},
+		{"plus", []string{"a+b"}},
+		{"semicolon", []string{"a;b"}},
+		{"bracket", []string{"a[0]"}},
+		{"question", []string{"a?b"}},
+		{"hash", []string{"a#b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := creds.Credential{BaseURL: "http://x", Auth: "bearer", Token: "token-value-abcdef12", StripQueryParams: tc.strip}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("expected Validate to reject strip_query_params %v", tc.strip)
+			}
+		})
+	}
+	ok := creds.Credential{BaseURL: "http://x", Auth: "bearer", Token: "token-value-abcdef12", StripQueryParams: []string{"trigger_token"}}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid strip_query_params rejected: %v", err)
+	}
+}

@@ -80,6 +80,109 @@ var defaultCredentialHeaders = stripHeaderSet(
 	"X-Auth-Token",
 )
 
+// defaultCredentialQueryParams are inbound URL query parameters that carry credentials for
+// some upstreams (e.g. a REST API that honours ?private_token= / ?access_token=, sometimes
+// in preference to the Authorization header). They must never reach the upstream when
+// mkonnect applies its own local credential — the header defaults above close the header
+// vector, these close the query-string vector, so the local credential is the only one the
+// upstream honours. Keys are lowercase; matching folds case (see stripQueryParamsFromRaw).
+// Like the header list this is not exhaustive — add service-specific names (e.g. a trigger
+// token) per plugin via StripQueryParams. Request BODIES are forwarded verbatim and are the
+// upstream's boundary (an upstream that also reads a credential from a form or JSON body is
+// outside this control), mirroring how the decoded-once path is the boundary for RawPath.
+var defaultCredentialQueryParams = map[string]bool{
+	"private_token": true,
+	"job_token":     true,
+	"access_token":  true,
+	"token":         true,
+}
+
+// stripQueryParamsFromRaw removes query parameters whose name is in strip from a raw
+// (still-percent-encoded) query string, returning the result. It preserves the original
+// order and exact bytes of the parameters it keeps, and returns rawQuery unchanged when
+// nothing matches — so the common no-match path forwards the caller's query verbatim.
+//
+// Matching mirrors how a permissive upstream reads the query, so a credential cannot hide
+// behind an encoding or separator quirk:
+//   - Each parameter name is percent-decoded before comparison (so %74oken matches token).
+//   - A trailing bracket group is dropped (private_token[] / token[$ne] match their base
+//     name), closing the Rack/Express array-and-operator syntax.
+//   - Comparison folds case (see defaultCredentialQueryParams).
+//   - Pairs are split on both '&' and ';': Go does not treat ';' as a separator, but some
+//     upstreams (Rack 2.x, PHP) do, so a credential after ';' is still removed. Surviving
+//     ';'-separated pairs are only rejoined with '&' when something was actually stripped;
+//     an untouched query keeps its ';' verbatim.
+//   - A name that fails to percent-decode is dropped (fail closed): forwarding a parameter
+//     this filter could not interpret would defeat it, and such a value is rejected by
+//     strict upstreams anyway.
+//
+// All occurrences of a matched name are removed, so a repeated parameter cannot survive.
+// Defense in depth stops at a single decode: an upstream that decodes twice is outside this
+// contract, exactly as for the request path.
+func stripQueryParamsFromRaw(rawQuery string, strip map[string]bool) string {
+	if rawQuery == "" || len(strip) == 0 {
+		return rawQuery
+	}
+	parts := strings.FieldsFunc(rawQuery, func(r rune) bool { return r == '&' || r == ';' })
+	kept := make([]string, 0, len(parts))
+	changed := false
+	for _, p := range parts {
+		key := p
+		if i := strings.IndexByte(p, '='); i >= 0 {
+			key = p[:i]
+		}
+		name, ok := canonicalQueryParamName(key)
+		if !ok || strip[name] {
+			changed = true
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if !changed {
+		return rawQuery
+	}
+	return strings.Join(kept, "&")
+}
+
+// canonicalQueryParamName decodes a raw query-parameter key to the normalised form used for
+// strip matching: percent-decoded, truncated at any first '[' (array/operator syntax), and
+// lower-cased. ok is false when the key is not valid percent-encoding, which the caller
+// treats as a parameter to drop (fail closed).
+func canonicalQueryParamName(key string) (name string, ok bool) {
+	decoded, err := url.QueryUnescape(key)
+	if err != nil {
+		return "", false
+	}
+	if i := strings.IndexByte(decoded, '['); i >= 0 {
+		decoded = decoded[:i]
+	}
+	return strings.ToLower(decoded), true
+}
+
+// queryStripSet builds the set of query-parameter names (lowercase) to strip for a request.
+// A plugin's explicit StripQueryParams are honoured whenever the entry exists; the
+// credential-parameter defaults are added only when a local credential is actually applied
+// (useDirectTransport), mirroring the header denylist. Returns nil when nothing is to be
+// stripped, so stripQueryParamsFromRaw short-circuits and forwards the query verbatim.
+func queryStripSet(cred creds.Credential, haveCred, useDirectTransport bool) map[string]bool {
+	var set map[string]bool
+	if haveCred && len(cred.StripQueryParams) > 0 {
+		set = make(map[string]bool, len(cred.StripQueryParams)+len(defaultCredentialQueryParams))
+		for _, n := range cred.StripQueryParams {
+			set[strings.ToLower(n)] = true
+		}
+	}
+	if useDirectTransport {
+		if set == nil {
+			set = make(map[string]bool, len(defaultCredentialQueryParams))
+		}
+		for n := range defaultCredentialQueryParams {
+			set[n] = true
+		}
+	}
+	return set
+}
+
 const unsafeCredentialResponse = `{"error":"upstream response contains local credentials"}`
 
 // credentialRepresentations returns encoded and complete-authorization forms of
@@ -367,8 +470,9 @@ func warmCACache(cache *caClientCache, store *creds.Store, defaultCABundle strin
 
 // HTTPHandler returns an HTTPPluginHandler that:
 //  1. Resolves the plugin's base URL from the creds store first, then the registry.
-//  2. Strips caller-supplied credential headers, then injects an Authorization header
-//     when local credentials are configured, so the local credential is the only one used.
+//  2. Strips caller-supplied credential headers and query parameters, then injects an
+//     Authorization header when local credentials are configured, so the local credential
+//     is the only one used.
 //  3. Applies a custom CA bundle (per-plugin ca_bundle, else the global defaultCABundle)
 //     for upstream TLS verification, failing closed if a configured bundle cannot load.
 //  4. Forwards the HTTP request and returns status, headers, and body.
@@ -522,6 +626,21 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 			target.RawPath = ""
 		}
 
+		// Compute once whether a local credential will be applied; reused for both the
+		// query-parameter and header credential-strip decisions below so they cannot drift.
+		useDirectTransport := haveCred && cred.HasAuthorization()
+
+		// Strip caller-supplied credential-bearing query parameters before building the
+		// outbound request, mirroring the header denylist: when a local credential is applied
+		// the defaults are enforced, and a plugin may strip additional names via
+		// StripQueryParams (honoured even without a local credential). The local credential is
+		// then the only credential the upstream sees in both the headers and the query string.
+		// The path allow-rules above still run on the decoded path exactly as before.
+		target.RawQuery = stripQueryParamsFromRaw(target.RawQuery, queryStripSet(cred, haveCred, useDirectTransport))
+		// A fragment never reaches the wire (RequestURI omits it), but clear it defensively so
+		// a future change to request construction cannot forward anything after '#'.
+		target.Fragment = ""
+
 		const maxBodyBytes = 32 << 20
 
 		// Build the request body reader from the plain-text string field.
@@ -546,7 +665,6 @@ func HTTPHandler(registry *Registry, store *creds.Store, defaultCABundle string)
 		// applied, so the local credential is the one credential the upstream sees; for a
 		// plugin without a local credential a caller-supplied Authorization is intentional
 		// (platform-held credentials) and is left untouched.
-		useDirectTransport := haveCred && cred.HasAuthorization()
 		var stripHeaders map[string]bool
 		if haveCred && len(cred.StripHeaders) > 0 {
 			stripHeaders = stripHeaderSet(cred.StripHeaders...)

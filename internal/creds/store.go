@@ -45,6 +45,16 @@ type Credential struct {
 	// local credential is applied. Names are matched case-insensitively. Entries are
 	// honoured whenever this entry exists, so a no-auth plugin can opt into stripping too.
 	StripHeaders []string `json:"strip_headers,omitempty"`
+	// StripQueryParams lists extra inbound URL query-parameter names to drop before
+	// forwarding, in addition to the credential-parameter defaults the plugin handler
+	// enforces when a local credential is applied. The handler folds case when matching:
+	// query-parameter names are case-sensitive per the URL spec, but some upstreams (e.g.
+	// ASP.NET) read them case-insensitively, so a credential denylist must be at least as
+	// broad as the sloppiest upstream — the only cost is that a non-credential parameter
+	// whose name case-insensitively equals a stripped name is also dropped when a local
+	// credential is applied. Entries are honoured whenever this entry exists, so a no-auth
+	// plugin can opt into stripping too.
+	StripQueryParams []string `json:"strip_query_params,omitempty"`
 	// CABundle is the absolute path to a PEM file of additional root CA(s) to trust when
 	// verifying this plugin's upstream TLS certificate — e.g. an internal CA for a
 	// self-managed service. Its certificates are ADDED to the system trust store, never a
@@ -103,6 +113,18 @@ func (c Credential) Validate() error {
 		}
 		if strings.ContainsAny(h, " \t\r\n:") {
 			return errors.New("strip_headers entries must be valid header names")
+		}
+	}
+	// Validate any extra query-parameter names to strip. They are matched against the
+	// percent-DECODED, bracket-trimmed, case-folded parameter name at request time, so an
+	// entry containing a percent-escape, a separator, or a bracket could never match — reject
+	// those so a typo is a clear error, not a silent no-op in a security control.
+	for _, q := range c.StripQueryParams {
+		if strings.TrimSpace(q) == "" {
+			return errors.New("strip_query_params entries must not be empty")
+		}
+		if strings.ContainsAny(q, " \t\r\n&=?#%+;[]") {
+			return errors.New("strip_query_params entries must be plain query-parameter names (no separators, percent-escapes, or brackets)")
 		}
 	}
 	// A CA bundle path, if given, must be absolute: the connector daemon's working
