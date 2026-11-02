@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -286,10 +287,23 @@ func TestUpstreamReadErrorCarriesMarker(t *testing.T) {
 		if aerr != nil {
 			return
 		}
-		// Send a valid status line and headers announcing a 1000-byte body, write a
-		// few bytes, then close abruptly so the client's body read fails with EOF.
+		defer conn.Close() //nolint:errcheck
+		// Drain the inbound request first. Closing a connection that still has unread
+		// data provokes a TCP RST, and an RST can discard the response bytes we are
+		// about to write before the client parses them — that sends the handler down
+		// the client.Do (header-read) branch instead of the body-read branch under test,
+		// which is what made this test flaky. Reading the request leaves the close a
+		// clean FIN.
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		// Send a valid status line and headers announcing a 1000-byte body, write a few
+		// bytes, then half-close the write side so the client parses the headers, reads
+		// "partial", and then sees a clean EOF before the announced length. That is
+		// deterministically an io.ErrUnexpectedEOF while reading the body — the
+		// body-read branch (upstream_error), never a header parse failure.
 		_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\npartial"))
-		_ = conn.Close()
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
 	}()
 
 	h := HTTPHandler(newRegistry("svc", "http://"+ln.Addr().String()), mustStore(t), "")
