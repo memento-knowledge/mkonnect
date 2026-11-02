@@ -24,6 +24,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
+	"github.com/memento-knowledge/mkonnect/internal/gateway"
 	"github.com/memento-knowledge/mkonnect/internal/gitsync"
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
@@ -48,9 +49,11 @@ func (s *stubSender) messages() []any {
 	return append([]any(nil), s.sent...)
 }
 
-// fakeProber returns a fixed result (or error) for every provider. A non-nil block channel makes
-// Probe wait for ctx cancellation (or the channel) so a test can exercise a cancelled probe.
+// fakeProber returns a result (or error) for every provider. A non-nil block channel makes Probe
+// wait for ctx cancellation (or the channel) so a test can exercise a cancelled probe. The result
+// is mutex-guarded so a test can change it while a probe may be running.
 type fakeProber struct {
+	mu     sync.Mutex
 	result gitsync.OriginResult
 	err    error
 	calls  atomic.Int32
@@ -66,8 +69,25 @@ func (f *fakeProber) Probe(ctx context.Context, _ gitsync.LocalEntry) (gitsync.O
 		case <-f.block:
 		}
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.result, f.err
 }
+
+func (f *fakeProber) setResult(r gitsync.OriginResult) {
+	f.mu.Lock()
+	f.result = r
+	f.mu.Unlock()
+}
+
+// testClock is an advanceable clock for exercising the probe TTL/refresh deterministically.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) now() time.Time          { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *testClock) advance(d time.Duration) { c.mu.Lock(); c.t = c.t.Add(d); c.mu.Unlock() }
 
 func fixedNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
 
@@ -76,6 +96,10 @@ func newTestClient(t *testing.T, localJSON string) *gitsync.Client {
 }
 
 func newTestClientP(t *testing.T, localJSON string, p gitsync.OriginProber) *gitsync.Client {
+	return newTestClientClock(t, localJSON, p, fixedNow)
+}
+
+func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time) *gitsync.Client {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "git-sync.json")
 	if localJSON != "" {
@@ -88,7 +112,17 @@ func newTestClientP(t *testing.T, localJSON string, p gitsync.OriginProber) *git
 		t.Fatalf("load local config: %v", err)
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
-	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, fixedNow, "boot-test")
+	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test")
+}
+
+// latestOriginCheck returns the origin_check from the most recent status that carried one.
+func latestOriginCheck(msgs []any) *proto.OriginCheck {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if st, ok := msgs[i].(proto.GitSyncStatusMsg); ok && st.OriginCheck != nil {
+			return st.OriginCheck
+		}
+	}
+	return nil
 }
 
 func lastStatus(t *testing.T, msgs []any) proto.GitSyncStatusMsg {
@@ -328,8 +362,14 @@ func TestPushTokenNeverLogged(t *testing.T) {
 
 	c := newTestClient(t, oneProvider)
 	token := "secret-push-token-zzzz9999"
-	raw := json.RawMessage(fmt.Sprintf(`{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"repo-a","origin_url":"https://git.example.com/a.git","push_token":%q}]}`, token))
-	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", raw)
+	accepted := fmt.Sprintf(`{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"repo-a","origin_url":"https://git.example.com/a.git","push_token":%q}]}`, token)
+	// A duplicate repo_id is rejected; the warning must not echo the token either.
+	rejected := fmt.Sprintf(`{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a","push_token":%q},{"repo_id":"x","origin_url":"https://git.example.com/b","push_token":%q}]}`, token, token)
+	// A malformed frame carrying the token must not leak it through the decode error.
+	malformed := fmt.Sprintf(`{"type":"git_sync_config","repositories":[{"repo_id":123,"push_token":%q}]}`, token)
+	for _, raw := range []string{accepted, rejected, malformed} {
+		c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", json.RawMessage(raw))
+	}
 	if strings.Contains(buf.String(), token) {
 		t.Errorf("push token leaked into logs: %s", buf.String())
 	}
@@ -417,6 +457,40 @@ func TestOriginCheckNotCachedOnCancel(t *testing.T) {
 	}
 }
 
+// TestHeartbeatProbeUsesConnectionContext is the regression for the bug where a heartbeat-triggered
+// probe inherited the per-tick context the gateway cancels on return, so the origin_check could
+// never refresh after connect. The probe must run under the connection context captured in
+// OnConnected and refresh even when the heartbeat's own context is cancelled immediately.
+func TestHeartbeatProbeUsesConnectionContext(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &fakeProber{result: gitsync.OriginUnreachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	connCtx, connCancel := context.WithCancel(context.Background())
+	defer connCancel()
+
+	c.OnConnected(connCtx, s)
+	waitFor(t, func() bool {
+		oc := latestOriginCheck(s.messages())
+		return oc != nil && oc.Result == "unreachable"
+	})
+
+	// The origin recovers; advance past the TTL and deliver a heartbeat whose own context is
+	// cancelled the instant the call returns (as the gateway does).
+	prober.setResult(gitsync.OriginReachable)
+	clk.advance(gateway.DefaultHeartbeatInterval + time.Second)
+	tickCtx, tickCancel := context.WithCancel(context.Background())
+	if err := c.OnHeartbeat(tickCtx, s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	tickCancel()
+
+	waitFor(t, func() bool {
+		oc := latestOriginCheck(s.messages())
+		return oc != nil && oc.Result == "reachable"
+	})
+}
+
 // TestConcurrentConfigAndHeartbeat exercises the documented overlap of OnHeartbeat (its own
 // goroutine) and HandleMessage (the read loop). Empty local config keeps the probe out of the way.
 func TestConcurrentConfigAndHeartbeat(t *testing.T) {
@@ -442,6 +516,19 @@ func TestConcurrentConfigAndHeartbeat(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+
+	// Because build-and-send is serialised under statusMu, sent order must equal sequence order.
+	var prev uint64
+	for _, m := range s.messages() {
+		st, ok := m.(proto.GitSyncStatusMsg)
+		if !ok {
+			continue
+		}
+		if st.Sequence <= prev {
+			t.Fatalf("sequence not strictly increasing in send order: %d after %d", st.Sequence, prev)
+		}
+		prev = st.Sequence
+	}
 }
 
 // --- end-to-end enrollment through the gateway ---

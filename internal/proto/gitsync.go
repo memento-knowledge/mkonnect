@@ -17,8 +17,8 @@ import (
 //   - GitSyncStatusMsg  connector -> platform : connector-level envelope + per-repository state
 //   - GitSyncNowMsg     platform -> connector : request an immediate sync
 //
-// The connector kind is never carried on the wire; the gateway derives it server-side from the
-// registration-token claim, so no message here names it.
+// The connector kind is never carried on the wire; the gateway assigns it server-side at
+// enrollment, so no message here names it.
 
 // Secret is a string whose value is redacted on every output path (fmt verbs, slog, and JSON
 // marshalling) and revealed only via Reveal. It is used for inbound credential material — the

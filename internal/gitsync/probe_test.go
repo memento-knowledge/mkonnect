@@ -31,6 +31,11 @@ func TestClassifyLsRemote(t *testing.T) {
 		{"refused", "fatal: unable to access 'https://git.example.com/': Failed to connect to git.example.com port 443: Connection refused", anErr, OriginUnreachable},
 		{"tls", "fatal: unable to access 'https://git.example.com/': SSL certificate problem: unable to get local issuer certificate", anErr, OriginUnreachable},
 		{"unknown", "fatal: something unexpected went wrong", anErr, OriginUnreachable},
+		// Hostname-poisoning: a reachable host whose name contains a connection keyword must not be
+		// misclassified because git echoes the URL in the message.
+		{"tls in hostname not found", "fatal: repository 'https://tls.example.com/' not found", anErr, OriginReachable},
+		{"ssl in hostname not found", "fatal: repository 'https://ssl-git.example.com/' not found", anErr, OriginReachable},
+		{"tls in hostname 302", "fatal: unable to access 'https://tls.example.com/': The requested URL returned error: 302", anErr, OriginReachable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -44,7 +49,7 @@ func TestClassifyLsRemote(t *testing.T) {
 func TestGitProberInjectsBearerSafely(t *testing.T) {
 	token := "secret-token-abcdefghij"
 	var gotArgv, gotEnv []string
-	p := &gitProber{run: func(_ context.Context, argv, env []string) ([]byte, error) {
+	p := &gitProber{run: func(_ context.Context, argv, env []string, _ string) ([]byte, error) {
 		gotArgv, gotEnv = argv, env
 		return nil, nil
 	}}
@@ -85,7 +90,7 @@ func TestGitProberInjectsBearerSafely(t *testing.T) {
 
 func TestGitProberBasicAuthHeader(t *testing.T) {
 	var gotEnv []string
-	p := &gitProber{run: func(_ context.Context, _, env []string) ([]byte, error) { gotEnv = env; return nil, nil }}
+	p := &gitProber{run: func(_ context.Context, _, env []string, _ string) ([]byte, error) { gotEnv = env; return nil, nil }}
 	e := LocalEntry{BaseURL: "https://git.example.com/", Auth: "basic", Username: "svc", Token: Secret("pw-abcdefghijklmnop")}
 	if _, err := p.Probe(context.Background(), e); err != nil {
 		t.Fatalf("probe: %v", err)
@@ -97,7 +102,7 @@ func TestGitProberBasicAuthHeader(t *testing.T) {
 }
 
 func TestGitProberLocalFaultOnMissingBinary(t *testing.T) {
-	p := &gitProber{run: func(_ context.Context, _, _ []string) ([]byte, error) {
+	p := &gitProber{run: func(_ context.Context, _, _ []string, _ string) ([]byte, error) {
 		return nil, &exec.Error{Name: "git", Err: exec.ErrNotFound}
 	}}
 	res, err := p.Probe(context.Background(), LocalEntry{BaseURL: "https://git.example.com/"})

@@ -17,8 +17,8 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
-// Repository lifecycle states reported in git_sync_status. The platform mirrors this set in a CHECK
-// constraint, so the strings are pinned by a test.
+// Repository lifecycle states reported in git_sync_status. These strings are part of the wire
+// contract, so a test pins them against accidental drift.
 const (
 	// StatePending: the repository is configured and host-matched but no sync has completed this run
 	// (Phase 2 never advances past this, so a stubbed connector never reports a healthy "ok").
@@ -110,6 +110,11 @@ type Client struct {
 	configAccepted bool
 	configVersion  json.RawMessage
 	repos          map[string]repoState // by repo_id
+	// connCtx/connSender are the current connection's context and sender, captured in OnConnected.
+	// A probe started from a heartbeat must run under the connection's lifetime, NOT the
+	// per-heartbeat context the gateway cancels as soon as OnHeartbeat returns.
+	connCtx    context.Context
+	connSender gateway.Sender
 
 	// statusMu serialises build-and-send so a heartbeat cannot send a stale snapshot after the read
 	// loop has already sent a newer one, and so the sequence number matches wire order.
@@ -158,16 +163,22 @@ func (c *Client) OnHandshake(info gateway.HandshakeInfo) {
 
 // OnConnected sends an immediate status (so the platform sees the connector promptly) and starts a
 // pre-config origin reachability probe off the connection goroutine; the probe's result arrives in
-// a later status, so the first write is never blocked on the network.
+// a later status, so the first write is never blocked on the network. The connection context and
+// sender are captured so a later heartbeat-triggered probe runs under the connection's lifetime.
 func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
+	c.mu.Lock()
+	c.connCtx = ctx
+	c.connSender = s
+	c.mu.Unlock()
+	c.lastProbe.Store(0) // allow an immediate probe on each new connection
 	c.emitStatus(ctx, s, statusWriteTimeout)
-	c.maybeProbe(ctx, s)
+	c.maybeProbe()
 }
 
 // OnHeartbeat pushes the current status each tick (the status resend cadence is the gateway health
 // interval), refreshing the pre-config origin check no more often than that interval.
 func (c *Client) OnHeartbeat(ctx context.Context, s gateway.Sender) error {
-	c.maybeProbe(ctx, s)
+	c.maybeProbe()
 	return c.sendStatus(ctx, s)
 }
 
@@ -366,20 +377,27 @@ func (c *Client) hostMatched(originURL string) bool {
 
 // maybeProbe launches a pre-config origin reachability probe on a goroutine if the connector has no
 // accepted configuration, has at least one local provider, is not already probing, and has not
-// probed within the health cadence. The result is cached and a status is sent once it is ready; a
-// probe cancelled by a closing connection is never cached, and a local fault (e.g. git missing)
-// leaves origin_check absent.
-func (c *Client) maybeProbe(ctx context.Context, s gateway.Sender) {
+// probed within the health cadence. The probe and its status send run under the CONNECTION context
+// captured in OnConnected (not a per-heartbeat context, which the gateway cancels on return), so a
+// heartbeat-triggered refresh is not killed the instant OnHeartbeat returns. The throttle applies to
+// every attempt — including failed ones — so a persistent local fault (e.g. git missing) does not
+// exec git on every heartbeat. A probe cancelled by a closing connection is never cached.
+func (c *Client) maybeProbe() {
 	c.mu.Lock()
 	accepted := c.configAccepted
+	ctx := c.connCtx
+	s := c.connSender
 	c.mu.Unlock()
-	if accepted || c.local == nil || len(c.local.Names()) == 0 {
+	if accepted || ctx == nil || s == nil || ctx.Err() != nil {
+		return
+	}
+	if c.local == nil || len(c.local.Names()) == 0 {
 		return
 	}
 	if !c.probing.CompareAndSwap(false, true) {
 		return
 	}
-	if oc := c.originCheck.Load(); oc != nil && c.now().Sub(time.Unix(0, c.lastProbe.Load())) < gateway.DefaultHeartbeatInterval {
+	if c.now().Sub(time.Unix(0, c.lastProbe.Load())) < gateway.DefaultHeartbeatInterval {
 		c.probing.Store(false)
 		return
 	}
@@ -459,8 +477,8 @@ func isScalarJSON(b json.RawMessage) bool {
 	return true
 }
 
-// parseExpiry parses an RFC3339 timestamp, reporting ok=false for an empty or unparseable value (so
-// a malformed expiry is ignored rather than treated as "no expiry" incorrectly swallowing a real one).
+// parseExpiry parses an RFC3339 timestamp, reporting ok=false for an empty or unparseable value, so
+// a malformed expiry is skipped when computing the earliest rather than being misread as a time.
 func parseExpiry(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false

@@ -13,8 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"maps"
 	"net"
 	"net/netip"
@@ -28,6 +26,8 @@ import (
 	"sync"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
 // minTokenLength mirrors creds.MinTokenLength: a short string is too ambiguous to be a usable
@@ -49,38 +49,11 @@ func DefaultConfigPath() string {
 	return DefaultConfigFile
 }
 
-// secretRedaction is what a Secret renders as everywhere except an explicit Reveal.
-const secretRedaction = "<redacted>"
-
-// Secret is a string whose value never appears in logs, formatted output, or marshalled JSON:
-// every rendering path redacts it, and only Reveal returns the underlying value. Keeping the
-// protection on the type — rather than on each struct that happens to hold one — means it
-// survives new fields and struct copies. The value is still read normally from config through
-// UnmarshalText.
-type Secret string
-
-// Format handles every fmt verb (%v, %s, %q, %#v, %d, ...), so no verb can print the value.
-func (Secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, secretRedaction) }
-
-// LogValue redacts the value for slog. The signature MUST be LogValue() slog.Value to satisfy
-// slog.LogValuer; a LogValue() any is silently ignored and the value would leak.
-func (Secret) LogValue() slog.Value { return slog.StringValue(secretRedaction) }
-
-// MarshalText redacts the value for encoding/json and any text encoder. Phase 2 has no write
-// path, so redacting on marshal cannot lose a real value; a Phase 4 persistence path will use
-// Reveal explicitly.
-func (Secret) MarshalText() ([]byte, error) { return []byte(secretRedaction), nil }
-
-// UnmarshalText reads the raw value from config.
-func (s *Secret) UnmarshalText(b []byte) error { *s = Secret(b); return nil }
-
-// Reveal returns the underlying secret value. It is the only path that does.
-func (s Secret) Reveal() string { return string(s) }
-
-var (
-	_ slog.LogValuer = Secret("")
-	_ fmt.Formatter  = Secret("")
-)
+// Secret aliases proto.Secret so the local token uses the same self-redacting type as the inbound
+// push token — one implementation, no drift. Its value is redacted on every output path (fmt, slog,
+// JSON) and revealed only via Reveal; the Store never marshals it directly, persisting through an
+// explicit plain-string on-disk struct instead (see save).
+type Secret = proto.Secret
 
 // chmod is os.Chmod, overridable in tests to exercise the read-only-mount branch of New (as the
 // file's owner, chmod cannot be made to fail portably). Mirrors the seam in internal/creds.

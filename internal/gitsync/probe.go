@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"regexp"
@@ -43,7 +44,7 @@ type OriginProber interface {
 // gitProber probes with `git ls-remote`. run is a seam so tests can assert the argv/env without a
 // real subprocess; it defaults to runGit.
 type gitProber struct {
-	run func(ctx context.Context, argv, env []string) (stderr []byte, err error)
+	run func(ctx context.Context, argv, env []string, dir string) (stderr []byte, err error)
 }
 
 // NewGitProber returns a prober backed by the git binary.
@@ -93,10 +94,13 @@ func (p *gitProber) Probe(ctx context.Context, e LocalEntry) (OriginResult, erro
 	defer func() { _ = os.RemoveAll(home) }()
 
 	argv := []string{"git", "ls-remote", "--", e.BaseURL, "HEAD"}
-	stderr, err := p.run(ctx, argv, probeEnv(e, home))
+	// Run in the empty HOME so git cannot discover an ambient repository's .git/config (url.insteadOf,
+	// http.* overrides) from the daemon's working directory.
+	stderr, err := p.run(ctx, argv, probeEnv(e, home), home)
 
 	var execErr *exec.Error
-	if errors.As(err, &execErr) {
+	var pathErr *fs.PathError
+	if errors.As(err, &execErr) || errors.As(err, &pathErr) {
 		// git itself could not be started (missing or non-executable binary): a local packaging
 		// fault, not an origin result.
 		return "", fmt.Errorf("git ls-remote could not run: %w", err)
@@ -154,7 +158,13 @@ func probeEnv(e LocalEntry, home string) []string {
 	return env
 }
 
-var httpStatusRE = regexp.MustCompile(`returned error: (\d{3})`)
+var (
+	httpStatusRE = regexp.MustCompile(`returned error: (\d{3})`)
+	// quotedRE matches the single-quoted URL git echoes in its errors. Stripping it before keyword
+	// matching stops a hostname that contains "ssl", "tls", or "timed out" from being mistaken for a
+	// connection failure.
+	quotedRE = regexp.MustCompile(`'[^']*'`)
+)
 
 // classifyLsRemote maps git's exit and stderr to an OriginResult. A received HTTP response (even a
 // 404 against a base URL that is not itself a repository) means the origin is reachable; 401/403/407
@@ -164,7 +174,8 @@ func classifyLsRemote(err error, stderr []byte) OriginResult {
 	if err == nil {
 		return OriginReachable
 	}
-	s := strings.ToLower(string(stderr))
+	// Remove the echoed URL so its host cannot trip a keyword below.
+	s := strings.ToLower(string(quotedRE.ReplaceAll(stderr, []byte("''"))))
 
 	// Access-denied markers first: these also contain "unable to access", so they must win over the
 	// generic reachable classification below.
@@ -181,7 +192,15 @@ func classifyLsRemote(err error, stderr []byte) OriginResult {
 		case "401", "403", "407":
 			return OriginAccessDenied
 		default:
-			// 404, 5xx, anything else: the server answered, so the origin is reachable.
+			// 404, 3xx, 5xx, anything else: the server answered, so the origin is reachable.
+			return OriginReachable
+		}
+	}
+	// The server answered but the base URL is not itself a repository: git reports
+	// "repository '<url>' not found" (its rendering of a 404), or an invalid smart-HTTP response.
+	// Checked before the connection markers so it wins regardless of the message's other words.
+	for _, m := range []string{"not found", "invalid server response", "not a valid repository"} {
+		if strings.Contains(s, m) {
 			return OriginReachable
 		}
 	}
@@ -194,23 +213,18 @@ func classifyLsRemote(err error, stderr []byte) OriginResult {
 			return OriginUnreachable
 		}
 	}
-	// The server answered but the base URL is not itself a repository: git reports
-	// "repository '<url>' not found" (its rendering of a 404), or an invalid smart-HTTP response.
-	// Either way the origin is reachable — a base URL is not expected to be a repository.
-	for _, m := range []string{"not found", "invalid server response", "not a valid repository"} {
-		if strings.Contains(s, m) {
-			return OriginReachable
-		}
-	}
 	// Unknown failure: never claim reachable.
 	return OriginUnreachable
 }
 
 // runGit executes git with a discarded stdout and a size-capped stderr, in its own process group so
 // a lingering git-remote-https helper is killed with the parent rather than outliving the timeout.
-func runGit(ctx context.Context, argv, env []string) ([]byte, error) {
+// dir is the working directory (an empty temp dir), so git cannot pick up an ambient repository's
+// configuration from the daemon's cwd.
+func runGit(ctx context.Context, argv, env []string, dir string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = env
+	cmd.Dir = dir
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
 	stderr := &limitedBuffer{max: maxProbeStderr}

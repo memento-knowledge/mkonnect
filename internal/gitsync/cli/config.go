@@ -55,6 +55,9 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 		return errors.New(setUsage)
 	}
 	name := args[0]
+	if strings.HasPrefix(name, "-") {
+		return errors.New("the provider name must come before the flags, e.g. `config set <name> --base-url ...`")
+	}
 
 	fs := flag.NewFlagSet("config set", flag.ContinueOnError)
 	fs.SetOutput(w)
@@ -109,7 +112,8 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 
 	var token string
 	if *tokenStdin {
-		b, err := io.ReadAll(stdin)
+		// Bound the read so a misdirected pipe cannot exhaust memory; a real token is tiny.
+		b, err := io.ReadAll(io.LimitReader(stdin, 64<<10))
 		if err != nil {
 			return fmt.Errorf("reading token from stdin: %w", err)
 		}
