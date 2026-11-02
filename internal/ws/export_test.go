@@ -1,24 +1,4 @@
 package ws
 
-import "time"
-
-// SetHeartbeatIntervalForTest overrides the heartbeat interval for external tests
-// (package ws_test) that need to observe a heartbeat without waiting the real 30s. Call
-// the returned restore func (e.g. via defer) to put the original interval back.
-func SetHeartbeatIntervalForTest(d time.Duration) (restore func()) {
-	old := heartbeatInterval
-	heartbeatInterval = d
-	return func() { heartbeatInterval = old }
-}
-
 // SafeDiagnosticForTest exposes safeDiagnostic to the external ws_test package.
 func SafeDiagnosticForTest(err error) string { return safeDiagnostic(err) }
-
-// SetDialTimeoutForTest overrides the per-attempt dial timeout for external tests (package
-// ws_test) that need to observe a stuck dial timing out without waiting the real 30s. Call
-// the returned restore func (e.g. via defer) to put the original timeout back.
-func SetDialTimeoutForTest(d time.Duration) (restore func()) {
-	old := dialTimeout
-	dialTimeout = d
-	return func() { dialTimeout = old }
-}
