@@ -3,9 +3,9 @@
 // with backoff, and dispatch of inbound messages to a pluggable Handler.
 //
 // The gateway owns the connection and the protocol lifecycle. A Handler owns what a
-// particular connector kind does with it (the mkonnect API connector, the git-sync job).
-// The package has no knowledge of connector kinds — the Bridge Gateway enforces the kind
-// server-side from the registration token claim.
+// particular connector kind does with it. The package has no knowledge of connector
+// kinds — the Bridge Gateway enforces the kind server-side from the registration token
+// claim.
 package gateway
 
 import (
@@ -29,53 +29,90 @@ import (
 
 // Config holds the enrollment inputs common to every connector kind.
 type Config struct {
-	GatewayURL        string
-	ConnectorID       string
-	ProtocolVersion   string
-	RegistrationToken string // used only on first run to register
+	// GatewayURL is the ws:// or wss:// URL of the Bridge Gateway endpoint.
+	GatewayURL string
+	// ConnectorID identifies this connector to the gateway. The connector kind is not
+	// carried here; the gateway derives it server-side from the registration token claim.
+	ConnectorID string
+	// ProtocolVersion is the opaque protocol version string announced in the HELLO.
+	ProtocolVersion string
+	// RegistrationToken is the one-time enrollment token, used only on first run to
+	// register; once a key is saved, reconnects sign the challenge instead.
+	RegistrationToken string
+	// ReadLimit caps a single inbound message in bytes. Zero selects defaultReadLimit.
+	// A connector kind that moves larger payloads can raise it.
+	ReadLimit int64
 }
 
 // Sender writes a message to the gateway, serialised against the concurrent writes
 // coder/websocket does not allow. A Handler is given a Sender and never touches the
 // raw connection, so every write on a connection shares one mutex.
+//
+// A Sender is bound to the single connection that produced it: once that connection
+// drops, Send returns an error rather than reaching the replacement connection. It is
+// safe for concurrent use by multiple goroutines.
 type Sender interface {
 	Send(ctx context.Context, v any) error
 }
 
 // HandshakeInfo carries flags from a successful handshake for the Handler to act on.
 type HandshakeInfo struct {
+	// CriticalPatch is set when the gateway signals that this connector is running a
+	// version with a critical patch available and should be upgraded.
 	CriticalPatch bool
 }
 
 // Handler receives the lifecycle callbacks a connector kind implements.
+//
+// The gateway never invokes these callbacks concurrently with one another, with one
+// exception: OnHeartbeat runs on its own goroutine and so may overlap a HandleMessage
+// call. The same Handler is reused across reconnects, so OnHandshake and OnConnected
+// fire once per connection, not once per process.
 type Handler interface {
-	// OnHandshake runs synchronously right after a successful handshake, before
-	// OnConnected and the read loop, so the connector can set state (for example a
-	// critical-patch gate) before any message is dispatched.
+	// OnHandshake runs synchronously when the gateway accepts the HELLO (handshake_ok),
+	// before OnConnected and the read loop, so the connector can set state (for example a
+	// critical-patch gate) before any message is dispatched. On first-run registration it
+	// runs before the generated key is persisted, so a later key-save failure still aborts
+	// the connection even though OnHandshake already ran.
 	OnHandshake(info HandshakeInfo)
 
 	// OnConnected runs once after the handshake, before the heartbeat and read loop.
 	// ctx is cancelled when the connection ends, so the Handler may start
-	// connection-lifetime goroutines on it; it must bound its own writes.
+	// connection-lifetime goroutines on it; it must bound its own writes. A write failure
+	// here is only logged — OnConnected cannot abort the connection.
 	OnConnected(ctx context.Context, s Sender)
 
 	// OnHeartbeat runs on each heartbeat tick after the ping and health message have
 	// succeeded, on the tick's 10s-bounded ctx. Returning an error closes the
-	// connection, exactly as a failed health write does.
+	// connection, exactly as a failed health write does. It runs on its own goroutine and
+	// may therefore overlap a HandleMessage call.
 	OnHeartbeat(ctx context.Context, s Sender) error
 
-	// HandleMessage dispatches one inbound message the gateway does not consume
-	// itself. The gateway consumes challenge, handshake_* and going_away.
+	// HandleMessage dispatches one inbound message the read loop does not consume itself.
+	// During the read loop the gateway consumes only going_away; the challenge and
+	// handshake_* messages are consumed earlier, during the handshake, and never reach
+	// here. It runs synchronously on the read loop, so a slow handler delays later reads —
+	// offload long work to a goroutine. ctx is the process-lifetime Connect context, not a
+	// connection context: it is not cancelled when the connection drops, so work spawned on
+	// it must bound itself or watch for Send errors.
 	HandleMessage(ctx context.Context, s Sender, typ string, raw json.RawMessage)
 
-	// OnDraining runs on a going_away message before the connection is torn down.
+	// OnDraining runs on a going_away message before the connection is torn down. Like
+	// HandleMessage it runs synchronously on the read loop and receives the process-lifetime
+	// Connect context; the Handler owns any timeout on its drain.
 	OnDraining(ctx context.Context)
 }
 
-// handshakeTimeout mirrors the gateway's own handshakeTimeout (registration.go) — the gateway
-// gives up on a stalled handshake after 30s, so a connector should too rather than blocking
-// Connect (and therefore Run's reconnect backoff) forever on a stuck read.
+// handshakeTimeout mirrors the gateway's own handshake timeout — the gateway gives up on a
+// stalled handshake after 30s, so a connector should too rather than blocking Connect (and
+// therefore Run's reconnect backoff) forever on a stuck read.
 const handshakeTimeout = 30 * time.Second
+
+// defaultReadLimit caps a single inbound message at 64 MiB when Config.ReadLimit is zero.
+// The API connector's largest message is a proxied HTTP response — a 32 MiB body plus the
+// ~33% base64/JSON envelope overhead — so a connector kind with larger payloads must raise
+// it via Config.ReadLimit.
+const defaultReadLimit int64 = 64 << 20
 
 // dialTimeout bounds a single websocket.Dial attempt (TCP connect, TLS, and the HTTP upgrade
 // request/response). Without it the dial runs on Run's process-lifetime context, so a dial that
@@ -90,7 +127,8 @@ var dialTimeout = 30 * time.Second
 // need to observe a heartbeat without waiting 30s of real time.
 var heartbeatInterval = 30 * time.Second
 
-// Client is the reusable gateway connection for one connector kind.
+// Client is the reusable Bridge Gateway connection. A Handler supplies the behaviour of a
+// particular connector kind; Client itself is kind-agnostic.
 type Client struct {
 	cfg      Config
 	keyStore *auth.KeyStore
@@ -102,6 +140,15 @@ type Client struct {
 // to handler.
 func NewClient(cfg Config, keyStore *auth.KeyStore, handler Handler) *Client {
 	return &Client{cfg: cfg, keyStore: keyStore, handler: handler}
+}
+
+// readLimit returns the configured inbound-message size cap, or defaultReadLimit when
+// Config.ReadLimit is unset.
+func (c *Client) readLimit() int64 {
+	if c.cfg.ReadLimit > 0 {
+		return c.cfg.ReadLimit
+	}
+	return defaultReadLimit
 }
 
 // connSender binds a connection to the client's write mutex as a Sender.
@@ -149,9 +196,9 @@ func (c *Client) Run(ctx context.Context) {
 			return
 		}
 		// A brief jittered pause before reconnecting avoids immediately bouncing back onto
-		// a gateway pod that just told us it's draining (going_away): the pod keeps
-		// accepting new connections until its own GracefulDrainSecs window elapses, so an
-		// instant reconnect can land right back on it and get force-closed again.
+		// a gateway instance that just told us it's draining (going_away): a draining
+		// instance keeps accepting new connections until its own graceful-drain window
+		// elapses, so an instant reconnect can land right back on it and get force-closed.
 		select {
 		case <-time.After(reconnectPause()):
 		case <-ctx.Done():
@@ -205,15 +252,14 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("ws dial: %w", err)
 	}
 	defer conn.CloseNow() //nolint:errcheck
-	// Allow messages up to 64 MiB (32 MiB body + ~33% base64/JSON overhead).
-	conn.SetReadLimit(64 << 20)
+	conn.SetReadLimit(c.readLimit())
 
 	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelHandshake()
 
 	// The gateway always sends the challenge first, before reading HELLO — for both
 	// first-run registration (which ignores it, using the registration token instead)
-	// and reconnect (which signs it). See handler.go's Handle() in bridge-gateway.
+	// and reconnect (which signs it).
 	challenge, err := c.readChallenge(handshakeCtx, conn)
 	if err != nil {
 		return fmt.Errorf("read challenge: %w", err)
@@ -240,12 +286,11 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.handler.OnConnected(connCtx, sender)
 
 	// Heartbeat: a WebSocket-level ping (waits for a pong; this is what actually detects a
-	// half-open/zombie TCP connection the gateway has stopped reading from — e.g. router.go's
-	// SQS-init-failure path returns without ever reading again, so only a pong-requiring ping
-	// notices) AND an application-level health message (the only thing the gateway's Route()
-	// loop actually reads to refresh last_health_at — a ping/pong frame is invisible to it).
-	// After both succeed, the Handler's OnHeartbeat runs on the same tick. Any failure closes
-	// the connection.
+	// half-open/zombie TCP connection the gateway has stopped reading from, which an
+	// application-level message alone would not notice) AND an application-level health
+	// message (the only thing the gateway reads to refresh its last-health timestamp — a
+	// ping/pong control frame is invisible to that bookkeeping). After both succeed, the
+	// Handler's OnHeartbeat runs on the same tick. Any failure closes the connection.
 	hbInterval := heartbeatInterval // snapshot before goroutine; avoids a race with the test seam
 	go func() {
 		ticker := time.NewTicker(hbInterval)
