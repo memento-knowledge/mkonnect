@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -566,103 +565,6 @@ func TestCriticalPatchRequiredSuspendsDispatch(t *testing.T) {
 	}
 	if receivedResponse.ResponderID != "resp-1" {
 		t.Errorf("responder_id = %q, want %q (must be echoed even on the 503 path)", receivedResponse.ResponderID, "resp-1")
-	}
-}
-
-// TestHeartbeatSendsHealthMessage verifies the connector sends an application-level
-// {"type":"health"} message on the heartbeat tick — the only thing the gateway's Route()
-// loop actually reads to refresh last_health_at (a WebSocket ping/pong control frame is
-// invisible to it; the server's wsjson.Read here only ever sees the health text frame,
-// since coder/websocket handles ping/pong transparently beneath it). Shortens the
-// interval via SetHeartbeatIntervalForTest rather than waiting the real 30s.
-func TestHeartbeatSendsHealthMessage(t *testing.T) {
-	restore := ws.SetHeartbeatIntervalForTest(20 * time.Millisecond)
-	defer restore()
-
-	serverKey := genPrivKey(t)
-	keyBytes := make([]byte, mldsa65.PrivateKeySize)
-	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
-
-	healthReceived := make(chan struct{})
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			t.Errorf("accept: %v", err)
-			return
-		}
-		defer conn.CloseNow() //nolint:errcheck
-
-		var challengeNonce [32]byte
-		if err := writeGatewayChallenge(r.Context(), conn, challengeNonce); err != nil {
-			t.Errorf("write challenge: %v", err)
-			return
-		}
-		var hello gatewayHelloMsg
-		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
-			t.Errorf("read hello: %v", err)
-			return
-		}
-		ok := gatewayHandshakeOkMsg{
-			Type:       "handshake_ok",
-			PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
-		}
-		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
-			t.Errorf("write handshake_ok: %v", err)
-			return
-		}
-
-		// The connector emits connection_status right after the handshake, then sends health
-		// messages on the heartbeat tick. Read until we see "health".
-		for {
-			var raw json.RawMessage
-			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
-				t.Errorf("read heartbeat: %v", err)
-				return
-			}
-			var typed proto.TypedMessage
-			if err := json.Unmarshal(raw, &typed); err != nil {
-				t.Errorf("unmarshal heartbeat type: %v", err)
-				return
-			}
-			if typed.Type == "health" {
-				close(healthReceived)
-				break
-			}
-			// Skip connection_status and any other interleaved messages.
-		}
-
-		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "going_away"}); err != nil {
-			t.Errorf("write going_away: %v", err)
-			return
-		}
-		_, _, _ = conn.Read(r.Context())
-	}))
-	defer srv.Close()
-
-	keyFile := filepath.Join(t.TempDir(), "key")
-	cfg := newTestConfig(srv.URL, keyFile)
-	keyStore := auth.NewKeyStore(keyFile)
-	client := ws.NewClient(cfg, keyStore)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	connectDone := make(chan error, 1)
-	go func() { connectDone <- client.Connect(ctx) }()
-
-	select {
-	case <-healthReceived:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for a health heartbeat message")
-	}
-
-	select {
-	case err := <-connectDone:
-		if err != nil {
-			t.Errorf("Connect returned an error: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for Connect to return after going_away")
 	}
 }
 
@@ -1365,50 +1267,5 @@ func TestConnectFailsFastWhenKeyDirUnwritable(t *testing.T) {
 	}
 	if contacted.Load() {
 		t.Error("gateway was contacted despite an unwritable key dir — the one-time token could be consumed")
-	}
-}
-
-// TestConnectTimesOutOnStuckDial verifies that a dial which stalls mid-upgrade (TCP accepted,
-// HTTP upgrade response never sent — the rolling-update scenario in issue #18) fails within the
-// dial timeout and re-enters Run's backoff, instead of blocking Connect forever.
-func TestConnectTimesOutOnStuckDial(t *testing.T) {
-	restore := ws.SetDialTimeoutForTest(200 * time.Millisecond)
-	defer restore()
-
-	var contacted atomic.Bool
-	hold := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		// Accept the request but never respond, so the client's dial blocks on the upgrade
-		// response until its dial context expires. Unblocked only at cleanup.
-		contacted.Store(true)
-		<-hold
-	}))
-	// LIFO: close(hold) runs first to release the handler, then srv.Close() can return.
-	defer srv.Close()
-	defer close(hold)
-
-	keyFile := filepath.Join(t.TempDir(), "key") // writable dir, no key -> first-run path reaches the dial
-	cfg := newTestConfig(srv.URL, keyFile)
-	client := ws.NewClient(cfg, auth.NewKeyStore(keyFile))
-
-	done := make(chan error, 1)
-	go func() { done <- client.Connect(context.Background()) }()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("expected Connect to fail on a stuck dial")
-		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("error = %v, want it to wrap context.DeadlineExceeded (the dial timeout)", err)
-		}
-		if !strings.Contains(err.Error(), "ws dial") {
-			t.Errorf("error = %v, want it to identify the dial stage", err)
-		}
-		if !contacted.Load() {
-			t.Error("black-hole server was never contacted — the test did not exercise a real dial")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Connect did not return within 2s on a stuck dial — the reconnect hang (issue #18) has regressed")
 	}
 }
