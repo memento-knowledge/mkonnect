@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -56,13 +58,24 @@ func main() {
 	if localPath == "" {
 		localPath = defaultLocalConfigFile
 	}
-	local, err := gitsync.LoadLocalConfig(localPath)
+	local, err := gitsync.New(localPath)
 	if err != nil {
 		log.Fatalf("mkonnect-gitsync: local config load failed: %v", err)
 	}
 
-	log.Printf("mkonnect-gitsync starting — connector=%s gateway=%s protocol=%s version=%s",
-		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion, version.Version)
+	// The reachability probe shells out to git; warn loudly if the image lacks a usable git so the
+	// operator sees a packaging problem rather than silent "unreachable" results.
+	if ok, detail := gitsync.GitVersionOK(); !ok {
+		log.Printf("mkonnect-gitsync: WARNING: %s; the origin reachability check needs git >= 2.31", detail)
+	}
+
+	bootID, err := randomBootID()
+	if err != nil {
+		log.Fatalf("mkonnect-gitsync: could not generate a boot id: %v", err)
+	}
+
+	log.Printf("mkonnect-gitsync starting — connector=%s gateway=%s protocol=%s version=%s providers=%d",
+		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion, version.Version, len(local.Names()))
 
 	// No SIGHUP reload in Phase 2: there is nothing to reload yet (the local config is read
 	// once and the sync loop does not exist). A reload path arrives with the Phase 3/4 work
@@ -70,6 +83,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local)
+	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local, gitsync.NewGitProber(), nil, bootID)
 	client.Run(ctx)
+}
+
+// randomBootID returns a random per-process identifier so the platform can tell a status stream
+// apart from the one before a restart (a sequence number alone restarts at a lower value).
+func randomBootID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }

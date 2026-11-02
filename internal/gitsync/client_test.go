@@ -1,10 +1,13 @@
 package gitsync_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,9 +48,34 @@ func (s *stubSender) messages() []any {
 	return append([]any(nil), s.sent...)
 }
 
-// newTestClient builds a git-sync client with the given local config JSON (empty string = no
-// config file, i.e. an empty local config).
+// fakeProber returns a fixed result (or error) for every provider. A non-nil block channel makes
+// Probe wait for ctx cancellation (or the channel) so a test can exercise a cancelled probe.
+type fakeProber struct {
+	result gitsync.OriginResult
+	err    error
+	calls  atomic.Int32
+	block  chan struct{}
+}
+
+func (f *fakeProber) Probe(ctx context.Context, _ gitsync.LocalEntry) (gitsync.OriginResult, error) {
+	f.calls.Add(1)
+	if f.block != nil {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-f.block:
+		}
+	}
+	return f.result, f.err
+}
+
+func fixedNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
+
 func newTestClient(t *testing.T, localJSON string) *gitsync.Client {
+	return newTestClientP(t, localJSON, &fakeProber{result: gitsync.OriginReachable})
+}
+
+func newTestClientP(t *testing.T, localJSON string, p gitsync.OriginProber) *gitsync.Client {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "git-sync.json")
 	if localJSON != "" {
@@ -54,15 +83,14 @@ func newTestClient(t *testing.T, localJSON string) *gitsync.Client {
 			t.Fatalf("write local config: %v", err)
 		}
 	}
-	local, err := gitsync.LoadLocalConfig(path)
+	local, err := gitsync.New(path)
 	if err != nil {
 		t.Fatalf("load local config: %v", err)
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
-	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local)
+	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, fixedNow, "boot-test")
 }
 
-// lastStatus returns the most recent git_sync_status among the recorded messages.
 func lastStatus(t *testing.T, msgs []any) proto.GitSyncStatusMsg {
 	t.Helper()
 	for i := len(msgs) - 1; i >= 0; i-- {
@@ -74,112 +102,196 @@ func lastStatus(t *testing.T, msgs []any) proto.GitSyncStatusMsg {
 	return proto.GitSyncStatusMsg{}
 }
 
-const oneLocalRepo = `{"repo-a":{"origin_url":"https://git.example.com/a"}}`
+func repoStates(st proto.GitSyncStatusMsg) map[string]proto.GitSyncRepoStatus {
+	m := make(map[string]proto.GitSyncRepoStatus, len(st.Repositories))
+	for _, r := range st.Repositories {
+		m[r.RepoID] = r
+	}
+	return m
+}
 
-func TestHandleGitSyncConfigEmitsUnionStatus(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo)
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met within timeout")
+}
+
+const oneProvider = `{"origin":{"base_url":"https://git.example.com/"}}`
+
+// configJSON builds a git_sync_config frame. version is a JSON literal ("7", "null", "" to omit).
+// Each repo is {repo_id, origin_url, push_token_expires_at}; an empty expiry is omitted.
+func configJSON(version string, repos ...[3]string) json.RawMessage {
+	var sb strings.Builder
+	sb.WriteString(`{"type":"git_sync_config"`)
+	if version != "" {
+		sb.WriteString(`,"config_version":` + version)
+	}
+	sb.WriteString(`,"repositories":[`)
+	for i, r := range repos {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `{"repo_id":%q,"origin_url":%q`, r[0], r[1])
+		if r[2] != "" {
+			fmt.Fprintf(&sb, `,"push_token_expires_at":%q`, r[2])
+		}
+		sb.WriteString("}")
+	}
+	sb.WriteString("]}")
+	return json.RawMessage(sb.String())
+}
+
+func TestConfigAcceptedStatusEnvelope(t *testing.T) {
+	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
-	// repo-a is in local config; repo-b is platform-configured only.
-	raw := json.RawMessage(`{"type":"git_sync_config","repositories":[{"repo_key":"repo-a"},{"repo_key":"repo-b"}]}`)
-	c.HandleMessage(context.Background(), s, "git_sync_config", raw)
+	c.HandleMessage(context.Background(), s, "git_sync_config",
+		configJSON("7", [3]string{"repo-a", "https://git.example.com/team/a.git", "2026-01-01T00:00:00Z"}))
 
 	st := lastStatus(t, s.messages())
 	if st.Type != "git_sync_status" {
-		t.Errorf("type = %q, want git_sync_status", st.Type)
+		t.Errorf("type = %q", st.Type)
 	}
-	want := []proto.GitSyncRepoStatus{
-		{RepoKey: "repo-a", State: gitsync.StatePending},
-		{RepoKey: "repo-b", State: gitsync.StateNotConfigured},
+	if string(st.ConfigVersion) != "7" {
+		t.Errorf("config_version = %s, want 7", st.ConfigVersion)
 	}
-	if !reflect.DeepEqual(st.Repositories, want) {
-		t.Errorf("repositories = %+v, want %+v", st.Repositories, want)
+	if st.SentAt != "2026-01-02T03:04:05.000000000Z" {
+		t.Errorf("sent_at = %q, want fixed UTC with fraction", st.SentAt)
+	}
+	if st.BootID != "boot-test" {
+		t.Errorf("boot_id = %q", st.BootID)
+	}
+	if st.Sequence != 1 {
+		t.Errorf("sequence = %d, want 1 for the first status", st.Sequence)
+	}
+	if st.EarliestPushTokenExpiresAt == nil || *st.EarliestPushTokenExpiresAt != "2026-01-01T00:00:00Z" {
+		t.Errorf("earliest_push_token_expires_at = %v", st.EarliestPushTokenExpiresAt)
+	}
+	if got := repoStates(st)["repo-a"].State; got != gitsync.StatePending {
+		t.Errorf("repo-a state = %q, want pending", got)
 	}
 }
 
-func TestOnHeartbeatEmptyStatusMarshalsEmptyArray(t *testing.T) {
-	c := newTestClient(t, "")
+func TestHostMatchStates(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
+		[3]string{"repo-a", "https://git.example.com/a.git", ""},
+		[3]string{"repo-b", "https://other.example.com/b.git", ""}))
+
+	rs := repoStates(lastStatus(t, s.messages()))
+	if rs["repo-a"].State != gitsync.StatePending {
+		t.Errorf("matched repo-a state = %q, want pending", rs["repo-a"].State)
+	}
+	b := rs["repo-b"]
+	if b.State != gitsync.StateError || b.ErrorType != gitsync.ErrOriginAccessDenied || b.ErrorDetail != "host not configured locally" {
+		t.Errorf("unmatched repo-b = %+v, want error/origin_access_denied/host not configured locally", b)
+	}
+	// The error detail must never carry the actual host.
+	if strings.Contains(b.ErrorDetail, "other.example.com") {
+		t.Error("error_detail leaked the origin host")
+	}
+}
+
+func TestStatusNullBeforeConfig(t *testing.T) {
+	c := newTestClient(t, "") // empty local config: no probe fires
 	s := &stubSender{}
 	if err := c.OnHeartbeat(context.Background(), s); err != nil {
 		t.Fatalf("OnHeartbeat: %v", err)
 	}
 	st := lastStatus(t, s.messages())
+	if st.ConfigVersion != nil || st.EarliestPushTokenExpiresAt != nil {
+		t.Errorf("config_version/earliest should be nil before any config, got %s / %v", st.ConfigVersion, st.EarliestPushTokenExpiresAt)
+	}
 	b, err := json.Marshal(st)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if !strings.Contains(string(b), `"repositories":[]`) {
-		t.Errorf("empty status must marshal repositories as [], got %s", b)
+	for _, want := range []string{`"config_version":null`, `"earliest_push_token_expires_at":null`, `"repositories":[]`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("status missing %s: %s", want, b)
+		}
 	}
 }
 
-// configRepos is a git_sync_config raw frame naming the given repo keys.
-func configRepos(keys ...string) json.RawMessage {
-	msg := proto.GitSyncConfigMsg{Type: "git_sync_config"}
-	for _, k := range keys {
-		msg.Repositories = append(msg.Repositories, proto.GitSyncRepoConfig{RepoKey: k})
+func TestSequenceIncrementsBootStable(t *testing.T) {
+	c := newTestClient(t, "")
+	s := &stubSender{}
+	_ = c.OnHeartbeat(context.Background(), s)
+	_ = c.OnHeartbeat(context.Background(), s)
+	msgs := s.messages()
+	st1, st2 := msgs[0].(proto.GitSyncStatusMsg), msgs[1].(proto.GitSyncStatusMsg)
+	if st1.Sequence != 1 || st2.Sequence != 2 {
+		t.Errorf("sequences = %d,%d, want 1,2", st1.Sequence, st2.Sequence)
 	}
-	b, _ := json.Marshal(msg)
-	return b
-}
-
-func TestSyncNowEmptyKeyTargetsSyncableOnly(t *testing.T) {
-	// Local config has repo-a and repo-b; the platform configures repo-a and repo-c.
-	// Syncable = platform-configured AND local = {repo-a}. repo-b (local only) and repo-c
-	// (configured, no local creds) are NOT sync targets.
-	c := newTestClient(t, `{"repo-a":{"origin_url":"https://git.example.com/a"},"repo-b":{"origin_url":"https://git.example.com/b"}}`)
-	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configRepos("repo-a", "repo-c"))
-
-	got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now"})
-	if !reflect.DeepEqual(got, []string{"repo-a"}) {
-		t.Errorf("empty-key targets = %v, want [repo-a] (configured ∩ local)", got)
+	if st1.BootID != "boot-test" || st2.BootID != "boot-test" {
+		t.Errorf("boot_id not stable: %q %q", st1.BootID, st2.BootID)
 	}
 }
 
-func TestSyncNowRejectsNonSyncableRepo(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo) // local: repo-a, but no platform config yet
-	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configRepos("repo-c"))
-	// repo-a is local-only (not configured) -> not syncable; repo-x is unknown; repo-c has no
-	// local creds. None resolve to a target.
-	for _, key := range []string{"repo-a", "repo-c", "repo-x"} {
-		if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now", RepoKey: key}); got != nil {
-			t.Errorf("repo %q should not be a sync target, got %v", key, got)
+func TestApplyConfigValidationRejected(t *testing.T) {
+	cases := map[string]string{
+		"absent repositories": `{"type":"git_sync_config","config_version":1}`,
+		"duplicate repo_id":   `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"},{"repo_id":"x","origin_url":"https://git.example.com/b"}]}`,
+		"empty repo_id":       `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"","origin_url":"https://git.example.com/a"}]}`,
+		"non-scalar version":  `{"type":"git_sync_config","config_version":{"n":1},"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"}]}`,
+	}
+	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
+	cases["oversized repo_id"] = oversized
+
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClient(t, "")
+			s := &stubSender{}
+			c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(raw))
+			// A rejected config emits no status and leaves the connector unconfigured.
+			if n := len(s.messages()); n != 0 {
+				t.Errorf("rejected config emitted %d status messages, want 0", n)
+			}
+			if err := c.OnHeartbeat(context.Background(), s); err != nil {
+				t.Fatalf("OnHeartbeat: %v", err)
+			}
+			st := lastStatus(t, s.messages())
+			if len(st.Repositories) != 0 || st.ConfigVersion != nil {
+				t.Errorf("configuration should be unchanged after rejection: repos=%v version=%s", st.Repositories, st.ConfigVersion)
+			}
+		})
+	}
+}
+
+func TestSyncNowMatchableOnly(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1",
+		[3]string{"repo-a", "https://git.example.com/a.git", ""},
+		[3]string{"repo-b", "https://other.example.com/b.git", ""}))
+
+	if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now"}); !reflect.DeepEqual(got, []string{"repo-a"}) {
+		t.Errorf("empty repo_id targets = %v, want [repo-a] (host-matched only)", got)
+	}
+	for _, id := range []string{"repo-b", "repo-unknown"} {
+		if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now", RepoID: id}); got != nil {
+			t.Errorf("repo %q should not be a target, got %v", id, got)
 		}
 	}
 }
 
 func TestSyncNowSuppressedByCriticalPatch(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo)
+	c := newTestClient(t, oneProvider)
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
 	c.SetCriticalPatchForTest(true)
 	if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now"}); got != nil {
-		t.Errorf("critical patch must suppress sync, got targets %v", got)
+		t.Errorf("critical patch must suppress sync, got %v", got)
 	}
 }
 
-func TestMalformedMessagesAreIgnored(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo)
-	s := &stubSender{}
-	// A malformed config or now frame is logged and dropped before any status is emitted, and
-	// an unknown type is ignored entirely — none of these send a message or panic.
-	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(`{"repositories":"nope"}`))
-	c.HandleMessage(context.Background(), s, "git_sync_now", json.RawMessage(`{"repo_key":123}`))
-	c.HandleMessage(context.Background(), s, "something_else", json.RawMessage(`{}`))
-	if n := len(s.messages()); n != 0 {
-		t.Errorf("malformed/unknown messages sent %d replies, want 0", n)
-	}
-	// The desired repo set is unchanged: a well-formed git_sync_now still targets the local repo
-	// once the platform configures it.
-	c.HandleMessage(context.Background(), s, "git_sync_config", configRepos("repo-a"))
-	if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now"}); !reflect.DeepEqual(got, []string{"repo-a"}) {
-		t.Errorf("after a malformed config, a valid one still applies: targets = %v, want [repo-a]", got)
-	}
-}
-
-// TestCriticalPatchGateViaHandleMessage exercises the gate through the real dispatch path, not
-// only the test seam: git_sync_now under a critical patch still emits a status (acknowledgement)
-// but must not resolve any sync targets.
 func TestCriticalPatchGateViaHandleMessage(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo)
-	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configRepos("repo-a"))
+	c := newTestClient(t, oneProvider)
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
 	c.SetCriticalPatchForTest(true)
 
 	s := &stubSender{}
@@ -192,19 +304,132 @@ func TestCriticalPatchGateViaHandleMessage(t *testing.T) {
 	}
 }
 
-// TestConcurrentConfigAndHeartbeat exercises the documented overlap of OnHeartbeat (its own
-// goroutine) and HandleMessage (the read loop). Run under -race.
-func TestConcurrentConfigAndHeartbeat(t *testing.T) {
-	c := newTestClient(t, oneLocalRepo)
+func TestMalformedMessagesAreIgnored(t *testing.T) {
+	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
-	configRaw := json.RawMessage(`{"type":"git_sync_config","repositories":[{"repo_key":"repo-b"},{"repo_key":"repo-c"}]}`)
+	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(`{"repositories":"nope"}`))
+	c.HandleMessage(context.Background(), s, "git_sync_now", json.RawMessage(`{"repo_id":123}`))
+	c.HandleMessage(context.Background(), s, "something_else", json.RawMessage(`{}`))
+	if n := len(s.messages()); n != 0 {
+		t.Errorf("malformed/unknown messages sent %d replies, want 0", n)
+	}
+	// A valid config still applies afterwards.
+	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
+	if got := c.HandleSyncNowForTest(proto.GitSyncNowMsg{Type: "git_sync_now"}); !reflect.DeepEqual(got, []string{"repo-a"}) {
+		t.Errorf("after a malformed config, a valid one still applies: targets = %v", got)
+	}
+}
+
+func TestPushTokenNeverLogged(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(old)
+
+	c := newTestClient(t, oneProvider)
+	token := "secret-push-token-zzzz9999"
+	raw := json.RawMessage(fmt.Sprintf(`{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"repo-a","origin_url":"https://git.example.com/a.git","push_token":%q}]}`, token))
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", raw)
+	if strings.Contains(buf.String(), token) {
+		t.Errorf("push token leaked into logs: %s", buf.String())
+	}
+}
+
+func TestWireStringsPinned(t *testing.T) {
+	if gitsync.StatePending != "pending" || gitsync.StateSyncing != "syncing" || gitsync.StateOK != "ok" || gitsync.StateError != "error" {
+		t.Error("repository state wire strings drifted")
+	}
+	gotErrs := []string{
+		gitsync.ErrOriginUnreachable, gitsync.ErrOriginAccessDenied, gitsync.ErrReplicaUnreachable,
+		gitsync.ErrCredentialRejected, gitsync.ErrReplicaRejected, gitsync.ErrPushTimeout,
+		gitsync.ErrLocalDiskExhausted, gitsync.ErrJobOutOfMemory, gitsync.ErrRepositoryOverLimit,
+		gitsync.ErrPushTokenExpired, gitsync.ErrUnclassified,
+	}
+	wantErrs := []string{
+		"origin_unreachable", "origin_access_denied", "replica_unreachable", "credential_rejected",
+		"replica_rejected", "push_timeout", "local_disk_exhausted", "job_out_of_memory",
+		"repository_over_limit", "push_token_expired", "unclassified",
+	}
+	if !reflect.DeepEqual(gotErrs, wantErrs) {
+		t.Errorf("error_type wire strings drifted:\n got %v\nwant %v", gotErrs, wantErrs)
+	}
+	if gitsync.WarnLFSNotReplicated != "lfs_not_replicated" {
+		t.Errorf("warning string drifted: %q", gitsync.WarnLFSNotReplicated)
+	}
+}
+
+func TestOriginCheckPreConfigThenAbsent(t *testing.T) {
+	prober := &fakeProber{result: gitsync.OriginAccessDenied}
+	c := newTestClientP(t, oneProvider, prober)
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+
+	waitFor(t, func() bool {
+		for _, m := range s.messages() {
+			if st, ok := m.(proto.GitSyncStatusMsg); ok && st.OriginCheck != nil {
+				return true
+			}
+		}
+		return false
+	})
+	st := lastStatus(t, s.messages())
+	if st.OriginCheck == nil || st.OriginCheck.Result != "access_denied" || st.OriginCheck.CheckedAt == "" {
+		t.Errorf("origin_check = %+v, want access_denied with a checked_at", st.OriginCheck)
+	}
+
+	// Once configuration is accepted, origin_check is no longer reported.
+	c.HandleMessage(ctx, s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
+	if lastStatus(t, s.messages()).OriginCheck != nil {
+		t.Error("origin_check should be absent once config is accepted")
+	}
+}
+
+func TestOriginCheckAbsentWithoutLocalEntries(t *testing.T) {
+	prober := &fakeProber{result: gitsync.OriginReachable}
+	c := newTestClientP(t, "", prober)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	time.Sleep(50 * time.Millisecond)
+	if prober.calls.Load() != 0 {
+		t.Errorf("prober ran %d times with no local providers, want 0", prober.calls.Load())
+	}
+	for _, m := range s.messages() {
+		if st, ok := m.(proto.GitSyncStatusMsg); ok && st.OriginCheck != nil {
+			t.Error("origin_check should be absent without local providers")
+		}
+	}
+}
+
+func TestOriginCheckNotCachedOnCancel(t *testing.T) {
+	prober := &fakeProber{result: gitsync.OriginReachable, block: make(chan struct{})}
+	c := newTestClientP(t, oneProvider, prober)
+	s := &stubSender{}
+	ctx, cancel := context.WithCancel(context.Background())
+	c.OnConnected(ctx, s)
+	waitFor(t, func() bool { return prober.calls.Load() >= 1 })
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	for _, m := range s.messages() {
+		if st, ok := m.(proto.GitSyncStatusMsg); ok && st.OriginCheck != nil {
+			t.Error("a cancelled probe must not be cached as an origin_check")
+		}
+	}
+}
+
+// TestConcurrentConfigAndHeartbeat exercises the documented overlap of OnHeartbeat (its own
+// goroutine) and HandleMessage (the read loop). Empty local config keeps the probe out of the way.
+func TestConcurrentConfigAndHeartbeat(t *testing.T) {
+	c := newTestClient(t, "")
+	s := &stubSender{}
+	cfgRaw := configJSON("1", [3]string{"repo-b", "https://b.example.com/b", ""}, [3]string{"repo-c", "https://c.example.com/c", ""})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		for range 200 {
-			c.HandleMessage(context.Background(), s, "git_sync_config", configRaw)
+			c.HandleMessage(context.Background(), s, "git_sync_config", cfgRaw)
 		}
 	}()
 	go func() {
@@ -221,9 +446,6 @@ func TestConcurrentConfigAndHeartbeat(t *testing.T) {
 
 // --- end-to-end enrollment through the gateway ---
 
-// gatewayHelloMsg / gatewayHandshakeOkMsg are independent copies of the Bridge Gateway's wire
-// shapes (Signature/PrivateKey are base64 strings there), so a bug in mkonnect's proto encoding
-// cannot be masked by sharing a type across both ends — the same discipline the gateway tests use.
 type gatewayHelloMsg struct {
 	Type              string `json:"type"`
 	ConnectorID       string `json:"connector_id"`
@@ -238,9 +460,9 @@ type gatewayHandshakeOkMsg struct {
 	PrivateKey string `json:"private_key,omitempty"`
 }
 
-// TestEnrollsAndDispatchesStatus runs the real gateway client against a test server: the
-// connector registers, emits an initial git_sync_status on connect, and emits a second one in
-// response to a git_sync_now. health frames are filtered out.
+// TestEnrollsAndDispatchesStatus runs the real gateway client against a test server: the connector
+// registers, emits an initial git_sync_status, and after the server pushes a git_sync_config emits a
+// status reporting the configured repository as pending.
 func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	_, serverKey, err := mldsa65.GenerateKey(rand.Reader)
 	if err != nil {
@@ -249,7 +471,7 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	keyBytes := make([]byte, mldsa65.PrivateKeySize)
 	serverKey.Pack((*[mldsa65.PrivateKeySize]byte)(keyBytes))
 
-	statuses := make(chan proto.GitSyncStatusMsg, 4)
+	statuses := make(chan proto.GitSyncStatusMsg, 8)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
@@ -263,27 +485,25 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 		if err := wsjson.Write(r.Context(), conn, map[string]string{
 			"type": "challenge", "challenge": base64.StdEncoding.EncodeToString(nonce[:]),
 		}); err != nil {
-			t.Errorf("write challenge: %v", err)
 			return
 		}
 		var hello gatewayHelloMsg
 		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
-			t.Errorf("read hello: %v", err)
 			return
 		}
 		if err := wsjson.Write(r.Context(), conn, gatewayHandshakeOkMsg{
 			Type: "handshake_ok", PrivateKey: base64.StdEncoding.EncodeToString(keyBytes),
 		}); err != nil {
-			t.Errorf("write handshake_ok: %v", err)
 			return
 		}
-		// Ask for an immediate sync; the connector should answer with a git_sync_status.
-		if err := wsjson.Write(r.Context(), conn, map[string]string{"type": "git_sync_now"}); err != nil {
-			t.Errorf("write git_sync_now: %v", err)
+		// Push a configuration naming one repository whose origin matches the local provider.
+		if err := wsjson.Write(r.Context(), conn, map[string]any{
+			"type":           "git_sync_config",
+			"config_version": 1,
+			"repositories":   []map[string]any{{"repo_id": "repo-a", "origin_url": "https://git.example.com/a.git"}},
+		}); err != nil {
 			return
 		}
-		// Read frames, forwarding git_sync_status and ignoring health, until the client is told
-		// to go away (after the test has what it needs).
 		for {
 			var raw json.RawMessage
 			if err := wsjson.Read(r.Context(), conn, &raw); err != nil {
@@ -291,13 +511,11 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 			}
 			var typed proto.TypedMessage
 			if err := json.Unmarshal(raw, &typed); err != nil {
-				t.Errorf("unmarshal type: %v", err)
 				return
 			}
 			if typed.Type == "git_sync_status" {
 				var st proto.GitSyncStatusMsg
 				if err := json.Unmarshal(raw, &st); err != nil {
-					t.Errorf("unmarshal git_sync_status: %v", err)
 					return
 				}
 				statuses <- st
@@ -307,48 +525,42 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	defer srv.Close()
 
 	localPath := filepath.Join(t.TempDir(), "git-sync.json")
-	if err := os.WriteFile(localPath, []byte(oneLocalRepo), 0o600); err != nil {
+	if err := os.WriteFile(localPath, []byte(oneProvider), 0o600); err != nil {
 		t.Fatalf("write local config: %v", err)
 	}
-	local, err := gitsync.LoadLocalConfig(localPath)
+	local, err := gitsync.New(localPath)
 	if err != nil {
 		t.Fatalf("local config: %v", err)
 	}
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
 	cfg := &config.Config{GatewayURL: wsURL, ConnectorID: "gitsync-test", ProtocolVersion: "v1", RegistrationToken: "tok-test"}
-	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local)
+	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local,
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, "boot-test")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	connectDone := make(chan error, 1)
 	go func() { connectDone <- c.Connect(ctx) }()
 
-	// Expect two statuses: one from OnConnected, one answering git_sync_now.
-	for i := 0; i < 2; i++ {
+	// Wait for a status that reports repo-a as pending (the one emitted after the config push).
+	deadline := time.After(3 * time.Second)
+	for {
 		select {
 		case st := <-statuses:
-			if st.Type != "git_sync_status" {
-				t.Errorf("status type = %q", st.Type)
+			if st.Type != "git_sync_status" || st.BootID != "boot-test" {
+				t.Errorf("unexpected status envelope: %+v", st)
 			}
-			if !reflect.DeepEqual(reposKeys(st), []string{"repo-a"}) {
-				t.Errorf("status repos = %v, want [repo-a]", reposKeys(st))
+			if rs := repoStates(st); rs["repo-a"].State == gitsync.StatePending {
+				cancel()
+				select {
+				case <-connectDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("Connect did not return after cancel")
+				}
+				return
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for git_sync_status #%d", i+1)
+		case <-deadline:
+			t.Fatal("timed out waiting for a git_sync_status reporting repo-a pending")
 		}
 	}
-	cancel()
-	select {
-	case <-connectDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Connect did not return after context cancel")
-	}
-}
-
-func reposKeys(st proto.GitSyncStatusMsg) []string {
-	keys := make([]string, 0, len(st.Repositories))
-	for _, r := range st.Repositories {
-		keys = append(keys, r.RepoKey)
-	}
-	return keys
 }

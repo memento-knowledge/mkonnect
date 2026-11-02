@@ -49,6 +49,34 @@ type gitProber struct {
 // NewGitProber returns a prober backed by the git binary.
 func NewGitProber() *gitProber { return &gitProber{run: runGit} }
 
+// GitVersionOK reports whether a git that supports GIT_CONFIG_* credential injection (>= 2.31) is
+// available on PATH. When it returns false, the reachability probe cannot inject the credential and
+// the git-sync image is misconfigured — a packaging concern, surfaced as a startup warning.
+func GitVersionOK() (ok bool, detail string) {
+	out, err := exec.Command("git", "--version").Output()
+	if err != nil {
+		return false, "git was not found on PATH"
+	}
+	fields := strings.Fields(string(out)) // e.g. "git version 2.39.3"
+	if len(fields) < 3 {
+		return false, "unrecognised `git --version` output"
+	}
+	ver := fields[2]
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) < 2 {
+		return false, "unrecognised git version " + ver
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false, "unrecognised git version " + ver
+	}
+	if major > 2 || (major == 2 && minor >= 31) {
+		return true, ver
+	}
+	return false, "git " + ver + " is older than the required 2.31"
+}
+
 // Probe runs `git ls-remote` against the entry's base URL. The credential is injected through the
 // environment (never argv or the URL, so it cannot appear in `ps`/other users' process listings),
 // and git is run with a locked-down environment so no ambient config, credential helper, or askpass
