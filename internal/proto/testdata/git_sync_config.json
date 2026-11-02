@@ -1,0 +1,12 @@
+{
+  "type": "git_sync_config",
+  "repositories": [
+    {
+      "repo_key": "repo-a",
+      "branches": ["main", "release/1.x"]
+    },
+    {
+      "repo_key": "repo-b"
+    }
+  ]
+}

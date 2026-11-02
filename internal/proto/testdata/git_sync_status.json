@@ -1,0 +1,15 @@
+{
+  "type": "git_sync_status",
+  "repositories": [
+    {
+      "repo_key": "repo-a",
+      "state": "pending",
+      "origin_default_branch": "main"
+    },
+    {
+      "repo_key": "repo-b",
+      "state": "error",
+      "error_detail": "authentication failed"
+    }
+  ]
+}
