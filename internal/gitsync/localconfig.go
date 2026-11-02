@@ -36,6 +36,19 @@ import (
 // diverge as the git-sync credential model is hardened in Phase 4.
 const minTokenLength = 16
 
+// DefaultConfigFile is where the provider config is read from when GIT_SYNC_CONFIG_FILE is unset.
+// Nothing mounts this path yet; packaging is tracked separately.
+const DefaultConfigFile = "/data/git-sync.json"
+
+// DefaultConfigPath returns the provider-config path from GIT_SYNC_CONFIG_FILE, or the default. It
+// is shared by the daemon and the operator CLI so the two never read or write different files.
+func DefaultConfigPath() string {
+	if p := os.Getenv("GIT_SYNC_CONFIG_FILE"); p != "" {
+		return p
+	}
+	return DefaultConfigFile
+}
+
 // secretRedaction is what a Secret renders as everywhere except an explicit Reveal.
 const secretRedaction = "<redacted>"
 

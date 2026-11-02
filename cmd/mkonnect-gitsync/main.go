@@ -23,16 +23,21 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
 	"github.com/memento-knowledge/mkonnect/internal/gitsync"
+	"github.com/memento-knowledge/mkonnect/internal/gitsync/cli"
 	"github.com/memento-knowledge/mkonnect/internal/version"
 )
 
-// defaultLocalConfigFile is where the git-sync local repository config is read from when
-// GIT_SYNC_CONFIG_FILE is unset. It sits alongside the API connector's credentials.json on the
-// same data volume. NOTE (provisional): the env var name and this path are not yet finalised,
-// and nothing mounts this file yet — see memento-knowledge/mkonnect#48 for packaging.
-const defaultLocalConfigFile = "/data/git-sync.json"
-
 func main() {
+	// Operator CLI: `mkonnect-gitsync connector <config|status> ...`. Handled before loading daemon
+	// configuration so an admin can configure credentials without a running connector.
+	if len(os.Args) > 1 && os.Args[1] == "connector" {
+		if err := cli.Run(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "connector: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Kubernetes health probe, matching the API connector's no-op liveness contract.
 	if len(os.Args) > 1 && os.Args[1] == "--health" {
 		os.Exit(0)
@@ -54,11 +59,7 @@ func main() {
 		}
 	}
 
-	localPath := os.Getenv("GIT_SYNC_CONFIG_FILE")
-	if localPath == "" {
-		localPath = defaultLocalConfigFile
-	}
-	local, err := gitsync.New(localPath)
+	local, err := gitsync.New(gitsync.DefaultConfigPath())
 	if err != nil {
 		log.Fatalf("mkonnect-gitsync: local config load failed: %v", err)
 	}
