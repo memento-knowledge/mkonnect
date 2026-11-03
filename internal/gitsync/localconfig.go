@@ -3,9 +3,8 @@
 // The connection lifecycle (dial, enrollment, handshake, heartbeat, reconnect) lives in
 // internal/gateway, which this package drives — exactly as the API connector in internal/ws does.
 //
-// This is a Phase 2 skeleton: the sync algorithm itself is not implemented (see the
-// TODO(phase-3) markers), and the local credential surface here is intentionally minimal —
-// full credential hardening is Phase 4.
+// The local credential surface here is intentionally minimal — full credential hardening (at-rest
+// protection, live reload) is future work.
 package gitsync
 
 import (
@@ -80,14 +79,14 @@ func readOnlyModeAcceptable(mode os.FileMode) bool {
 	return mode.Perm()&0o027 == 0
 }
 
-// --- Provider-keyed local config (the confirmed Phase-2 model) ---
+// --- Provider-keyed local config ---
 //
-// The confirmed platform contract keys the local configuration by an operator-chosen provider
-// (remote) name carrying an origin BASE URL + credential, mirroring the API connector's
+// The platform contract keys the local configuration by an operator-chosen provider (remote) name
+// carrying an origin BASE URL + credential, mirroring the API connector's
 // `config set <name> --base-url ... --token-stdin`. A repository that the platform sends in
 // git_sync_config carries its own full origin_url; the connector binds it to a local provider by
 // canonical scheme+host+port (see canonicalRemoteURL and matchByHostKey) before it would ever use
-// the credential, and Phase 3 dials the re-serialized canonical URL, never the raw origin string.
+// the credential, and the sync dials the re-serialized canonical URL, never the raw origin string.
 
 // maxURLLength bounds a configured or platform-supplied URL so a hostile or malformed value cannot
 // define an absurdly long string that then appears in status, logs, or a subprocess environment.
@@ -226,15 +225,15 @@ func canonicalPort(u *url.URL) (string, error) {
 // canonicalRemoteURL validates raw and returns both its canonical host key (scheme://host:port, used
 // for provider matching and duplicate-host detection) and a re-serialized absolute URL whose
 // authority is exactly that canonical host:port, with the trailing FQDN dot stripped and the path
-// preserved. Phase 3 MUST dial fullURL rather than re-parsing the raw origin string: git's URL
-// parser and ours can diverge, so re-serializing from the validated host guarantees the host that
-// was match-checked is byte-for-byte the host that gets contacted.
+// preserved. The sync dials fullURL rather than re-parsing the raw origin string: git's URL parser
+// and ours can diverge, so re-serializing from the validated host guarantees the host that was
+// match-checked is byte-for-byte the host that gets contacted.
 //
 // Two normalizations are deliberate and safe here: the trailing FQDN dot is stripped and the
 // scheme's default port is made explicit. Both hostKey and fullURL are built from the SAME
 // canonicalized authority, so the match key and the dialed URL can never diverge from each other.
-// (Phase 3 must therefore pass credentials explicitly rather than rely on a git credential helper
-// keying on the un-normalized "scheme://host" form.)
+// (Credentials are therefore passed to git explicitly, scoped to fullURL, rather than through a git
+// credential helper keying on the un-normalized "scheme://host" form.)
 func canonicalRemoteURL(raw string) (hostKey, fullURL string, err error) {
 	u, err := validateRemoteURL(raw)
 	if err != nil {
@@ -302,7 +301,8 @@ func (e LocalEntry) Validate() error {
 		return fmt.Errorf("token must be at least %d characters", minTokenLength)
 	}
 	// Control characters are rejected because the token becomes an Authorization header value in a
-	// subprocess environment (Phase 2 probe, Phase 3 fetch); CR/LF/NUL there is an injection vector.
+	// subprocess environment (the reachability probe and the mirror fetch); CR/LF/NUL there is an
+	// injection vector.
 	if strings.ContainsFunc(token, func(r rune) bool { return unicode.IsControl(r) }) {
 		return errors.New("token must not contain control characters")
 	}
@@ -462,8 +462,8 @@ func (s *Store) Remove(name string) error {
 // the repository (origin_access_denied) rather than ever using a credential against an unexpected
 // host. Iteration is sorted for deterministic selection.
 //
-// Phase 3 must NOT use this to obtain a URL to dial: it discards the re-serialized canonical URL
-// and keeps only the raw origin. Resolve the match via canonicalRemoteURL (keeping its fullURL) and
+// Do NOT use this to obtain a URL to dial: it discards the re-serialized canonical URL and keeps
+// only the raw origin. Resolve the match via canonicalRemoteURL (keeping its fullURL) and
 // matchByHostKey instead, so the host that was match-checked is exactly the host that is contacted.
 // This entry point remains for a caller that only needs to know whether a provider exists.
 func (s *Store) MatchProvider(originURL string) (name string, e LocalEntry, ok bool) {

@@ -100,7 +100,28 @@ func newTestClientP(t *testing.T, localJSON string, p gitsync.OriginProber) *git
 }
 
 func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time) *gitsync.Client {
+	return newTestClientOpts(t, localJSON, p, now)
+}
+
+// newTestClientOpts builds a client whose git runner, by default, blocks until the test ends: a sync
+// started by a config push stays "syncing" (deterministic for status assertions) and never reaches
+// a real git or the network. Pass gitsync.WithGitRunner to take control of it.
+func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time, opts ...gitsync.Option) *gitsync.Client {
 	t.Helper()
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	defaults := []gitsync.Option{
+		gitsync.WithMirrorsRoot(t.TempDir()),
+		gitsync.WithStatusInterval(10 * time.Millisecond),
+		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
+			select {
+			case <-gate:
+				return nil, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}),
+	}
 	path := filepath.Join(t.TempDir(), "git-sync.json")
 	if localJSON != "" {
 		if err := os.WriteFile(path, []byte(localJSON), 0o600); err != nil {
@@ -112,7 +133,7 @@ func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, 
 		t.Fatalf("load local config: %v", err)
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
-	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test")
+	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
 }
 
 // latestOriginCheck returns the origin_check from the most recent status that carried one.
@@ -161,23 +182,40 @@ const oneProvider = `{"origin":{"base_url":"https://git.example.com/"}}`
 // configJSON builds a git_sync_config frame. version is a JSON literal ("7", "null", "" to omit).
 // Each repo is {repo_id, origin_url, push_token_expires_at}; an empty expiry is omitted.
 func configJSON(version string, repos ...[3]string) json.RawMessage {
+	objs := make([]string, len(repos))
+	for i, r := range repos {
+		objs[i] = repoJSON(r[0], r[1], r[2], "https://replica.example.com/r/"+r[0]+".git", testPushToken)
+	}
+	return configJSONRaw(version, objs...)
+}
+
+const testPushToken = "push-token-abcdefghij"
+
+// repoJSON builds one repositories[] entry. An empty expiry, replica URL, or token is omitted.
+func repoJSON(id, origin, expiry, replica, token string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, `{"repo_id":%q,"origin_url":%q`, id, origin)
+	if expiry != "" {
+		fmt.Fprintf(&sb, `,"push_token_expires_at":%q`, expiry)
+	}
+	if replica != "" {
+		fmt.Fprintf(&sb, `,"replica_push_url":%q`, replica)
+	}
+	if token != "" {
+		fmt.Fprintf(&sb, `,"push_token":%q`, token)
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+// configJSONRaw wraps already-built repository objects in a git_sync_config frame.
+func configJSONRaw(version string, repoObjs ...string) json.RawMessage {
 	var sb strings.Builder
 	sb.WriteString(`{"type":"git_sync_config"`)
 	if version != "" {
 		sb.WriteString(`,"config_version":` + version)
 	}
-	sb.WriteString(`,"repositories":[`)
-	for i, r := range repos {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		fmt.Fprintf(&sb, `{"repo_id":%q,"origin_url":%q`, r[0], r[1])
-		if r[2] != "" {
-			fmt.Fprintf(&sb, `,"push_token_expires_at":%q`, r[2])
-		}
-		sb.WriteString("}")
-	}
-	sb.WriteString("]}")
+	sb.WriteString(`,"repositories":[` + strings.Join(repoObjs, ",") + `]}`)
 	return json.RawMessage(sb.String())
 }
 
@@ -185,7 +223,7 @@ func TestConfigAcceptedStatusEnvelope(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config",
-		configJSON("7", [3]string{"repo-a", "https://git.example.com/team/a.git", "2026-01-01T00:00:00Z"}))
+		configJSON("7", [3]string{"repo-a", "https://git.example.com/team/a.git", "2027-01-01T00:00:00Z"}))
 
 	st := lastStatus(t, s.messages())
 	if st.Type != "git_sync_status" {
@@ -203,11 +241,12 @@ func TestConfigAcceptedStatusEnvelope(t *testing.T) {
 	if st.Sequence != 1 {
 		t.Errorf("sequence = %d, want 1 for the first status", st.Sequence)
 	}
-	if st.EarliestPushTokenExpiresAt == nil || *st.EarliestPushTokenExpiresAt != "2026-01-01T00:00:00Z" {
+	if st.EarliestPushTokenExpiresAt == nil || *st.EarliestPushTokenExpiresAt != "2027-01-01T00:00:00Z" {
 		t.Errorf("earliest_push_token_expires_at = %v", st.EarliestPushTokenExpiresAt)
 	}
-	if got := repoStates(st)["repo-a"].State; got != gitsync.StatePending {
-		t.Errorf("repo-a state = %q, want pending", got)
+	// A matched repository starts syncing as soon as its configuration is accepted.
+	if got := repoStates(st)["repo-a"].State; got != gitsync.StateSyncing {
+		t.Errorf("repo-a state = %q, want syncing", got)
 	}
 }
 
@@ -219,8 +258,8 @@ func TestHostMatchStates(t *testing.T) {
 		[3]string{"repo-b", "https://other.example.com/b.git", ""}))
 
 	rs := repoStates(lastStatus(t, s.messages()))
-	if rs["repo-a"].State != gitsync.StatePending {
-		t.Errorf("matched repo-a state = %q, want pending", rs["repo-a"].State)
+	if rs["repo-a"].State != gitsync.StateSyncing {
+		t.Errorf("matched repo-a state = %q, want syncing", rs["repo-a"].State)
 	}
 	b := rs["repo-b"]
 	if b.State != gitsync.StateError || b.ErrorType != gitsync.ErrOriginAccessDenied || b.ErrorDetail != "host not configured locally" {
@@ -234,7 +273,7 @@ func TestHostMatchStates(t *testing.T) {
 
 // TestRepoStateStoresCanonicalURL asserts that a host-matched repository retains the matched
 // provider name and the validated, re-serialized canonical origin URL (not the raw origin string),
-// so Phase 3 dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
+// so the sync dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
 // origin fails canonicalization outright (repo-c, a homoglyph host) retain neither.
 func TestRepoStateStoresCanonicalURL(t *testing.T) {
 	c := newTestClient(t, oneProvider) // provider "origin" at https://git.example.com/
@@ -308,7 +347,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"empty repo_id":       `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"","origin_url":"https://git.example.com/a"}]}`,
 		"non-scalar version":  `{"type":"git_sync_config","config_version":{"n":1},"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"}]}`,
 		// repo_id charset: traversal, control, and bare-dot ids are rejected as a whole message, since
-		// Phase 3 uses repo_id in filesystem paths and replica URLs.
+		// repo_id is the key of the configured set and appears in logs and statuses.
 		"traversal repo_id":  `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"../../x","origin_url":"https://git.example.com/a"}]}`,
 		"dotdot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"..","origin_url":"https://git.example.com/a"}]}`,
 		"dot repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".","origin_url":"https://git.example.com/a"}]}`,
@@ -344,7 +383,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 // Only the two pure traversal components "." and ".." are rejected beyond the charset; every other
 // contract-valid id — a leading "-", ".git", a trailing ".", an embedded ".." like "a..b", and
 // case-distinct ids — must be accepted here. Point-of-use safety (git argv, filesystem paths, case
-// folding) is Phase 3's responsibility, not this config-validation guard's.
+// folding) is closed where repo_id is used (Mirrors.Dir hashes it), not by this config-validation guard.
 func TestApplyConfigRepoIDAccepted(t *testing.T) {
 	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
 	c := newTestClient(t, "")
@@ -352,7 +391,7 @@ func TestApplyConfigRepoIDAccepted(t *testing.T) {
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
 		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
 		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine
-		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (Phase 3 passes it safely)
+		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (it is never a git argument)
 		[3]string{".git", "https://git.example.com/d", ""},  // leading dot is contract-valid
 		[3]string{"a.", "https://git.example.com/e", ""},    // trailing dot is contract-valid
 		[3]string{"a..b", "https://git.example.com/f", ""},  // embedded ".." (not the bare "..") is contract-valid
@@ -691,7 +730,10 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 		if err := wsjson.Write(r.Context(), conn, map[string]any{
 			"type":           "git_sync_config",
 			"config_version": 1,
-			"repositories":   []map[string]any{{"repo_id": "repo-a", "origin_url": "https://git.example.com/a.git"}},
+			"repositories": []map[string]any{{
+				"repo_id": "repo-a", "origin_url": "https://git.example.com/a.git",
+				"replica_push_url": "https://replica.example.com/r/repo-a.git", "push_token": testPushToken,
+			}},
 		}); err != nil {
 			return
 		}
@@ -725,15 +767,22 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	}
 	wsURL := strings.Replace(srv.URL, "http://", "ws://", 1)
 	cfg := &config.Config{GatewayURL: wsURL, ConnectorID: "gitsync-test", ProtocolVersion: "v1", RegistrationToken: "tok-test"}
+	// The sync must never reach a real git or network from this test: its runner waits for the
+	// connection context to end.
 	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local,
-		&fakeProber{result: gitsync.OriginReachable}, fixedNow, "boot-test")
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, "boot-test",
+		gitsync.WithMirrorsRoot(t.TempDir()),
+		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	connectDone := make(chan error, 1)
 	go func() { connectDone <- c.Connect(ctx) }()
 
-	// Wait for a status that reports repo-a as pending (the one emitted after the config push).
+	// Wait for a status that reports repo-a as syncing (the one emitted after the config push).
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
@@ -741,7 +790,7 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 			if st.Type != "git_sync_status" || st.BootID != "boot-test" {
 				t.Errorf("unexpected status envelope: %+v", st)
 			}
-			if rs := repoStates(st); rs["repo-a"].State == gitsync.StatePending {
+			if rs := repoStates(st); rs["repo-a"].State == gitsync.StateSyncing {
 				cancel()
 				select {
 				case <-connectDone:
@@ -751,7 +800,7 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 				return
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for a git_sync_status reporting repo-a pending")
+			t.Fatal("timed out waiting for a git_sync_status reporting repo-a syncing")
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
@@ -22,17 +24,20 @@ import (
 // Repository lifecycle states reported in git_sync_status. These strings are part of the wire
 // contract, so a test pins them against accidental drift.
 const (
-	// StatePending: the repository is configured and host-matched but no sync has completed this run
-	// (Phase 2 never advances past this, so a stubbed connector never reports a healthy "ok").
+	// StatePending: the repository is configured and host-matched but no sync has started or
+	// completed yet, or syncing is suspended (a critical security update is required).
 	StatePending = "pending"
+	// StateSyncing: a sync is queued or running. A repository waiting behind the concurrency limit
+	// is reported as syncing too.
 	StateSyncing = "syncing"
 	StateOK      = "ok"
 	StateError   = "error"
 )
 
 // Typed error codes carried as error_type when State is StateError. A single list covers every
-// failure; only ErrOriginAccessDenied is exercised in Phase 2 (the host-match guard and the
-// reachability probe). The remainder are reserved for the Phase 3 sync work.
+// failure. ErrOriginAccessDenied also covers a repository whose host is not configured locally (the
+// host-match guard); ErrUnclassified is the fallback that carries a sanitised detail so no failure
+// is dropped. See classifyGitFailure for how a failed git invocation maps onto them.
 const (
 	ErrOriginUnreachable   = "origin_unreachable"
 	ErrOriginAccessDenied  = "origin_access_denied"
@@ -56,19 +61,20 @@ const WarnLFSNotReplicated = "lfs_not_replicated"
 const (
 	maxConfigRepos = 4096
 	// maxRepoIDLength is the platform-contract bound on repo_id. It is at or above the 255-byte
-	// NAME_MAX of common filesystems (ext4, xfs, APFS), so Phase 3 MUST NOT use repo_id directly as a
-	// filename (and never suffixed, e.g. "<id>.git") — it has to map it to a bounded directory name;
-	// see the note on validRepoID. Must stay <= 1000 (see repoIDRE).
+	// NAME_MAX of common filesystems (ext4, xfs, APFS), so repo_id is never used directly as a
+	// filename: Mirrors.Dir maps it to a fixed-format hashed directory name. Must stay <= 1000 (see
+	// repoIDRE).
 	maxRepoIDLength      = 256
 	maxConfigVersionSize = 256
 )
 
-// repoIDRE constrains a platform-supplied repo_id to a safe charset and length. repo_id is used in
-// local filesystem paths and replica push URLs in Phase 3, so anything outside this set — path
-// separators, NUL, control characters, whitespace — is a traversal or injection vector and is
-// rejected at config-validation time. The length bound is single-sourced from maxRepoIDLength,
-// which must stay <= 1000: RE2 caps a bounded repetition at 1000, so a larger value would panic in
-// MustCompile at package init.
+// repoIDRE constrains a platform-supplied repo_id to a safe charset and length. repo_id appears in
+// logs and statuses and is the key of the configured set; it never reaches a path (the mirror
+// directory is a hash of it) or a git argument. Anything outside this set — path separators, NUL,
+// control characters, whitespace — is nonetheless rejected at config-validation time, as defence in
+// depth and so it cannot be used for log injection. The length bound is single-sourced from
+// maxRepoIDLength, which must stay <= 1000: RE2 caps a bounded repetition at 1000, so a larger value
+// would panic in MustCompile at package init.
 var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
 
 // validRepoID reports whether a repo_id conforms to the platform contract: the charset and length
@@ -76,12 +82,11 @@ var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDL
 // (they name a directory rather than a repository and cannot be a safe path component anywhere).
 //
 // It deliberately does NOT reject other contract-valid ids — a leading "-", ".git", a trailing ".",
-// an embedded ".." such as "a..b", or ids that differ only in case. Those are safe to STORE; the
-// only risks they carry are at the point of USE (a git argv element, a filesystem path, a
-// case-insensitive filesystem), which Phase 3 must defend independently (pass repo_id after "--" or
-// never in option position, map it to a bounded fixed-format directory name, and fold case when it
-// builds paths). Over-restricting here instead would reject platform-valid configurations whole and
-// halt sync for every repository in the message, so the guard is kept to the agreed contract.
+// an embedded ".." such as "a..b", or ids that differ only in case. Those are safe to STORE, and the
+// risks they carry at the point of USE are closed there: repo_id is never a git argument or a path
+// component (Mirrors.Dir hashes it, so length, case and ".."/".git" shapes cannot matter).
+// Over-restricting here instead would reject platform-valid configurations whole and halt sync for
+// every repository in the message, so the guard is kept to the agreed contract.
 func validRepoID(id string) bool {
 	return repoIDRE.MatchString(id) && id != "." && id != ".."
 }
@@ -102,24 +107,110 @@ const (
 	rfc3339Nano = "2006-01-02T15:04:05.000000000Z07:00"
 )
 
-// repoState is the Phase-2 retained subset of a configured repository. The push token is
-// deliberately NOT retained: Phase 2 never pushes, and holding it only widens the leak surface.
+// repoState is the retained state of a configured repository.
 //
-// The raw origin_url string is deliberately NOT retained either. When a repository host-matches a
-// local provider, applyConfig resolves and stores the matched provider name plus the validated,
-// re-serialized canonical origin URL. Phase 3 dials canonicalURL directly and never re-parses an
+// The raw origin_url string is deliberately NOT retained. When a repository host-matches a local
+// provider, applyConfig resolves and stores the matched provider name plus the validated,
+// re-serialized canonical origin URL. The sync dials canonicalURL directly and never re-parses an
 // unvalidated string with git's URL parser (whose host interpretation can diverge from ours), so
 // the host that was match-checked is byte-for-byte the host that gets contacted.
+//
+// The push token is retained, in memory only and as a self-redacting Secret, and only for a
+// repository that is host-matched and has a usable replica URL: a repository that can never be
+// synced holds no secret. Hardening it at rest is Phase 4.
 type repoState struct {
 	repoID       string
 	provider     string // matched local provider name, "" when unmatched
-	canonicalURL string // validated, re-serialized origin URL for Phase 3 to dial, "" when unmatched
+	canonicalURL string // validated, re-serialized origin URL the sync dials, "" when unmatched
 	expiresAt    string // push_token_expires_at (RFC3339), "" when none
 	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+
+	replicaURL string // validated, re-serialized https replica URL, "" when unmatched or unusable
+	pushToken  Secret // platform push token for replicaURL; empty exactly when replicaURL is
+	// result is the recorded outcome of the last sync attempt, or the reason the configuration is
+	// unusable. A zero State means no outcome yet, which is reported as pending.
+	result  syncResult
+	syncing bool // a sync is queued or running
+}
+
+// errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
+// is unusable. It is deliberately generic: the status must never echo the platform-supplied URL.
+const errInvalidReplica = "invalid replica configuration"
+
+// validReplicaURL validates a platform-supplied replica push URL and returns its re-serialized
+// canonical form. The push token travels to this URL, so it must be https; it gets the same host
+// validation as an origin so the host that is validated is the host that is dialled.
+func validReplicaURL(raw string) (string, bool) {
+	_, full, err := canonicalRemoteURL(raw)
+	if err != nil || !strings.HasPrefix(full, "https://") {
+		return "", false
+	}
+	return full, true
+}
+
+// validPushToken reports whether a platform-supplied push token is usable. It becomes an
+// Authorization header value in a subprocess environment, so it must be non-empty and free of
+// control characters: a CR or LF would inject headers into the replica request and a NUL would make
+// the process fail to start. (The operator's own origin token gets the same check; see
+// LocalEntry.Validate.)
+func validPushToken(tok Secret) bool {
+	s := tok.Reveal()
+	return s != "" && !strings.ContainsFunc(s, unicode.IsControl)
+}
+
+// sameSyncIdentity reports whether two states describe the same sync target, so a prior result is
+// still meaningful. The push token is deliberately not part of it: a refreshed token for the same
+// repository does not invalidate its last result.
+func sameSyncIdentity(a, b repoState) bool {
+	return a.matched == b.matched && a.provider == b.provider &&
+		a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
+}
+
+// defaultDrainTimeout bounds how long OnDraining waits for in-flight syncs. A gateway going_away
+// means a platform restart is coming, so a sync that can finish promptly may report its result over
+// this connection; one that cannot is left running and reports over the next.
+const defaultDrainTimeout = 30 * time.Second
+
+// Option customises a Client. The defaults suit production; the options exist so tests (and a
+// packaging layer) can point the connector at a different git, mirror location, or drain bound.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	run            runFunc
+	mirrorsRoot    string
+	drainTimeout   time.Duration
+	statusInterval time.Duration
+}
+
+// defaultStatusInterval is the minimum spacing between statuses sent because syncs finished. Each
+// status echoes every repository, so one per completion would cost O(N²) bytes across N repositories.
+const defaultStatusInterval = time.Second
+
+// WithStatusInterval sets the minimum spacing between completion-triggered statuses. The first is
+// sent immediately and the last state is always flushed within one interval. The default is one second.
+func WithStatusInterval(d time.Duration) Option {
+	return func(o *clientOptions) { o.statusInterval = d }
+}
+
+// WithGitRunner replaces how git is executed. The default runs the real git binary in the locked-down
+// environment (see runGit).
+func WithGitRunner(run func(ctx context.Context, argv, env []string, dir string) ([]byte, error)) Option {
+	return func(o *clientOptions) { o.run = run }
+}
+
+// WithMirrorsRoot sets the directory the bare mirrors live under. The default is DefaultMirrorsRoot.
+func WithMirrorsRoot(root string) Option {
+	return func(o *clientOptions) { o.mirrorsRoot = root }
+}
+
+// WithDrainTimeout bounds how long OnDraining waits for in-flight syncs. The default is 30 seconds.
+func WithDrainTimeout(d time.Duration) Option {
+	return func(o *clientOptions) { o.drainTimeout = d }
 }
 
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
-// the connection lifecycle. The sync algorithm is not implemented in Phase 2 (TODO(phase-3)).
+// the connection lifecycle, and runs mirror syncs for its host-matched repositories through a
+// bounded manager.
 type Client struct {
 	cfg    *config.Config
 	gw     *gateway.Client
@@ -127,6 +218,15 @@ type Client struct {
 	prober OriginProber
 	now    func() time.Time
 	bootID string
+
+	mgr          *manager
+	drainTimeout time.Duration
+
+	// Completion-triggered statuses are coalesced: see notifyStatus.
+	statusInterval  time.Duration
+	notifyMu        sync.Mutex
+	lastNotify      time.Time // wall clock, not c.now: it paces real timers
+	notifyScheduled bool
 
 	// criticalPatchRequired gates sync triggers while the gateway signals a required update.
 	criticalPatchRequired atomic.Bool
@@ -160,18 +260,40 @@ type Client struct {
 
 // NewClient creates a git-sync connector. prober runs the origin reachability check; now and bootID
 // are injectable so tests are deterministic (now defaults to time.Now).
-func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober OriginProber, now func() time.Time, bootID string) *Client {
+func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober OriginProber, now func() time.Time, bootID string, opts ...Option) *Client {
 	if now == nil {
 		now = time.Now
 	}
-	c := &Client{
-		cfg:    cfg,
-		local:  local,
-		prober: prober,
-		now:    now,
-		bootID: bootID,
-		repos:  map[string]repoState{},
+	o := clientOptions{run: runGit, mirrorsRoot: DefaultMirrorsRoot(), drainTimeout: defaultDrainTimeout, statusInterval: defaultStatusInterval}
+	for _, opt := range opts {
+		opt(&o)
 	}
+	// git runs in a temporary directory, so a relative mirrors root would be resolved against that
+	// (and lost with it) by git while Exists resolved it against the daemon's working directory.
+	root := o.mirrorsRoot
+	if abs, err := filepath.Abs(root); err == nil {
+		root = abs
+	}
+	c := &Client{
+		cfg:            cfg,
+		local:          local,
+		prober:         prober,
+		now:            now,
+		bootID:         bootID,
+		repos:          map[string]repoState{},
+		drainTimeout:   o.drainTimeout,
+		statusInterval: o.statusInterval,
+	}
+	c.mgr = newManager(defaultSyncConcurrency,
+		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, now: now},
+		syncHooks{
+			resolve:   c.resolveTask,
+			begin:     c.beginSync,
+			finish:    c.finishSync,
+			release:   c.releaseSync,
+			suspended: c.criticalPatchRequired.Load,
+			changed:   c.notifyStatus,
+		})
 	c.gw = gateway.NewClient(gateway.Config{
 		GatewayURL:        cfg.GatewayURL,
 		ConnectorID:       cfg.ConnectorID,
@@ -219,9 +341,14 @@ func (c *Client) OnHeartbeat(ctx context.Context, s gateway.Sender) error {
 	return c.sendStatus(ctx, s)
 }
 
-// OnDraining runs on a going_away before teardown.
-func (c *Client) OnDraining(_ context.Context) {
-	// TODO(phase-3): wait (bounded) for in-flight sync goroutines before teardown.
+// OnDraining runs on a going_away before teardown. It waits a bounded time for in-flight syncs so a
+// result that is about to land is reported over this connection. It never cancels them: syncs run
+// under the process-lifetime context, not the connection's, so one that outlasts the wait simply
+// keeps going across the reconnect and reports over the next connection.
+func (c *Client) OnDraining(ctx context.Context) {
+	dctx, cancel := context.WithTimeout(ctx, c.drainTimeout)
+	defer cancel()
+	c.mgr.drain(dctx)
 }
 
 // HandleMessage dispatches the git-sync inbound messages.
@@ -229,7 +356,10 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 	switch typ {
 	case "git_sync_config":
 		if c.applyConfig(raw) {
-			// TODO(phase-3): reconcile the desired set against local state and (re)schedule syncs.
+			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
+			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
+			// before the status is built, so the status already reports them as syncing.
+			c.startSyncs(ctx, c.syncableRepos())
 			c.emitStatus(ctx, s, dispatchStatusTimeout)
 		}
 	case "git_sync_now":
@@ -238,7 +368,7 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 			slog.Warn("malformed git_sync_now message", "err", err)
 			return
 		}
-		c.handleSyncNow(msg)
+		c.startSyncs(ctx, c.handleSyncNow(msg))
 		c.emitStatus(ctx, s, dispatchStatusTimeout)
 	default:
 		slog.Debug("ignoring message", "type", typ)
@@ -270,10 +400,9 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	next := make(map[string]repoState, len(msg.Repositories))
 	for _, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
-			// repo_id will be used in local filesystem paths and replica push URLs in Phase 3, so a
-			// value outside the contract charset (or a "." / ".." traversal component) is rejected
-			// here, not silently carried. Not logged verbatim: a hostile id could carry
-			// log-injection bytes.
+			// A value outside the contract charset (or a "." / ".." traversal component) is rejected
+			// here rather than carried into logs and statuses. Not logged verbatim: a hostile id
+			// could carry log-injection bytes.
 			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
 			return false
 		}
@@ -284,7 +413,7 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
 		// (loaded at startup, no live reload), so the result is stable until the next config and
 		// need not be recomputed on every status. The origin is parsed once: its canonical host key
-		// selects the provider and its canonical URL is retained for Phase 3 to dial.
+		// selects the provider and its canonical URL is retained for the sync to dial.
 		var provider, canonicalURL string
 		matched := false
 		if c.local != nil {
@@ -294,12 +423,34 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 				}
 			}
 		}
-		next[r.RepoID] = repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		st := repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		if matched {
+			// A bad replica fails this one repository, not the whole message: the others are
+			// independent and halting them all would be disproportionate.
+			if replicaURL, ok := validReplicaURL(r.ReplicaPushURL); ok && validPushToken(r.PushToken) {
+				st.replicaURL, st.pushToken = replicaURL, r.PushToken
+			} else {
+				st.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
+			}
+		}
+		next[r.RepoID] = st
 	}
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")
 	}
 	c.mu.Lock()
+	// Carry a prior result and in-flight marker across a configuration that leaves a repository's
+	// sync target unchanged (the platform re-sends config on every token refresh), so a healthy
+	// repository is not reset to pending. A changed target starts over.
+	for id, st := range next {
+		if old, ok := c.repos[id]; ok && sameSyncIdentity(old, st) {
+			if st.result.State == "" {
+				st.result = old.result
+			}
+			st.syncing = old.syncing
+			next[id] = st
+		}
+	}
 	c.repos = next
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
@@ -308,8 +459,136 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	return true
 }
 
-// handleSyncNow resolves the repositories an immediate-sync request addresses (and, in Phase 2,
-// does not yet sync). A request is suppressed entirely while a critical patch is required.
+// startSyncs hands repositories to the sync manager unless a critical security update is required,
+// which suspends all syncing. ctx is the one the gateway gives HandleMessage: the process-lifetime
+// Connect context, NOT a connection's, so a drain or reconnect does not cancel a sync (only shutdown
+// does). That is part of the gateway's Handler contract and is pinned by its
+// TestHandlerContextLifetimes; this package's TestSyncAndItsRerunSurviveLosingTheConnection pins
+// the consequence. Status replies use the connection's own context, captured in OnConnected.
+func (c *Client) startSyncs(ctx context.Context, repoIDs []string) {
+	if len(repoIDs) == 0 {
+		return
+	}
+	if c.criticalPatchRequired.Load() {
+		slog.Warn("not syncing: a critical security update is required first")
+		return
+	}
+	c.mgr.enqueue(ctx, repoIDs)
+}
+
+// resolveTask snapshots what a sync of repoID needs, or reports that the repository is not (or no
+// longer) syncable. It is the manager's view of the configured set, taken under mu.
+func (c *Client) resolveTask(repoID string) (syncTask, bool) {
+	c.mu.Lock()
+	r, ok := c.repos[repoID]
+	c.mu.Unlock()
+	if !ok || !r.matched || r.replicaURL == "" || c.local == nil {
+		return syncTask{}, false
+	}
+	origin, ok := c.local.Get(r.provider)
+	if !ok {
+		return syncTask{}, false
+	}
+	return syncTask{
+		RepoID:         repoID,
+		CanonicalURL:   r.canonicalURL,
+		Origin:         origin,
+		ReplicaURL:     r.replicaURL,
+		PushToken:      r.pushToken,
+		TokenExpiresAt: r.expiresAt,
+	}, true
+}
+
+// beginSync marks repoID as syncing (queued or running), if it is still configured. The task itself
+// is resolved later, when a slot is free, so only the repository is identified here.
+func (c *Client) beginSync(repoID string) {
+	c.setSyncing(repoID, true)
+}
+
+// releaseSync clears repoID's syncing mark for a sync that did not run, recording nothing.
+func (c *Client) releaseSync(repoID string) {
+	c.setSyncing(repoID, false)
+}
+
+func (c *Client) setSyncing(repoID string, syncing bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.repos[repoID]; ok {
+		r.syncing = syncing
+		c.repos[repoID] = r
+	}
+}
+
+// finishSync records a sync's outcome and clears the syncing mark. A task whose target no longer
+// matches the repository's configuration (the platform reconfigured it mid-sync) is ignored, so a
+// stale result is never attributed to the new target. A pending result means the sync was
+// cancelled; nothing is recorded.
+func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.repos[repoID]
+	if !ok || !targetMatches(r, t) {
+		return
+	}
+	r.syncing = false
+	if res.State != StatePending {
+		r.result = res
+	}
+	c.repos[repoID] = r
+}
+
+// targetMatches reports whether t was resolved from r's current sync target.
+func targetMatches(r repoState, t syncTask) bool {
+	return r.canonicalURL == t.CanonicalURL && r.replicaURL == t.ReplicaURL
+}
+
+// notifyStatus reports that a sync finished. Each status echoes every repository, so sending one per
+// completion would cost O(N²) bytes for N repositories; instead the first is sent at once and any
+// that follow within statusInterval are folded into a single trailing flush, which also guarantees
+// the final state is reported.
+func (c *Client) notifyStatus() {
+	c.notifyMu.Lock()
+	wait := c.statusInterval - time.Since(c.lastNotify)
+	if wait <= 0 && !c.notifyScheduled {
+		c.lastNotify = time.Now()
+		c.notifyMu.Unlock()
+		c.sendCurrentStatus()
+		return
+	}
+	if !c.notifyScheduled {
+		c.notifyScheduled = true
+		time.AfterFunc(wait, c.flushNotify)
+	}
+	c.notifyMu.Unlock()
+}
+
+func (c *Client) flushNotify() {
+	c.notifyMu.Lock()
+	c.notifyScheduled = false
+	c.lastNotify = time.Now()
+	c.notifyMu.Unlock()
+	c.sendCurrentStatus()
+}
+
+// Wait blocks until no sync is in flight or ctx ends. The daemon calls it after cancelling the
+// process-lifetime context, which kills each git, so it can confirm they have stopped before exiting
+// instead of leaving a process that holds a credential behind.
+func (c *Client) Wait(ctx context.Context) { c.mgr.drain(ctx) }
+
+// sendCurrentStatus sends the current status over the current connection, if there is a live one. A
+// sync that finishes mid-reconnect simply skips it: the next heartbeat reports the result anyway.
+func (c *Client) sendCurrentStatus() {
+	c.mu.Lock()
+	ctx, s := c.connCtx, c.connSender
+	c.mu.Unlock()
+	if ctx == nil || s == nil || ctx.Err() != nil {
+		return
+	}
+	c.emitStatus(ctx, s, dispatchStatusTimeout)
+}
+
+// handleSyncNow resolves the repositories an immediate-sync request addresses. A request is
+// suppressed entirely while a critical patch is required. The caller starts the syncs.
 func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 	if c.criticalPatchRequired.Load() {
 		slog.Warn("ignoring git_sync_now: a critical security update is required before syncing", "repo_id", msg.RepoID)
@@ -320,31 +599,31 @@ func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 		slog.Warn("git_sync_now for a repository that cannot be synced", "repo_id", msg.RepoID)
 		return nil
 	}
-	slog.Info("git_sync_now received; sync not yet implemented", "repo_count", len(targets))
+	slog.Info("git_sync_now received", "repo_count", len(targets))
 	return targets
 }
 
 // syncTargets resolves a git_sync_now repo_id to the repositories it addresses, restricted to the
-// matchable set (configured AND host-matched to a local provider). An empty repo_id is the
-// provisional "all matchable repositories" fan-out.
+// syncable set (configured, host-matched to a local provider, with a usable replica). An empty
+// repo_id is the provisional "all syncable repositories" fan-out.
 func (c *Client) syncTargets(repoID string) []string {
-	matchable := c.matchableRepos()
+	syncable := c.syncableRepos()
 	if repoID == "" {
-		return matchable
+		return syncable
 	}
-	if slices.Contains(matchable, repoID) {
+	if slices.Contains(syncable, repoID) {
 		return []string{repoID}
 	}
 	return nil
 }
 
-// matchableRepos returns the sorted repo_ids that host-match a local provider, using the match
-// resolved at applyConfig time.
-func (c *Client) matchableRepos() []string {
+// syncableRepos returns the sorted repo_ids that can be synced: host-matched to a local provider
+// (resolved at applyConfig time) and carrying a usable replica URL.
+func (c *Client) syncableRepos() []string {
 	snapshot := c.snapshotRepos()
 	var out []string
 	for _, r := range snapshot {
-		if r.matched {
+		if r.matched && r.replicaURL != "" {
 			out = append(out, r.repoID)
 		}
 	}
@@ -382,12 +661,20 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	var earliest *time.Time
 	for _, r := range snapshot {
 		st := proto.GitSyncRepoStatus{RepoID: r.repoID}
-		if r.matched {
-			st.State = StatePending
-		} else {
+		switch {
+		case !r.matched:
 			st.State = StateError
 			st.ErrorType = ErrOriginAccessDenied
 			st.ErrorDetail = "host not configured locally"
+		case r.syncing:
+			st.State = StateSyncing
+		case r.result.State != "":
+			st.State = r.result.State
+			st.ErrorType = r.result.ErrorType
+			st.ErrorDetail = r.result.ErrorDetail
+			st.Warnings = r.result.Warnings
+		default:
+			st.State = StatePending
 		}
 		repos = append(repos, st)
 		if t, ok := parseExpiry(r.expiresAt); ok && (earliest == nil || t.Before(*earliest)) {
