@@ -340,12 +340,13 @@ func TestMatchProvider(t *testing.T) {
 	}
 }
 
-// TestCanonicalHostRejectsAmbiguous asserts that the host-canonicalization underpinning the match
-// guard REJECTS (errors on) non-ASCII, Unicode-lookalike, IPv6-zone, and ambiguous-numeric hosts.
-// The rejection is done by canonicalASCIIHost's ASCII-charset validation and its final-label numeric
-// check (not by the ASCII-only lowercasing, which only ever sees already-ASCII input). Each would
-// otherwise resolve, in git/curl, to a different host than any ASCII provider it textually resembles
-// — a bypass of the "match-checked host == dialed host" invariant.
+// TestCanonicalHostRejectsAmbiguous asserts that the host/port canonicalization underpinning the
+// match guard REJECTS (errors on) non-ASCII, Unicode-lookalike, IPv6-zone, ambiguous-numeric,
+// over-long, and out-of-range forms. The rejection is done by canonicalASCIIHost's ASCII-charset
+// validation, its label-length and final-label numeric checks, and canonicalPort's range check (not
+// by the ASCII-only lowercasing, which only ever sees already-ASCII input). Each ambiguous host
+// would otherwise resolve, in git/curl, to a different host than any ASCII provider it textually
+// resembles — a bypass of the "match-checked host == dialed host" invariant.
 func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
 	bad := []struct {
 		name, url string
@@ -357,12 +358,26 @@ func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
 		{"zero-width-space U+200B", "https://git\u200bhub.com/x"},
 		{"percent-encoded non-ASCII", "https://git%C4%B0hub.com/x"},
 		{"bare integer IPv4", "https://2130706433/x"},
-		{"leading-zero octal octet", "https://010.0.0.1/x"},
-		{"hex final octet", "https://0x7f.0.0.1/x"},
-		{"hex run final label", "https://127.0.0.0x1/x"},
 		{"bare hex integer", "https://0x7f000001/x"},
+		{"hex run final label", "https://127.0.0.0x1/x"},
 		{"hex octet mid-dotted", "https://1.2.3.0x4/x"},
+		// These reject on the final label itself being a numeric/hex/octal run (earlier labels are
+		// non-numeric names), so they exercise the final-label rule rather than a numeric octet.
+		{"numeric final label (decimal)", "https://a.0.0.1/x"},
+		{"octal final label", "https://a.010/x"},
+		{"hex final label", "https://a.0x7f/x"},
+		{"uppercase hex final label", "https://a.0X7F/x"},
+		{"empty-hex 0x final label", "https://example.0x/x"},
+		{"numeric final label after trailing dot", "https://127.1./x"},
+		// Earlier-label numeric/octal octets that only decode as inet_aton because the WHOLE host is
+		// numeric; the final label is still what the rule keys on.
+		{"leading-zero octal octet", "https://010.0.0.1/x"},
+		{"hex leading octet", "https://0x7f.0.0.1/x"},
 		{"empty label (double dot)", "https://github..com/x"},
+		{"trailing empty label (double trailing dot)", "https://github.com../x"},
+		{"over-long label (64 chars)", "https://" + strings.Repeat("a", 64) + ".example.com/x"},
+		{"port zero", "https://git.example.com:0/x"},
+		{"port over max", "https://git.example.com:65536/x"},
 		{"ipv6 zone id", "https://[fe80::1%25eth0]/x"},
 	}
 	for _, tt := range bad {
@@ -388,6 +403,10 @@ func TestCanonicalHostAcceptsLegitimate(t *testing.T) {
 		"https://git.example.com./x",                            // trailing FQDN dot
 		"https://[2001:db8::1]/x",                               // IPv6 literal
 		"https://127.0.0.1/x",                                   // IPv4 literal
+		"https://0x.example.com/x",                              // "0x" is fine as a NON-final label
+		"https://example.1e3/x",                                 // "1e3" final label is not a numeric/hex run
+		"https://git.example.com:65535/x",                       // max port
+		"https://git.example.com:/x",                            // empty port falls back to the default
 	}
 	for _, u := range good {
 		if _, err := gitsync.CanonicalHostKeyForTest(u); err != nil {
@@ -407,11 +426,17 @@ func TestHostMatchNoUnicodeBypass(t *testing.T) {
 	if err := s.Set("gh", gitsync.LocalEntry{BaseURL: "https://github.com/"}); err != nil {
 		t.Fatalf("set gh: %v", err)
 	}
+	// A second provider whose host contains 'k', so the Kelvin sign (U+212A, which strings.ToLower
+	// folds to "k") has an ASCII twin it could try to bind to end-to-end.
+	if err := s.Set("ks", gitsync.LocalEntry{BaseURL: "https://keyserver.example.com/"}); err != nil {
+		t.Fatalf("set ks: %v", err)
+	}
 	lookalikes := []string{
 		"https://gİthub.com/owner/repo.git",       // İ folds to i
 		"https://github。com/owner/repo.git",       // ideographic dot
 		"https://git\u200bhub.com/owner/repo.git", // zero-width space
 		"https://git%C4%B0hub.com/owner/repo.git", // percent-encoded
+		"https://Keyserver.example.com/o/r.git",   // Kelvin sign folds to "k" -> keyserver
 	}
 	for _, origin := range lookalikes {
 		if name, _, ok := s.MatchProvider(origin); ok {
@@ -433,8 +458,11 @@ func TestCanonicalRemoteURLReserialized(t *testing.T) {
 		name, origin, wantKey, wantURL string
 	}{
 		{"mixed case + default port", "https://GitHub.com/owner/repo.git", "https://github.com:443", "https://github.com:443/owner/repo.git"},
+		{"uppercase scheme + host", "HTTPS://GitHub.COM/o/r.git", "https://github.com:443", "https://github.com:443/o/r.git"},
 		{"trailing dot + explicit port", "https://github.com.:443/o/r.git", "https://github.com:443", "https://github.com:443/o/r.git"},
+		{"empty port falls back to default", "https://git.example.com:/o/r.git", "https://git.example.com:443", "https://git.example.com:443/o/r.git"},
 		{"ipv6 literal", "https://[2001:DB8::1]/o/r.git", "https://[2001:db8::1]:443", "https://[2001:db8::1]:443/o/r.git"},
+		{"ipv6 literal + explicit port", "https://[::1]:8443/o/r.git", "https://[::1]:8443", "https://[::1]:8443/o/r.git"},
 		{"http default port", "http://git.example.com/o/r.git", "http://git.example.com:80", "http://git.example.com:80/o/r.git"},
 	}
 	for _, tt := range tests {

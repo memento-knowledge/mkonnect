@@ -54,8 +54,12 @@ const WarnLFSNotReplicated = "lfs_not_replicated"
 // Caps on an inbound git_sync_config so a hostile or malformed push cannot amplify into every
 // status (each accepted repository is echoed in every heartbeat status).
 const (
-	maxConfigRepos       = 4096
-	maxRepoIDLength      = 256
+	maxConfigRepos = 4096
+	// maxRepoIDLength is held below the 255-byte NAME_MAX of common filesystems (ext4, xfs, APFS)
+	// with headroom: Phase 3 uses repo_id as a path component, possibly with a suffix (e.g. a
+	// "<id>.git" working directory), so an id that cannot be a single filename must be rejected at
+	// config time rather than failing with ENAMETOOLONG mid-sync. Must stay <= 1000 (see repoIDRE).
+	maxRepoIDLength      = 200
 	maxConfigVersionSize = 256
 )
 
@@ -68,15 +72,24 @@ const (
 var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
 
 // validRepoID reports whether a repo_id is safe to use as a path component. Beyond the charset:
-// "." and ".." are themselves path-traversal components, and a leading "-" could be read as an
-// option flag when repo_id is later passed as a git argv element, so both are rejected. (This is
-// slightly stricter than the bare charset regex, by design — restricting now is cheap, whereas
-// loosening a stored-config contract later is not.)
+//   - A leading "-" could be read as an option flag when repo_id is later passed as a git argv
+//     element.
+//   - A leading or trailing "." (so "." and "..", but also ".git" and "a.") is rejected: a leading
+//     dot hides the entry and ".git" would collide with git's own metadata if Phase 3 roots a
+//     repository at "<root>/<id>", and a trailing dot is dropped by some filesystems.
+//   - Any embedded ".." is rejected so no id — even one like "a..b" — can form a traversal segment.
+//
+// This is deliberately stricter than the bare charset regex: restricting now is cheap, whereas
+// loosening a stored-config contract later is not. Phase 3 should still map repo_id to a
+// fixed-format directory name rather than rely on this charset alone.
 func validRepoID(id string) bool {
 	if !repoIDRE.MatchString(id) {
 		return false
 	}
-	return id != "." && id != ".." && !strings.HasPrefix(id, "-")
+	if strings.HasPrefix(id, "-") || strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") {
+		return false
+	}
+	return !strings.Contains(id, "..")
 }
 
 const (
@@ -261,18 +274,24 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		return false
 	}
 	next := make(map[string]repoState, len(msg.Repositories))
+	// seen detects duplicates case-INsensitively: repo_id becomes a filesystem path component in
+	// Phase 3, and ids differing only in case ("Repo" vs "repo") are distinct map keys but the same
+	// directory on case-insensitive filesystems (APFS, Windows), so both must be rejected as a clash.
+	// The id is already ASCII-validated by validRepoID, so strings.ToLower folds ASCII only here.
+	seen := make(map[string]struct{}, len(msg.Repositories))
 	for _, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
 			// repo_id will be used in local filesystem paths and replica push URLs in Phase 3, so a
-			// value outside the safe charset (or a "." / ".." traversal component) is rejected here,
-			// not silently carried. Not logged verbatim: a hostile id could carry log-injection bytes.
+			// value outside the safe charset (or a traversal / dot component) is rejected here, not
+			// silently carried. Not logged verbatim: a hostile id could carry log-injection bytes.
 			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
 			return false
 		}
-		if _, dup := next[r.RepoID]; dup {
+		if _, dup := seen[strings.ToLower(r.RepoID)]; dup {
 			slog.Warn("git_sync_config has a duplicate repo_id; leaving configuration unchanged", "repo_id", r.RepoID)
 			return false
 		}
+		seen[strings.ToLower(r.RepoID)] = struct{}{}
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
 		// (loaded at startup, no live reload), so the result is stable until the next config and
 		// need not be recomputed on every status. The origin is parsed once: its canonical host key

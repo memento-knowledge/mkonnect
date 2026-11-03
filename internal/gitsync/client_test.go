@@ -317,8 +317,16 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"whitespace repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a b","origin_url":"https://git.example.com/a"}]}`,
 		// A leading '-' could be read as an option flag when repo_id becomes a git argv element.
 		"leading-dash repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"-rf","origin_url":"https://git.example.com/a"}]}`,
+		// Dot-edge ids are rejected: a leading dot (".git" would collide with git metadata), a trailing
+		// dot (dropped by some filesystems), and any embedded ".." (a traversal segment).
+		"leading-dot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".git","origin_url":"https://git.example.com/a"}]}`,
+		"trailing-dot repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a.","origin_url":"https://git.example.com/a"}]}`,
+		"embedded-dotdot repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a..b","origin_url":"https://git.example.com/a"}]}`,
+		// repo_id becomes a filesystem path component, so ids differing only in case collide on
+		// case-insensitive filesystems and are rejected as a duplicate.
+		"case-insensitive duplicate repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"Repo","origin_url":"https://git.example.com/a"},{"repo_id":"repo","origin_url":"https://git.example.com/b"}]}`,
 	}
-	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
+	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 201) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
 
 	for name, raw := range cases {
@@ -344,19 +352,53 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 // TestApplyConfigRepoIDAccepted is the positive companion: repo_ids using the full legal charset,
 // including a maximum-length id, are accepted so the charset rule cannot be over-tightened silently.
 func TestApplyConfigRepoIDAccepted(t *testing.T) {
-	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
+	maxID := strings.Repeat("a", 200) // exactly maxRepoIDLength, must be accepted
 	c := newTestClient(t, "")
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
 		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
-		[3]string{".git", "https://git.example.com/b", ""},
+		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine; only leading/trailing/".." are not
 		[3]string{maxID, "https://git.example.com/c", ""}))
 
 	rs := repoStates(lastStatus(t, s.messages()))
-	for _, id := range []string{"repo.a_b-c", ".git", maxID} {
+	for _, id := range []string{"repo.a_b-c", "a.b.c", maxID} {
 		if _, ok := rs[id]; !ok {
 			t.Errorf("repo_id %q was not accepted", id)
 		}
+	}
+}
+
+// TestApplyConfigRejectionPreservesPrevious asserts the validate-then-swap contract end-to-end: a
+// config whose FIRST entry is valid but a LATER entry is invalid must be rejected whole, leaving the
+// previously-accepted configuration (its version and repositories) untouched — no partial apply.
+func TestApplyConfigRejectionPreservesPrevious(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	// Accept a good config first (version 1, repo "good").
+	c.HandleMessage(context.Background(), s, "git_sync_config",
+		configJSON("1", [3]string{"good", "https://git.example.com/a.git", ""}))
+
+	// A later message whose first entry is valid but whose second is an invalid repo_id.
+	bad := `{"type":"git_sync_config","config_version":2,"repositories":[` +
+		`{"repo_id":"ok","origin_url":"https://git.example.com/a.git"},` +
+		`{"repo_id":"../evil","origin_url":"https://git.example.com/b.git"}]}`
+	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(bad))
+
+	// Build a fresh status so the assertion reflects the connector's live configuration, not the
+	// status cached from the earlier accepted config.
+	if err := c.OnHeartbeat(context.Background(), s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	st := lastStatus(t, s.messages())
+	if string(st.ConfigVersion) != "1" {
+		t.Errorf("config_version = %s, want 1 (rejected config must not advance the version)", st.ConfigVersion)
+	}
+	rs := repoStates(st)
+	if _, ok := rs["good"]; !ok {
+		t.Error("the previously-accepted repo 'good' was dropped by a rejected config")
+	}
+	if _, ok := rs["ok"]; ok {
+		t.Error("the valid first entry of the rejected config was partially applied ('ok' leaked in)")
 	}
 }
 

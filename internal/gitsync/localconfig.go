@@ -86,7 +86,8 @@ func readOnlyModeAcceptable(mode os.FileMode) bool {
 // (remote) name carrying an origin BASE URL + credential, mirroring the API connector's
 // `config set <name> --base-url ... --token-stdin`. A repository that the platform sends in
 // git_sync_config carries its own full origin_url; the connector binds it to a local provider by
-// canonical scheme+host+port (see MatchProvider) before it would ever use the credential.
+// canonical scheme+host+port (see canonicalRemoteURL and matchByHostKey) before it would ever use
+// the credential, and Phase 3 dials the re-serialized canonical URL, never the raw origin string.
 
 // maxURLLength bounds a configured or platform-supplied URL so a hostile or malformed value cannot
 // define an absurdly long string that then appears in status, logs, or a subprocess environment.
@@ -228,6 +229,12 @@ func canonicalPort(u *url.URL) (string, error) {
 // preserved. Phase 3 MUST dial fullURL rather than re-parsing the raw origin string: git's URL
 // parser and ours can diverge, so re-serializing from the validated host guarantees the host that
 // was match-checked is byte-for-byte the host that gets contacted.
+//
+// Two normalizations are deliberate and safe here: the trailing FQDN dot is stripped and the
+// scheme's default port is made explicit. Both hostKey and fullURL are built from the SAME
+// canonicalized authority, so the match key and the dialed URL can never diverge from each other.
+// (Phase 3 must therefore pass credentials explicitly rather than rely on a git credential helper
+// keying on the un-normalized "scheme://host" form.)
 func canonicalRemoteURL(raw string) (hostKey, fullURL string, err error) {
 	u, err := validateRemoteURL(raw)
 	if err != nil {
@@ -454,6 +461,11 @@ func (s *Store) Remove(name string) error {
 // scheme+host+port. A malformed or non-matching origin_url returns ok=false, so the caller rejects
 // the repository (origin_access_denied) rather than ever using a credential against an unexpected
 // host. Iteration is sorted for deterministic selection.
+//
+// Phase 3 must NOT use this to obtain a URL to dial: it discards the re-serialized canonical URL
+// and keeps only the raw origin. Resolve the match via canonicalRemoteURL (keeping its fullURL) and
+// matchByHostKey instead, so the host that was match-checked is exactly the host that is contacted.
+// This entry point remains for a caller that only needs to know whether a provider exists.
 func (s *Store) MatchProvider(originURL string) (name string, e LocalEntry, ok bool) {
 	hk, err := canonicalHostKey(originURL)
 	if err != nil {
