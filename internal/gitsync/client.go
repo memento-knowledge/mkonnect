@@ -151,8 +151,40 @@ func sameSyncIdentity(a, b repoState) bool {
 		a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
 }
 
+// defaultDrainTimeout bounds how long OnDraining waits for in-flight syncs. A gateway going_away
+// means a platform restart is coming, so a sync that can finish promptly may report its result over
+// this connection; one that cannot is left running and reports over the next.
+const defaultDrainTimeout = 30 * time.Second
+
+// Option customises a Client. The defaults suit production; the options exist so tests (and a
+// packaging layer) can point the connector at a different git, mirror location, or drain bound.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	run          runFunc
+	mirrorsRoot  string
+	drainTimeout time.Duration
+}
+
+// WithGitRunner replaces how git is executed. The default runs the real git binary in the locked-down
+// environment (see runGit).
+func WithGitRunner(run func(ctx context.Context, argv, env []string, dir string) ([]byte, error)) Option {
+	return func(o *clientOptions) { o.run = run }
+}
+
+// WithMirrorsRoot sets the directory the bare mirrors live under. The default is DefaultMirrorsRoot.
+func WithMirrorsRoot(root string) Option {
+	return func(o *clientOptions) { o.mirrorsRoot = root }
+}
+
+// WithDrainTimeout bounds how long OnDraining waits for in-flight syncs. The default is 30 seconds.
+func WithDrainTimeout(d time.Duration) Option {
+	return func(o *clientOptions) { o.drainTimeout = d }
+}
+
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
-// the connection lifecycle. The sync algorithm is not implemented in Phase 2 (TODO(phase-3)).
+// the connection lifecycle, and runs mirror syncs for its host-matched repositories through a
+// bounded manager.
 type Client struct {
 	cfg    *config.Config
 	gw     *gateway.Client
@@ -160,6 +192,9 @@ type Client struct {
 	prober OriginProber
 	now    func() time.Time
 	bootID string
+
+	mgr          *manager
+	drainTimeout time.Duration
 
 	// criticalPatchRequired gates sync triggers while the gateway signals a required update.
 	criticalPatchRequired atomic.Bool
@@ -193,18 +228,26 @@ type Client struct {
 
 // NewClient creates a git-sync connector. prober runs the origin reachability check; now and bootID
 // are injectable so tests are deterministic (now defaults to time.Now).
-func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober OriginProber, now func() time.Time, bootID string) *Client {
+func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober OriginProber, now func() time.Time, bootID string, opts ...Option) *Client {
 	if now == nil {
 		now = time.Now
 	}
-	c := &Client{
-		cfg:    cfg,
-		local:  local,
-		prober: prober,
-		now:    now,
-		bootID: bootID,
-		repos:  map[string]repoState{},
+	o := clientOptions{run: runGit, mirrorsRoot: DefaultMirrorsRoot(), drainTimeout: defaultDrainTimeout}
+	for _, opt := range opts {
+		opt(&o)
 	}
+	c := &Client{
+		cfg:          cfg,
+		local:        local,
+		prober:       prober,
+		now:          now,
+		bootID:       bootID,
+		repos:        map[string]repoState{},
+		drainTimeout: o.drainTimeout,
+	}
+	c.mgr = newManager(defaultSyncConcurrency,
+		syncDeps{mirrors: Mirrors{Root: o.mirrorsRoot}, run: o.run, now: now},
+		syncHooks{resolve: c.resolveTask, begin: c.beginSync, finish: c.finishSync, changed: c.notifyStatus})
 	c.gw = gateway.NewClient(gateway.Config{
 		GatewayURL:        cfg.GatewayURL,
 		ConnectorID:       cfg.ConnectorID,
@@ -252,9 +295,14 @@ func (c *Client) OnHeartbeat(ctx context.Context, s gateway.Sender) error {
 	return c.sendStatus(ctx, s)
 }
 
-// OnDraining runs on a going_away before teardown.
-func (c *Client) OnDraining(_ context.Context) {
-	// TODO(phase-3): wait (bounded) for in-flight sync goroutines before teardown.
+// OnDraining runs on a going_away before teardown. It waits a bounded time for in-flight syncs so a
+// result that is about to land is reported over this connection. It never cancels them: syncs run
+// under the process-lifetime context, not the connection's, so one that outlasts the wait simply
+// keeps going across the reconnect and reports over the next connection.
+func (c *Client) OnDraining(ctx context.Context) {
+	dctx, cancel := context.WithTimeout(ctx, c.drainTimeout)
+	defer cancel()
+	c.mgr.drain(dctx)
 }
 
 // HandleMessage dispatches the git-sync inbound messages.
@@ -262,7 +310,10 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 	switch typ {
 	case "git_sync_config":
 		if c.applyConfig(raw) {
-			// TODO(phase-3): reconcile the desired set against local state and (re)schedule syncs.
+			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
+			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
+			// before the status is built, so the status already reports them as syncing.
+			c.startSyncs(ctx, c.syncableRepos())
 			c.emitStatus(ctx, s, dispatchStatusTimeout)
 		}
 	case "git_sync_now":
@@ -271,7 +322,7 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 			slog.Warn("malformed git_sync_now message", "err", err)
 			return
 		}
-		c.handleSyncNow(msg)
+		c.startSyncs(ctx, c.handleSyncNow(msg))
 		c.emitStatus(ctx, s, dispatchStatusTimeout)
 	default:
 		slog.Debug("ignoring message", "type", typ)
@@ -363,8 +414,89 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	return true
 }
 
-// handleSyncNow resolves the repositories an immediate-sync request addresses (and, in Phase 2,
-// does not yet sync). A request is suppressed entirely while a critical patch is required.
+// startSyncs hands repositories to the sync manager unless a critical security update is required,
+// which suspends all syncing.
+func (c *Client) startSyncs(ctx context.Context, repoIDs []string) {
+	if len(repoIDs) == 0 {
+		return
+	}
+	if c.criticalPatchRequired.Load() {
+		slog.Warn("not syncing: a critical security update is required first")
+		return
+	}
+	c.mgr.enqueue(ctx, repoIDs)
+}
+
+// resolveTask snapshots what a sync of repoID needs, or reports that the repository is not (or no
+// longer) syncable. It is the manager's view of the configured set, taken under mu.
+func (c *Client) resolveTask(repoID string) (syncTask, bool) {
+	c.mu.Lock()
+	r, ok := c.repos[repoID]
+	c.mu.Unlock()
+	if !ok || !r.matched || r.replicaURL == "" || c.local == nil {
+		return syncTask{}, false
+	}
+	origin, ok := c.local.Get(r.provider)
+	if !ok {
+		return syncTask{}, false
+	}
+	return syncTask{
+		RepoID:         repoID,
+		CanonicalURL:   r.canonicalURL,
+		Origin:         origin,
+		ReplicaURL:     r.replicaURL,
+		PushToken:      r.pushToken,
+		TokenExpiresAt: r.expiresAt,
+	}, true
+}
+
+// beginSync marks repoID as syncing, if its configuration still matches the task.
+func (c *Client) beginSync(repoID string, t syncTask) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.repos[repoID]; ok && targetMatches(r, t) {
+		r.syncing = true
+		c.repos[repoID] = r
+	}
+}
+
+// finishSync records a sync's outcome and clears the syncing mark. A task whose target no longer
+// matches the repository's configuration (the platform reconfigured it mid-sync) is ignored, so a
+// stale result is never attributed to the new target. A pending result means the sync was
+// cancelled; nothing is recorded.
+func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.repos[repoID]
+	if !ok || !targetMatches(r, t) {
+		return
+	}
+	r.syncing = false
+	if res.State != StatePending {
+		r.result = res
+	}
+	c.repos[repoID] = r
+}
+
+// targetMatches reports whether t was resolved from r's current sync target.
+func targetMatches(r repoState, t syncTask) bool {
+	return r.canonicalURL == t.CanonicalURL && r.replicaURL == t.ReplicaURL
+}
+
+// notifyStatus sends the current status over the current connection, if there is a live one. A sync
+// that finishes mid-reconnect simply skips it: the next heartbeat reports the result anyway.
+func (c *Client) notifyStatus() {
+	c.mu.Lock()
+	ctx, s := c.connCtx, c.connSender
+	c.mu.Unlock()
+	if ctx == nil || s == nil || ctx.Err() != nil {
+		return
+	}
+	c.emitStatus(ctx, s, dispatchStatusTimeout)
+}
+
+// handleSyncNow resolves the repositories an immediate-sync request addresses. A request is
+// suppressed entirely while a critical patch is required. The caller starts the syncs.
 func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 	if c.criticalPatchRequired.Load() {
 		slog.Warn("ignoring git_sync_now: a critical security update is required before syncing", "repo_id", msg.RepoID)
@@ -375,7 +507,7 @@ func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 		slog.Warn("git_sync_now for a repository that cannot be synced", "repo_id", msg.RepoID)
 		return nil
 	}
-	slog.Info("git_sync_now received; sync not yet implemented", "repo_count", len(targets))
+	slog.Info("git_sync_now received", "repo_count", len(targets))
 	return targets
 }
 
