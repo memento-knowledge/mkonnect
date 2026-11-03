@@ -46,6 +46,23 @@ func TestNewRejectsUnknownField(t *testing.T) {
 	}
 }
 
+func TestNewRejectsTrailingData(t *testing.T) {
+	for name, content := range map[string]string{
+		"trailing garbage": `{"origin": {"base_url": "https://git.example.com/"}} nonsense`,
+		"second object":    `{"origin": {"base_url": "https://git.example.com/"}}{"x":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := gitsync.New(writeConfig(t, content)); err == nil {
+				t.Fatal("content after the configuration object should be rejected")
+			}
+		})
+	}
+	// Trailing whitespace/newline is fine.
+	if _, err := gitsync.New(writeConfig(t, `{"origin": {"base_url": "https://git.example.com/"}}`+"\n\n")); err != nil {
+		t.Errorf("trailing whitespace should be accepted: %v", err)
+	}
+}
+
 // TestNewReadOnlyMount exercises the fallback for a file whose mode cannot be chmod-ed (a read-only
 // Secret mount): a safe mode is accepted, an unsafe one is rejected.
 func TestNewReadOnlyMount(t *testing.T) {

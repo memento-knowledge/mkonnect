@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/netip"
@@ -256,6 +257,11 @@ func New(path string) (*Store, error) {
 			return nil, fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset)
 		}
 		return nil, fmt.Errorf("git-sync config %s is not valid: %w", path, err)
+	}
+	// Reject anything after the first JSON value (a second value or trailing garbage), so a
+	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path)
 	}
 	hostKeys := make(map[string]string, len(dc))
 	for name, de := range dc {

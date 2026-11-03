@@ -19,6 +19,10 @@ The token is read from stdin so it never appears in the process list or shell hi
 container, run (name and binary path are provisional until packaging):
   docker exec -i <container> /mkonnect-gitsync connector config set <name> --base-url <url> --auth bearer --token-stdin`
 
+// maxTokenBytes bounds the credential read from stdin. A real token is tiny; anything larger is a
+// misdirected pipe and is rejected rather than truncated.
+const maxTokenBytes = 64 << 10
+
 // Run dispatches the git-sync operator commands. args is everything after "connector".
 func Run(args []string, stdin io.Reader, w io.Writer) error {
 	if len(args) == 0 {
@@ -117,10 +121,15 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 
 	var token string
 	if *tokenStdin {
-		// Bound the read so a misdirected pipe cannot exhaust memory; a real token is tiny.
-		b, err := io.ReadAll(io.LimitReader(stdin, 64<<10))
+		// Bound the read so a misdirected pipe cannot exhaust memory; a real token is tiny. Read one
+		// byte past the limit so an oversized token is rejected rather than silently truncated into a
+		// credential that would always fail to authenticate.
+		b, err := io.ReadAll(io.LimitReader(stdin, maxTokenBytes+1))
 		if err != nil {
 			return fmt.Errorf("reading token from stdin: %w", err)
+		}
+		if len(b) > maxTokenBytes {
+			return fmt.Errorf("token is too long (over %d bytes); pass the token alone on stdin", maxTokenBytes)
 		}
 		token = strings.TrimRight(string(b), "\r\n")
 		if token == "" {

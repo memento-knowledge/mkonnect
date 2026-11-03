@@ -68,6 +68,15 @@ func TestConfigSetRejectsBareToken(t *testing.T) {
 	}
 }
 
+func TestConfigSetRejectsOversizedToken(t *testing.T) {
+	withConfig(t)
+	huge := strings.Repeat("a", (64<<10)+1)
+	_, err := runCLI(t, huge, "config", "set", "origin", "--base-url", "https://git.example.com/", "--auth", "bearer", "--token-stdin")
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Errorf("an oversized token should be rejected, not truncated; got %v", err)
+	}
+}
+
 func TestConfigSetEmptyStdin(t *testing.T) {
 	withConfig(t)
 	_, err := runCLI(t, "", "config", "set", "origin", "--base-url", "https://git.example.com/", "--auth", "bearer", "--token-stdin")
