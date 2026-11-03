@@ -123,9 +123,15 @@ const defaultReadLimit int64 = 64 << 20
 // export_test.go can shorten it for tests that need to observe a stuck dial timing out.
 var dialTimeout = 30 * time.Second
 
+// DefaultHeartbeatInterval is the platform-wide default cadence at which a connector pushes a
+// liveness/status heartbeat. It is exported so a connector can name the same cadence for its own
+// periodic reporting (for example the git-sync status resend) rather than hard-coding a bare
+// duration, keeping a single source of truth for "the health interval".
+const DefaultHeartbeatInterval = 30 * time.Second
+
 // heartbeatInterval is a var, not a const, so export_test.go can shorten it for tests that
 // need to observe a heartbeat without waiting 30s of real time.
-var heartbeatInterval = 30 * time.Second
+var heartbeatInterval = DefaultHeartbeatInterval
 
 // Client is the reusable Bridge Gateway connection. A Handler supplies the behaviour of a
 // particular connector kind; Client itself is kind-agnostic.

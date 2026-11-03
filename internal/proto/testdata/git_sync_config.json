@@ -1,0 +1,21 @@
+{
+  "type": "git_sync_config",
+  "config_version": 7,
+  "repositories": [
+    {
+      "repo_id": "repo-a",
+      "origin_url": "https://git.example.com/team/repo-a.git",
+      "replica_push_url": "https://replica.example.com/mirror/repo-a.git",
+      "push_token": "synthetic-push-token-aaaa1111",
+      "push_token_expires_at": "2026-01-01T00:00:00Z",
+      "branch": "main"
+    },
+    {
+      "repo_id": "repo-b",
+      "origin_url": "https://git.example.com/team/repo-b.git",
+      "replica_push_url": "https://replica.example.com/mirror/repo-b.git",
+      "push_token": "synthetic-push-token-bbbb2222",
+      "push_token_expires_at": "2026-02-01T00:00:00Z"
+    }
+  ]
+}

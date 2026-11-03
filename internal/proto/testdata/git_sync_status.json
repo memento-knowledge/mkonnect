@@ -1,0 +1,30 @@
+{
+  "type": "git_sync_status",
+  "config_version": 7,
+  "earliest_push_token_expires_at": "2026-01-01T00:00:00Z",
+  "sent_at": "2026-01-02T03:04:05.000000000Z",
+  "sequence": 3,
+  "boot_id": "boot-synthetic-0001",
+  "origin_check": {
+    "result": "reachable",
+    "checked_at": "2026-01-02T03:04:00.000000000Z"
+  },
+  "repositories": [
+    {
+      "repo_id": "repo-a",
+      "state": "pending",
+      "origin_default_branch": "main"
+    },
+    {
+      "repo_id": "repo-b",
+      "state": "error",
+      "error_type": "origin_access_denied",
+      "error_detail": "host not configured locally"
+    },
+    {
+      "repo_id": "repo-c",
+      "state": "ok",
+      "warnings": ["lfs_not_replicated"]
+    }
+  ]
+}
