@@ -315,16 +315,6 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"nul repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0000b","origin_url":"https://git.example.com/a"}]}`,
 		"control repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0001b","origin_url":"https://git.example.com/a"}]}`,
 		"whitespace repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a b","origin_url":"https://git.example.com/a"}]}`,
-		// A leading '-' could be read as an option flag when repo_id becomes a git argv element.
-		"leading-dash repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"-rf","origin_url":"https://git.example.com/a"}]}`,
-		// Dot-edge ids are rejected: a leading dot (".git" would collide with git metadata), a trailing
-		// dot (dropped by some filesystems), and any embedded ".." (a traversal segment).
-		"leading-dot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".git","origin_url":"https://git.example.com/a"}]}`,
-		"trailing-dot repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a.","origin_url":"https://git.example.com/a"}]}`,
-		"embedded-dotdot repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a..b","origin_url":"https://git.example.com/a"}]}`,
-		// repo_id becomes a filesystem path component, so ids differing only in case collide on
-		// case-insensitive filesystems and are rejected as a duplicate.
-		"case-insensitive duplicate repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"Repo","origin_url":"https://git.example.com/a"},{"repo_id":"repo","origin_url":"https://git.example.com/b"}]}`,
 	}
 	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
@@ -351,17 +341,27 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 
 // TestApplyConfigRepoIDAccepted is the positive companion: repo_ids using the full legal charset,
 // including a maximum-length id, are accepted so the charset rule cannot be over-tightened silently.
+// Only the two pure traversal components "." and ".." are rejected beyond the charset; every other
+// contract-valid id — a leading "-", ".git", a trailing ".", an embedded ".." like "a..b", and
+// case-distinct ids — must be accepted here. Point-of-use safety (git argv, filesystem paths, case
+// folding) is Phase 3's responsibility, not this config-validation guard's.
 func TestApplyConfigRepoIDAccepted(t *testing.T) {
 	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
 	c := newTestClient(t, "")
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
 		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
-		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine; only leading/trailing/".." are not
-		[3]string{maxID, "https://git.example.com/c", ""}))
+		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine
+		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (Phase 3 passes it safely)
+		[3]string{".git", "https://git.example.com/d", ""},  // leading dot is contract-valid
+		[3]string{"a.", "https://git.example.com/e", ""},    // trailing dot is contract-valid
+		[3]string{"a..b", "https://git.example.com/f", ""},  // embedded ".." (not the bare "..") is contract-valid
+		[3]string{"Repo", "https://git.example.com/g", ""},  // case-distinct ids are NOT duplicates
+		[3]string{"repo", "https://git.example.com/h", ""},
+		[3]string{maxID, "https://git.example.com/i", ""}))
 
 	rs := repoStates(lastStatus(t, s.messages()))
-	for _, id := range []string{"repo.a_b-c", "a.b.c", maxID} {
+	for _, id := range []string{"repo.a_b-c", "a.b.c", "-rf", ".git", "a.", "a..b", "Repo", "repo", maxID} {
 		if _, ok := rs[id]; !ok {
 			t.Errorf("repo_id %q was not accepted", id)
 		}

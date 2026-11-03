@@ -71,25 +71,19 @@ const (
 // MustCompile at package init.
 var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
 
-// validRepoID reports whether a repo_id is safe to use as a path component. Beyond the charset:
-//   - A leading "-" could be read as an option flag when repo_id is later passed as a git argv
-//     element.
-//   - A leading or trailing "." (so "." and "..", but also ".git" and "a.") is rejected: a leading
-//     dot hides the entry and ".git" would collide with git's own metadata if Phase 3 roots a
-//     repository at "<root>/<id>", and a trailing dot is dropped by some filesystems.
-//   - Any embedded ".." is rejected so no id — even one like "a..b" — can form a traversal segment.
+// validRepoID reports whether a repo_id conforms to the platform contract: the charset and length
+// of repoIDRE, with the two pure path-traversal components "." and ".." additionally rejected
+// (they name a directory rather than a repository and cannot be a safe path component anywhere).
 //
-// This is deliberately stricter than the bare charset regex: restricting now is cheap, whereas
-// loosening a stored-config contract later is not. Phase 3 should still map repo_id to a
-// fixed-format directory name rather than rely on this charset alone.
+// It deliberately does NOT reject other contract-valid ids — a leading "-", ".git", a trailing ".",
+// an embedded ".." such as "a..b", or ids that differ only in case. Those are safe to STORE; the
+// only risks they carry are at the point of USE (a git argv element, a filesystem path, a
+// case-insensitive filesystem), which Phase 3 must defend independently (pass repo_id after "--" or
+// never in option position, map it to a bounded fixed-format directory name, and fold case when it
+// builds paths). Over-restricting here instead would reject platform-valid configurations whole and
+// halt sync for every repository in the message, so the guard is kept to the agreed contract.
 func validRepoID(id string) bool {
-	if !repoIDRE.MatchString(id) {
-		return false
-	}
-	if strings.HasPrefix(id, "-") || strings.HasPrefix(id, ".") || strings.HasSuffix(id, ".") {
-		return false
-	}
-	return !strings.Contains(id, "..")
+	return repoIDRE.MatchString(id) && id != "." && id != ".."
 }
 
 const (
@@ -274,24 +268,19 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		return false
 	}
 	next := make(map[string]repoState, len(msg.Repositories))
-	// seen detects duplicates case-INsensitively: repo_id becomes a filesystem path component in
-	// Phase 3, and ids differing only in case ("Repo" vs "repo") are distinct map keys but the same
-	// directory on case-insensitive filesystems (APFS, Windows), so both must be rejected as a clash.
-	// The id is already ASCII-validated by validRepoID, so strings.ToLower folds ASCII only here.
-	seen := make(map[string]struct{}, len(msg.Repositories))
 	for _, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
 			// repo_id will be used in local filesystem paths and replica push URLs in Phase 3, so a
-			// value outside the safe charset (or a traversal / dot component) is rejected here, not
-			// silently carried. Not logged verbatim: a hostile id could carry log-injection bytes.
+			// value outside the contract charset (or a "." / ".." traversal component) is rejected
+			// here, not silently carried. Not logged verbatim: a hostile id could carry
+			// log-injection bytes.
 			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
 			return false
 		}
-		if _, dup := seen[strings.ToLower(r.RepoID)]; dup {
+		if _, dup := next[r.RepoID]; dup {
 			slog.Warn("git_sync_config has a duplicate repo_id; leaving configuration unchanged", "repo_id", r.RepoID)
 			return false
 		}
-		seen[strings.ToLower(r.RepoID)] = struct{}{}
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
 		// (loaded at startup, no live reload), so the result is stable until the next config and
 		// need not be recomputed on every status. The origin is parsed once: its canonical host key
