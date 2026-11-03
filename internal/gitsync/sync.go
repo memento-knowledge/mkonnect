@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
+	"os/exec"
 	"time"
 )
 
 const (
 	// defaultFetchTimeout and defaultPushTimeout bound a single clone/fetch and a single push, so a
 	// wedged connection cannot hold a sync slot forever. They are generous because the first clone
-	// of a large repository is legitimately slow. (Per-deployment tuning is a Phase 3b item.)
+	// of a large repository is legitimately slow. They are not yet configurable per deployment.
 	defaultFetchTimeout = 30 * time.Minute
 	defaultPushTimeout  = 30 * time.Minute
 
@@ -96,6 +96,20 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
+	// Never prune the replica from a mirror with nothing to send: an origin that advertises no
+	// branches or tags (an empty repository, or a transient bad advertisement) leaves the mirror
+	// with no refs, and `push --prune` would then delete every branch and tag on the replica.
+	if stderr, err := d.hasPushableRefs(ctx, home, t); err != nil {
+		if ctx.Err() != nil {
+			return syncResult{State: StatePending}
+		}
+		if errors.Is(err, errNoRefs) {
+			return syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errOriginEmpty}
+		}
+		typ, detail := classifyGitFailure(originSide, err, stderr, false)
+		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
+	}
+
 	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--prune", "--force", "--", t.ReplicaURL}, pushRefspecs...)
 	pushEnv := gitConfigEnv(gitBaseEnv(home), credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken))
 	stderr, err := d.runBounded(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home)
@@ -110,6 +124,28 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 	return syncResult{State: StateOK}
 }
 
+// errOriginEmpty is the detail reported when the origin has no branches or tags to replicate. The
+// replica is left exactly as it was.
+const errOriginEmpty = "origin has no branches or tags; replica left unchanged"
+
+var errNoRefs = errors.New("mirror has no branches or tags")
+
+// hasPushableRefs reports, as a nil error, that the mirror holds at least one branch or tag.
+// `git show-ref --quiet` exits 1 when nothing matches, which is returned as errNoRefs; any other
+// failure is returned as-is and says nothing about whether the origin is empty.
+func (d syncDeps) hasPushableRefs(ctx context.Context, home string, t syncTask) ([]byte, error) {
+	argv := []string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "show-ref", "--quiet", "--heads", "--tags"}
+	stderr, err := d.runBounded(ctx, d.fetchTimeoutOrDefault(), "ref check", argv, gitBaseEnv(home), home)
+	if err == nil {
+		return nil, nil
+	}
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return nil, errNoRefs
+	}
+	return stderr, err
+}
+
 // fetchOrClone brings the local mirror up to date with the origin: a fetch when a mirror exists, a
 // clone otherwise. A mirror directory that is not a usable repository is removed and recloned once.
 func (d syncDeps) fetchOrClone(ctx context.Context, home string, t syncTask) ([]byte, error) {
@@ -122,7 +158,7 @@ func (d syncDeps) fetchOrClone(ctx context.Context, home string, t syncTask) ([]
 		if err == nil {
 			return nil, nil
 		}
-		if !containsAny(strings.ToLower(string(stderr)), corruptMirrorMarkers) {
+		if !isCorruptMirror(stderr) {
 			return stderr, err
 		}
 		if rmErr := os.RemoveAll(dir); rmErr != nil {

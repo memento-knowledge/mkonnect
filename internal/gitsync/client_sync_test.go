@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -249,6 +251,128 @@ func TestOnDrainingWaitsBrieflyForInFlightSync(t *testing.T) {
 	}
 }
 
+// Every finished sync used to send a full status that echoes every repository, so a fan-out over N
+// repositories cost N statuses of O(N) size each. Completions are coalesced: the first is sent at
+// once, the rest within one interval, and the final state is always flushed.
+func TestCompletionStatusesAreCoalesced(t *testing.T) {
+	g := &scriptedGit{}
+	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow,
+		gitsync.WithGitRunner(g.run), gitsync.WithStatusInterval(150*time.Millisecond))
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+
+	const n = 40
+	objs := make([]string, n)
+	for i := range objs {
+		id := fmt.Sprintf("repo-%02d", i)
+		objs[i] = repoJSON(id, "https://git.example.com/team/"+id+".git", "", "https://replica.example.com/r/"+id+".git", testPushToken)
+	}
+	c.HandleMessage(ctx, s, "git_sync_config", configJSONRaw("1", objs...))
+
+	waitFor(t, func() bool {
+		for _, r := range lastStatus(t, s.messages()).Repositories {
+			if r.State != gitsync.StateOK {
+				return false
+			}
+		}
+		return true
+	})
+	statuses := 0
+	for _, m := range s.messages() {
+		if _, ok := m.(proto.GitSyncStatusMsg); ok {
+			statuses++
+		}
+	}
+	if statuses > 12 {
+		t.Errorf("sent %d statuses for %d completions; want them coalesced (an uncoalesced run sends ~%d)", statuses, n, n+2)
+	}
+}
+
+// A result recorded for a target the platform has since reconfigured must never be attributed to the
+// new target: a repository moved to a new replica mid-sync is not "ok" because the OLD push was.
+func TestResultForAReconfiguredTargetIsIgnored(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	c.SetCriticalPatchForTest(true) // nothing syncs, so only the explicit results below are recorded
+	s := &stubSender{}
+	ctx := context.Background()
+	apply := func(replica string) {
+		c.HandleMessage(ctx, s, "git_sync_config", configJSONRaw("1",
+			repoJSON("repo-a", "https://git.example.com/a.git", "", replica, testPushToken)))
+	}
+	state := func() proto.GitSyncRepoStatus {
+		_ = c.OnHeartbeat(ctx, s)
+		return repoStatusNow(t, s, "repo-a")
+	}
+
+	apply("https://replica.example.com/r/old.git")
+	_, canon, _, _ := c.RepoStateForTest("repo-a")
+	oldReplica, _, _ := c.ReplicaMaterialForTest("repo-a")
+	apply("https://replica.example.com/r/new.git") // reconfigured while the old sync was running
+	newReplica, _, _ := c.ReplicaMaterialForTest("repo-a")
+
+	c.FinishSyncForTest("repo-a", canon, oldReplica, gitsync.StateError, gitsync.ErrReplicaRejected)
+	if got := state(); got.State != gitsync.StatePending || got.ErrorType != "" {
+		t.Errorf("a stale result was attributed to the new target: %+v, want pending", got)
+	}
+	c.FinishSyncForTest("repo-a", canon, newReplica, gitsync.StateOK, "")
+	if got := state(); got.State != gitsync.StateOK {
+		t.Errorf("a result for the current target was ignored: %+v, want ok", got)
+	}
+}
+
+// A sync that finishes after its connection has gone must not write to that connection (its sender
+// is bound to it); the next heartbeat on the new connection reports the result instead.
+func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
+	g := &scriptedGit{gate: make(chan struct{})}
+	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	connCtx, closeConn := context.WithCancel(context.Background())
+	conn := &stubSender{}
+	c.OnConnected(connCtx, conn)
+
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config",
+		configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))
+	waitFor(t, func() bool { return g.count("clone") == 1 })
+
+	before := len(conn.messages())
+	closeConn()
+	close(g.gate)
+	waitFor(t, func() bool { return g.count("push") == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if after := len(conn.messages()); after != before {
+		t.Errorf("a finished sync wrote %d message(s) to a closed connection", after-before)
+	}
+}
+
+func TestMirrorsRootIsMadeAbsolute(t *testing.T) {
+	c := newTestClientOpts(t, oneProvider, &fakeProber{result: gitsync.OriginReachable}, fixedNow,
+		gitsync.WithMirrorsRoot("relative/mirrors"))
+	root := c.MirrorsRootForTest()
+	if !filepath.IsAbs(root) || !strings.HasSuffix(root, filepath.Join("relative", "mirrors")) {
+		t.Errorf("mirrors root = %q, want an absolute path: git runs in a temp dir, so a relative root would clone into it and lose the mirror", root)
+	}
+}
+
+// At shutdown the process-lifetime context is cancelled, which kills each git; Wait lets the daemon
+// confirm they have stopped before it exits rather than orphan a process that holds a credential.
+func TestWaitReturnsOnceCancelledSyncsHaveStopped(t *testing.T) {
+	g := &scriptedGit{gate: make(chan struct{})}
+	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	ctx, cancel := context.WithCancel(context.Background())
+	c.HandleMessage(ctx, &stubSender{}, "git_sync_config",
+		configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))
+	waitFor(t, func() bool { return g.count("clone") == 1 })
+	cancel()
+
+	wctx, wcancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer wcancel()
+	start := time.Now()
+	c.Wait(wctx)
+	if wctx.Err() != nil || time.Since(start) > 2*time.Second {
+		t.Errorf("Wait ran out its bound (%v) although the cancelled sync had stopped", time.Since(start))
+	}
+}
+
 func TestApplyConfigRetainsReplicaMaterialForMatched(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSONRaw("1",
@@ -281,7 +405,9 @@ func TestApplyConfigMalformedReplicaMarksRepoNotWholeConfig(t *testing.T) {
 		repoJSON("plain-http", "https://git.example.com/h.git", "", "http://replica.example.com/r/h.git", testPushToken),
 		repoJSON("no-replica", "https://git.example.com/n.git", "", "", testPushToken),
 		repoJSON("no-token", "https://git.example.com/t.git", "", "https://replica.example.com/r/t.git", ""),
-		repoJSON("userinfo", "https://git.example.com/u.git", "", "https://user:pw@replica.example.com/r/u.git", testPushToken)))
+		repoJSON("userinfo", "https://git.example.com/u.git", "", "https://user:pw@replica.example.com/r/u.git", testPushToken),
+		// The token becomes an Authorization header value: a CR/LF would inject headers.
+		repoJSON("ctl-token", "https://git.example.com/c.git", "", "https://replica.example.com/r/c.git", "push-token-abcdef\r\nX-Evil: yes")))
 
 	st := lastStatus(t, s.messages())
 	if string(st.ConfigVersion) != "5" {
@@ -291,7 +417,7 @@ func TestApplyConfigMalformedReplicaMarksRepoNotWholeConfig(t *testing.T) {
 	if rs["good"].State != gitsync.StateSyncing {
 		t.Errorf("good = %+v, want syncing", rs["good"])
 	}
-	for _, id := range []string{"plain-http", "no-replica", "no-token", "userinfo"} {
+	for _, id := range []string{"plain-http", "no-replica", "no-token", "userinfo", "ctl-token"} {
 		r := rs[id]
 		if r.State != gitsync.StateError || r.ErrorType != gitsync.ErrUnclassified || r.ErrorDetail != "invalid replica configuration" {
 			t.Errorf("%s = %+v, want error/unclassified/invalid replica configuration", id, r)

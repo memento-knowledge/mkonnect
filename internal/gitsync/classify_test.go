@@ -80,6 +80,95 @@ func TestClassifyGitFailure(t *testing.T) {
 	}
 }
 
+// git prints a status line per ref, so a branch or tag NAME must never steer the classification: a
+// ref called "user-quota" is not a quota failure, and "tls-fix" is not a TLS failure.
+func TestClassifyGitFailureIgnoresRefNames(t *testing.T) {
+	exit := errors.New("exit status 128")
+	push := "To https://replica.example.com/r.git\n" +
+		" * [new branch]      feature/user-quota -> feature/user-quota\n" +
+		" * [new tag]         ssl-timed-out-fix -> ssl-timed-out-fix\n" +
+		" ! [remote rejected] main -> main (pre-receive hook declined)\n" +
+		"error: failed to push some refs to 'https://replica.example.com/r.git'\n"
+	if got, _ := classifyGitFailure(replicaSide, exit, []byte(push), false); got != ErrReplicaRejected {
+		t.Errorf("a hook rejection beside quota/ssl-named refs = %q, want replica_rejected", got)
+	}
+
+	fetch := "From https://git.example.com/group/repo-a\n" +
+		" * [new branch]      tls-fix -> tls-fix\n" +
+		" * [new tag]         v1-corrupt-cache -> v1-corrupt-cache\n" +
+		"fatal: something unexpected went wrong\n"
+	if got, _ := classifyGitFailure(originSide, exit, []byte(fetch), false); got != ErrUnclassified {
+		t.Errorf("an unknown failure beside tls-named refs = %q, want unclassified", got)
+	}
+
+	// The reason in a rejected line still counts: it is git's explanation, not a ref name.
+	quota := " ! [remote rejected] main -> main (repository size limit exceeded)\n"
+	if got, _ := classifyGitFailure(replicaSide, exit, []byte(quota), false); got != ErrRepositoryOverLimit {
+		t.Errorf("a size-limit reason = %q, want repository_over_limit", got)
+	}
+}
+
+// With no fatal:/error: line, the detail used to fall back to the last line, which could be a ref
+// status line carrying a branch name.
+func TestClassifyGitFailureDetailNeverCarriesRefNames(t *testing.T) {
+	exit := errors.New("exit status 128")
+	stderr := " * [new tag]         release-tag-1 -> release-tag-1\n * [new tag]         release-tag-2 -> release-tag-2\n"
+
+	typ, detail := classifyGitFailure(replicaSide, exit, []byte(stderr), false)
+	if typ != ErrUnclassified {
+		t.Fatalf("error_type = %q, want unclassified", typ)
+	}
+	if strings.Contains(detail, "release-tag") || strings.Contains(detail, "->") {
+		t.Errorf("detail %q carries a ref name", detail)
+	}
+	if detail == "" {
+		t.Error("unclassified must still carry a detail")
+	}
+}
+
+// A hostname from a proxy error is customer infrastructure; the detail must never carry a host.
+func TestClassifyGitFailureDetailNeverCarriesAHost(t *testing.T) {
+	exit := errors.New("exit status 128")
+	stderr := "fatal: unable to access 'https://git.example.com/x/': Weird proxy trouble via proxy.corp.example:3128 and 10.1.2.3"
+
+	_, detail := classifyGitFailure(originSide, exit, []byte(stderr), false)
+	for _, leak := range []string{"proxy.corp.example", "3128", "10.1.2.3", "example"} {
+		if strings.Contains(detail, leak) {
+			t.Errorf("detail %q leaks %q", detail, leak)
+		}
+	}
+}
+
+func TestClassifyGitFailureProxyResolveFailureIsUnreachable(t *testing.T) {
+	exit := errors.New("exit status 128")
+	stderr := "fatal: unable to access 'https://git.example.com/x/': Could not resolve proxy: proxy.corp.example"
+	if got, detail := classifyGitFailure(originSide, exit, []byte(stderr), false); got != ErrOriginUnreachable || detail != "" {
+		t.Errorf("got (%q, %q), want origin_unreachable with no detail", got, detail)
+	}
+}
+
+func TestIsCorruptMirror(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{"not a repository", "fatal: not a git repository: '/m/abc.git'", true},
+		{"corrupt object file", "error: object file /m/abc.git/objects/ab/cd is corrupt\nfatal: loose object is corrupt", true},
+		{"bad object", "error: bad object refs/heads/main", true},
+		{"the origin reporting its own corruption", "remote: error: object 1234 is corrupt\nfatal: the remote end hung up unexpectedly", false},
+		{"a ref named corrupt", " * [new branch]      fix-corrupt-cache -> fix-corrupt-cache\nfatal: unable to access 'https://git.example.com/': Connection refused", false},
+		{"unrelated failure", "fatal: unable to access 'https://git.example.com/': Could not resolve host: git.example.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCorruptMirror([]byte(tt.stderr)); got != tt.want {
+				t.Errorf("isCorruptMirror(%q) = %v, want %v", tt.stderr, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestClassifyGitFailureUnclassifiedDetailIsSanitized(t *testing.T) {
 	exit := errors.New("exit status 128")
 	stderr := "fatal: weird failure contacting https://secret-host.example.com/group/repo.git near '/var/lib/gitsync/mirrors/abc.git' while syncing\n"

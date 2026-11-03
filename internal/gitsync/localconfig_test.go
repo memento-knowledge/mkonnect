@@ -450,7 +450,7 @@ func TestHostMatchNoUnicodeBypass(t *testing.T) {
 	}
 }
 
-// TestCanonicalRemoteURLReserialized asserts the Phase-3 dial URL: the host is canonicalized to the
+// TestCanonicalRemoteURLReserialized asserts the dial URL: the host is canonicalized to the
 // exact string that was match-checked (ASCII-lowercased, trailing dot stripped, explicit port) and
 // the repository path is preserved, so git dials byte-for-byte the host that was authorized.
 func TestCanonicalRemoteURLReserialized(t *testing.T) {

@@ -1,7 +1,6 @@
 package gitsync
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,8 +27,8 @@ const (
 // probeTimeout bounds a single ls-remote probe so a hung network call cannot stall the caller.
 const probeTimeout = 15 * time.Second
 
-// maxProbeStderr caps how much of git's stderr is retained for classification.
-const maxProbeStderr = 8 << 10
+// maxGitStderr caps how much of git's stderr is retained for classification.
+const maxGitStderr = 8 << 10
 
 // OriginProber probes an origin's reachability and access. A non-nil error is a LOCAL fault — for
 // example the git binary is missing — which the caller MUST NOT report as an origin result;
@@ -49,8 +48,9 @@ type gitProber struct {
 func NewGitProber() *gitProber { return &gitProber{run: runGit} }
 
 // GitVersionOK reports whether a git that supports GIT_CONFIG_* credential injection (>= 2.31) is
-// available on PATH. When it returns false, the reachability probe cannot inject the credential and
-// the git-sync image is misconfigured — a packaging concern, surfaced as a startup warning.
+// available on PATH. When it returns false, neither the reachability probe nor the mirror sync can
+// inject its credential and the git-sync image is misconfigured — a packaging concern, surfaced as
+// a startup warning.
 func GitVersionOK() (ok bool, detail string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -124,30 +124,34 @@ var (
 )
 
 // classifyLsRemote maps git's exit and stderr to an OriginResult. A received HTTP response (even a
-// 404 against a base URL that is not itself a repository) means the origin is reachable; 401/403/407
-// mean the credential was rejected or missing; a connection/DNS/TLS failure means unreachable. It
-// never reports "reachable" for an unrecognised failure.
+// 404 against a base URL that is not itself a repository) means the origin is reachable; 401/403
+// mean the credential was rejected or missing; a connection/DNS/TLS failure, or a proxy's 407,
+// means unreachable. It never reports "reachable" for an unrecognised failure.
+//
+// It shares authMarkers and connMarkers with classifyGitFailure, so a given git error is read the
+// same way before configuration (here) and after it (per repository); the portal must not say
+// "access denied" and later "unreachable" for one problem. They differ deliberately only where the
+// target does: this probes a base URL that need not be a repository, so a server that answers with
+// a 404 or a 5xx is "reachable", whereas a missing repository is a failed sync.
 func classifyLsRemote(err error, stderr []byte) OriginResult {
 	if err == nil {
 		return OriginReachable
 	}
-	// Remove the echoed URL so its host cannot trip a keyword below.
-	s := strings.ToLower(string(quotedRE.ReplaceAll(stderr, []byte("''"))))
+	s := matchText(stderr)
 
 	// Access-denied markers first: these also contain "unable to access", so they must win over the
 	// generic reachable classification below.
-	for _, m := range []string{
-		"authentication failed", "could not read username", "terminal prompts disabled",
-		"401 unauthorized", "403 forbidden",
-	} {
-		if strings.Contains(s, m) {
-			return OriginAccessDenied
-		}
+	if containsAny(s, authMarkers) {
+		return OriginAccessDenied
 	}
 	if m := httpStatusRE.FindStringSubmatch(s); m != nil {
 		switch m[1] {
-		case "401", "403", "407":
+		case "401", "403":
 			return OriginAccessDenied
+		case "407":
+			// A proxy demanding authentication is not the customer's origin credential being
+			// rejected; it is the connector failing to reach the origin.
+			return OriginUnreachable
 		default:
 			// 404, 3xx, 5xx, anything else: the server answered, so the origin is reachable.
 			return OriginReachable
@@ -161,14 +165,8 @@ func classifyLsRemote(err error, stderr []byte) OriginResult {
 			return OriginReachable
 		}
 	}
-	for _, m := range []string{
-		"could not resolve host", "couldn't resolve host", "connection refused",
-		"connection timed out", "timed out", "could not connect", "failed to connect",
-		"ssl", "tls", "certificate",
-	} {
-		if strings.Contains(s, m) {
-			return OriginUnreachable
-		}
+	if containsAny(s, connMarkers) {
+		return OriginUnreachable
 	}
 	// Unknown failure: never claim reachable.
 	return OriginUnreachable
@@ -184,7 +182,7 @@ func runGit(ctx context.Context, argv, env []string, dir string) ([]byte, error)
 	cmd.Dir = dir
 	cmd.Stdin = nil
 	cmd.Stdout = io.Discard
-	stderr := &limitedBuffer{max: maxProbeStderr}
+	stderr := &limitedBuffer{max: maxGitStderr}
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -198,22 +196,44 @@ func runGit(ctx context.Context, argv, env []string, dir string) ([]byte, error)
 	return stderr.Bytes(), err
 }
 
-// limitedBuffer retains at most max bytes but reports every write as fully consumed, so git never
-// sees a short-write error on its stderr.
+// truncationMarker stands in for the middle of a limitedBuffer's output when it was cut.
+const truncationMarker = "\n[... output truncated ...]\n"
+
+// limitedBuffer retains at most max bytes of what is written to it — the first half and the last
+// half — but reports every write as fully consumed, so git never sees a short-write error on its
+// stderr. Both ends are kept because git prints its explanation of a failed push LAST, after a
+// status line for every ref: a buffer that kept only the beginning would lose the one line that
+// says why it failed.
 type limitedBuffer struct {
-	buf bytes.Buffer
-	max int
+	max     int
+	head    []byte
+	tail    []byte
+	dropped bool
 }
 
 func (l *limitedBuffer) Write(p []byte) (int, error) {
-	if rem := l.max - l.buf.Len(); rem > 0 {
-		if len(p) > rem {
-			l.buf.Write(p[:rem])
-		} else {
-			l.buf.Write(p)
+	n := len(p)
+	headCap := l.max / 2
+	if room := headCap - len(l.head); room > 0 {
+		take := min(room, len(p))
+		l.head = append(l.head, p[:take]...)
+		p = p[take:]
+	}
+	if len(p) > 0 {
+		tailCap := l.max - headCap
+		l.tail = append(l.tail, p...)
+		if len(l.tail) > tailCap {
+			l.dropped = true
+			l.tail = append(l.tail[:0], l.tail[len(l.tail)-tailCap:]...)
 		}
 	}
-	return len(p), nil
+	return n, nil
 }
 
-func (l *limitedBuffer) Bytes() []byte { return l.buf.Bytes() }
+func (l *limitedBuffer) Bytes() []byte {
+	out := append([]byte(nil), l.head...)
+	if l.dropped {
+		out = append(out, truncationMarker...)
+	}
+	return append(out, l.tail...)
+}

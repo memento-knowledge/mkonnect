@@ -73,10 +73,13 @@ type GitSyncRepoConfig struct {
 	// configuration). The connector uses the local credential against it only if its scheme, host
 	// and port match a locally configured provider.
 	OriginURL string `json:"origin_url"`
-	// ReplicaPushURL is where the connector pushes the mirror (used from Phase 3).
+	// ReplicaPushURL is where the connector pushes the mirror. It must be an https URL: the push
+	// token travels to it.
 	ReplicaPushURL string `json:"replica_push_url"`
-	// PushToken authenticates the push to the replica (used from Phase 3). It is a Secret so it
-	// cannot leak through a log or re-marshal; Phase 2 does not retain it beyond decoding.
+	// PushToken authenticates the push to the replica, sent as an Authorization Bearer token
+	// (INFERRED: the contract names the token but not the scheme). It is a Secret so it cannot leak
+	// through a log or re-marshal; the connector keeps it in memory only, and only for a repository
+	// it can sync.
 	PushToken Secret `json:"push_token"`
 	// PushTokenExpiresAt is the push token's expiry (RFC3339). The connector reports the earliest it
 	// holds so the platform can refresh before expiry.
@@ -137,8 +140,9 @@ type GitSyncRepoStatus struct {
 }
 
 // GitSyncNowMsg is sent by the platform to request an immediate sync. An empty repo_id is
-// provisionally interpreted as "every matchable repository"; a later phase must coalesce and
-// rate-limit, and the platform contract should prefer an explicit all-repositories signal.
+// provisionally interpreted as "every syncable repository", and the platform contract should prefer
+// an explicit all-repositories signal. The connector folds triggers for a repository that is already
+// syncing into a single trailing rerun, but does not otherwise rate-limit them.
 type GitSyncNowMsg struct {
 	Type   string `json:"type"` // "git_sync_now"
 	RepoID string `json:"repo_id,omitempty"`

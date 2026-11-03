@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -32,11 +33,23 @@ type gitCall struct {
 func (c gitCall) sub() string {
 	for _, a := range c.argv {
 		switch a {
-		case "clone", "fetch", "push":
+		case "clone", "fetch", "push", "show-ref":
 			return a
 		}
 	}
 	return ""
+}
+
+// exitCode1 returns the error a process that exited with status 1 yields, which is how git
+// show-ref reports "no matching refs".
+func exitCode1(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("false").Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("could not produce an exit-status-1 error: %v", err)
+	}
+	return err
 }
 
 func (c gitCall) envHas(sub string) bool {
@@ -97,11 +110,11 @@ func TestSyncRepoCloneThenPushHappyPath(t *testing.T) {
 	if got.State != StateOK || got.ErrorType != "" {
 		t.Fatalf("result = %+v, want ok", got)
 	}
-	if want := []string{"clone", "push"}; !slices.Equal(f.subs(), want) {
+	if want := []string{"clone", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Fatalf("git sequence = %v, want %v", f.subs(), want)
 	}
 
-	clone, push := f.calls[0], f.calls[1]
+	clone, push := f.calls[0], f.calls[2]
 	if !slices.Contains(clone.argv, "--mirror") || !slices.Contains(clone.argv, testOriginURL) || !slices.Contains(clone.argv, d.mirrors.Dir("repo-a")) {
 		t.Errorf("clone argv = %v, want --mirror <canonical origin URL> <mirror dir>", clone.argv)
 	}
@@ -128,6 +141,45 @@ func TestSyncRepoCloneThenPushHappyPath(t *testing.T) {
 				t.Errorf("a credential leaked into argv: %v", c.argv)
 			}
 		}
+	}
+}
+
+// An origin that advertises no branches or tags (an empty repository, or a transient bad
+// advertisement) must never be pushed with --prune: that would delete every branch and tag on the
+// replica.
+func TestSyncRepoOriginWithNoRefsDoesNotPushOrPrune(t *testing.T) {
+	f := &fakeGit{script: func(c gitCall) ([]byte, error) {
+		if c.sub() == "show-ref" {
+			return nil, exitCode1(t)
+		}
+		return nil, nil
+	}}
+	got := syncRepo(context.Background(), newTestDeps(t, f), testTask())
+
+	if got.State != StateError || got.ErrorType != ErrUnclassified || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+		t.Fatalf("result = %+v, want error/unclassified naming the empty origin", got)
+	}
+	if slices.Contains(f.subs(), "push") {
+		t.Errorf("nothing may be pushed when the origin has no refs; sequence = %v", f.subs())
+	}
+}
+
+// A show-ref failure that is not "no refs" (exit 1) says nothing about the origin; it must not be
+// mistaken for an empty one, and must not push either.
+func TestSyncRepoRefCheckFailureIsNotAnEmptyOrigin(t *testing.T) {
+	f := &fakeGit{script: func(c gitCall) ([]byte, error) {
+		if c.sub() == "show-ref" {
+			return []byte("fatal: not a git repository"), errExit
+		}
+		return nil, nil
+	}}
+	got := syncRepo(context.Background(), newTestDeps(t, f), testTask())
+
+	if got.State != StateError || strings.Contains(got.ErrorDetail, "no branches or tags") {
+		t.Fatalf("result = %+v, want an error that does not claim the origin is empty", got)
+	}
+	if slices.Contains(f.subs(), "push") {
+		t.Errorf("no push after a failed ref check; sequence = %v", f.subs())
 	}
 }
 
@@ -160,7 +212,7 @@ func TestSyncRepoFetchesWhenMirrorExists(t *testing.T) {
 	if got.State != StateOK {
 		t.Fatalf("result = %+v, want ok", got)
 	}
-	if want := []string{"fetch", "push"}; !slices.Equal(f.subs(), want) {
+	if want := []string{"fetch", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Fatalf("git sequence = %v, want %v", f.subs(), want)
 	}
 	fetch := f.calls[0]
@@ -272,7 +324,7 @@ func TestSyncRepoCorruptMirrorReclones(t *testing.T) {
 	if got.State != StateOK {
 		t.Fatalf("result = %+v, want ok after one reclone", got)
 	}
-	if want := []string{"fetch", "clone", "push"}; !slices.Equal(f.subs(), want) {
+	if want := []string{"fetch", "clone", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Errorf("git sequence = %v, want %v", f.subs(), want)
 	}
 }

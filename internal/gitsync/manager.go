@@ -2,27 +2,37 @@ package gitsync
 
 import (
 	"context"
+	"log/slog"
 	"sync"
+	"time"
 )
 
 // defaultSyncConcurrency is how many repositories sync at once. Each sync is a git subprocess that
-// may be memory- and bandwidth-heavy, so the default is deliberately small. (Making it
-// configurable per deployment is a Phase 3b item.)
+// may be memory- and bandwidth-heavy, so the default is deliberately small. It is not yet
+// configurable per deployment.
 const defaultSyncConcurrency = 4
 
 // syncHooks connect the manager to the connector's state without the manager knowing about it.
 type syncHooks struct {
 	// resolve returns a snapshot of the task to run for repoID, or false when the repository is not
-	// (or no longer) syncable. It is called again before every rerun so a refreshed token or changed
-	// target is picked up.
+	// (or no longer) syncable. It is called only once a concurrency slot is held, immediately before
+	// the sync starts, so a repository that queued behind others runs with the token and target it
+	// has when it runs, not the ones it had when it was queued.
 	resolve func(repoID string) (syncTask, bool)
-	// begin marks the repository as syncing. It runs synchronously inside enqueue, so a status built
-	// right after enqueue returns already reports it.
-	begin func(repoID string, t syncTask)
+	// begin marks the repository as syncing (queued or running). It runs synchronously inside
+	// enqueue, so a status built right after enqueue returns already reports it.
+	begin func(repoID string)
 	// finish records the outcome and clears the syncing mark. A pending result means the sync was
 	// cancelled and nothing should be recorded. The implementation must ignore a task whose target
 	// no longer matches the repository's current configuration.
 	finish func(repoID string, t syncTask, r syncResult)
+	// release clears the syncing mark of a repository that did not run (cancelled while queued, no
+	// longer syncable, or suspended), recording nothing.
+	release func(repoID string)
+	// suspended reports whether all syncing is currently suspended (a critical security update is
+	// required). It is checked when a queued sync or a rerun is about to start, so work queued
+	// before the gate closed does not run after it.
+	suspended func() bool
 	// changed reports that a repository's state changed in a way worth sending a status for.
 	changed func()
 }
@@ -65,8 +75,7 @@ func newManager(limit int, deps syncDeps, hooks syncHooks) *manager {
 // context, not a connection's, so a reconnect does not kill a long clone.
 func (m *manager) enqueue(ctx context.Context, repoIDs []string) {
 	for _, id := range repoIDs {
-		task, ok := m.hooks.resolve(id)
-		if !ok {
+		if _, ok := m.hooks.resolve(id); !ok {
 			continue
 		}
 		m.mu.Lock()
@@ -81,19 +90,15 @@ func (m *manager) enqueue(ctx context.Context, repoIDs []string) {
 		m.inflight[id] = struct{}{}
 		m.mu.Unlock()
 
-		m.hooks.begin(id, task)
-		go m.runRepo(ctx, id, task)
+		m.hooks.begin(id)
+		go m.runRepo(ctx, id)
 	}
 }
 
 // runRepo runs a repository's sync, then its trailing rerun if one was requested meanwhile.
-func (m *manager) runRepo(ctx context.Context, id string, task syncTask) {
+func (m *manager) runRepo(ctx context.Context, id string) {
 	for {
-		res := m.runOne(ctx, task)
-		m.hooks.finish(id, task, res)
-		if res.State != StatePending {
-			m.hooks.changed()
-		}
+		m.runOnce(ctx, id)
 
 		m.mu.Lock()
 		again := m.rerun[id] && ctx.Err() == nil
@@ -104,30 +109,51 @@ func (m *manager) runRepo(ctx context.Context, id string, task syncTask) {
 			return
 		}
 		m.mu.Unlock()
-
-		next, ok := m.hooks.resolve(id)
-		if !ok {
-			m.mu.Lock()
-			delete(m.rerun, id)
-			m.removeInflightLocked(id)
-			m.mu.Unlock()
-			return
-		}
-		m.hooks.begin(id, next)
-		task = next
+		m.hooks.begin(id)
 	}
 }
 
-// runOne waits for a concurrency slot and runs one sync. Cancellation while waiting, like
-// cancellation during the sync, is reported as pending rather than as a failure.
-func (m *manager) runOne(ctx context.Context, task syncTask) syncResult {
+// runOnce waits for a concurrency slot, then resolves the task and runs one sync. Cancellation
+// while waiting, like cancellation during the sync, is not a failure: nothing is recorded.
+func (m *manager) runOnce(ctx context.Context, id string) {
 	select {
 	case m.sem <- struct{}{}:
 	case <-ctx.Done():
-		return syncResult{State: StatePending}
+		m.hooks.release(id)
+		return
 	}
 	defer func() { <-m.sem }()
-	return syncRepo(ctx, m.deps, task)
+
+	if ctx.Err() != nil {
+		m.hooks.release(id)
+		return
+	}
+	task, ok := m.hooks.resolve(id)
+	if !ok || m.hooks.suspended() {
+		m.hooks.release(id)
+		m.hooks.changed()
+		return
+	}
+	start := time.Now()
+	res := syncRepo(ctx, m.deps, task)
+	m.hooks.finish(id, task, res)
+	if res.State != StatePending {
+		logOutcome(id, res, time.Since(start))
+		m.hooks.changed()
+	}
+}
+
+// logOutcome writes one line per finished sync. The portal shows the same outcome, but an operator
+// debugging on the machine (the CLI `status` defers to the portal) has nothing else. It carries only
+// the repo_id (restricted to a safe charset), the typed code, the sanitised detail and the duration:
+// never a URL, host, path or credential.
+func logOutcome(repoID string, res syncResult, took time.Duration) {
+	took = took.Round(time.Millisecond)
+	if res.State == StateError {
+		slog.Warn("sync failed", "repo_id", repoID, "error_type", res.ErrorType, "detail", res.ErrorDetail, "duration", took)
+		return
+	}
+	slog.Info("sync complete", "repo_id", repoID, "duration", took)
 }
 
 // removeInflightLocked drops id from the in-flight set and, when that leaves none, signals idle.

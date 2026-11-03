@@ -113,6 +113,67 @@ func TestSyncRepoAgainstRealGit(t *testing.T) {
 	}
 }
 
+// TestSyncRepoAgainstRealGitEmptyOriginNeverWipesReplica reproduces the data-loss case: once an
+// origin advertises no branches or tags, `fetch --prune` empties the mirror (and exits 0), and a
+// `push --prune` from it would delete everything on the replica. Both a previously-synced origin
+// that lost its refs and an origin that is empty on the very first sync must leave the replica as it
+// was and report an error.
+func TestSyncRepoAgainstRealGitEmptyOriginNeverWipesReplica(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	replica := filepath.Join(root, "replica.git")
+	work := filepath.Join(root, "work")
+	for _, d := range []string{origin, replica} {
+		git(t, "", "init", "--bare", "-b", "main", d)
+	}
+	git(t, "", "init", "-b", "main", work)
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, work, "add", "file.txt")
+	git(t, work, "commit", "-m", "one")
+	git(t, work, "tag", "v1")
+	git(t, work, "push", origin, "main", "v1")
+
+	d := syncDeps{mirrors: Mirrors{Root: filepath.Join(root, "mirrors")}, run: runGit, now: time.Now}
+	task := syncTask{
+		RepoID: "repo-a", CanonicalURL: "file://" + origin, ReplicaURL: "file://" + replica,
+		PushToken: Secret("push-token-abcdefghij"),
+	}
+	populated := []string{"refs/heads/main", "refs/tags/v1"}
+
+	if got := syncRepo(context.Background(), d, task); got.State != StateOK {
+		t.Fatalf("first sync = %+v, want ok", got)
+	}
+	if got := refs(t, replica); !slices.Equal(got, populated) {
+		t.Fatalf("replica refs = %v, want %v", got, populated)
+	}
+
+	// The origin loses every ref (a restore, a permission change, a bad proxy...).
+	git(t, "", "--git-dir="+origin, "update-ref", "-d", "refs/heads/main")
+	git(t, "", "--git-dir="+origin, "update-ref", "-d", "refs/tags/v1")
+
+	got := syncRepo(context.Background(), d, task)
+	if got.State != StateError || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+		t.Errorf("sync of an emptied origin = %+v, want an error naming the empty origin", got)
+	}
+	if refs := refs(t, replica); !slices.Equal(refs, populated) {
+		t.Errorf("replica refs after the origin was emptied = %v, want them untouched: %v", refs, populated)
+	}
+
+	// An origin that is empty on the very first sync, against a replica that already has refs.
+	task.RepoID = "repo-b"
+	if got := syncRepo(context.Background(), d, task); got.State != StateError || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+		t.Errorf("first sync of an empty origin = %+v, want an error naming the empty origin", got)
+	}
+	if refs := refs(t, replica); !slices.Equal(refs, populated) {
+		t.Errorf("replica refs after syncing an empty origin = %v, want them untouched: %v", refs, populated)
+	}
+}
+
 func TestSyncRepoAgainstRealGitMissingOriginIsAnError(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

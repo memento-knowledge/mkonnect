@@ -212,7 +212,7 @@ func maskedAuth(e gitsync.LocalEntry) string {
 }
 
 // printReloadReminder tells the operator how to apply a change. The git-sync daemon reads its
-// configuration at startup (no SIGHUP reload in Phase 2), so a change is applied by restarting.
+// configuration at startup (there is no SIGHUP reload), so a change is applied by restarting.
 func printReloadReminder(w io.Writer) {
 	fmt.Fprint(w, `
 The git-sync connector reads its configuration at startup; restart it to apply this change:

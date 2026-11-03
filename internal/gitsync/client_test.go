@@ -112,6 +112,7 @@ func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, n
 	t.Cleanup(func() { close(gate) })
 	defaults := []gitsync.Option{
 		gitsync.WithMirrorsRoot(t.TempDir()),
+		gitsync.WithStatusInterval(10 * time.Millisecond),
 		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
 			select {
 			case <-gate:
@@ -222,7 +223,7 @@ func TestConfigAcceptedStatusEnvelope(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config",
-		configJSON("7", [3]string{"repo-a", "https://git.example.com/team/a.git", "2026-01-01T00:00:00Z"}))
+		configJSON("7", [3]string{"repo-a", "https://git.example.com/team/a.git", "2027-01-01T00:00:00Z"}))
 
 	st := lastStatus(t, s.messages())
 	if st.Type != "git_sync_status" {
@@ -240,7 +241,7 @@ func TestConfigAcceptedStatusEnvelope(t *testing.T) {
 	if st.Sequence != 1 {
 		t.Errorf("sequence = %d, want 1 for the first status", st.Sequence)
 	}
-	if st.EarliestPushTokenExpiresAt == nil || *st.EarliestPushTokenExpiresAt != "2026-01-01T00:00:00Z" {
+	if st.EarliestPushTokenExpiresAt == nil || *st.EarliestPushTokenExpiresAt != "2027-01-01T00:00:00Z" {
 		t.Errorf("earliest_push_token_expires_at = %v", st.EarliestPushTokenExpiresAt)
 	}
 	// A matched repository starts syncing as soon as its configuration is accepted.
@@ -272,7 +273,7 @@ func TestHostMatchStates(t *testing.T) {
 
 // TestRepoStateStoresCanonicalURL asserts that a host-matched repository retains the matched
 // provider name and the validated, re-serialized canonical origin URL (not the raw origin string),
-// so Phase 3 dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
+// so the sync dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
 // origin fails canonicalization outright (repo-c, a homoglyph host) retain neither.
 func TestRepoStateStoresCanonicalURL(t *testing.T) {
 	c := newTestClient(t, oneProvider) // provider "origin" at https://git.example.com/
@@ -346,7 +347,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"empty repo_id":       `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"","origin_url":"https://git.example.com/a"}]}`,
 		"non-scalar version":  `{"type":"git_sync_config","config_version":{"n":1},"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"}]}`,
 		// repo_id charset: traversal, control, and bare-dot ids are rejected as a whole message, since
-		// Phase 3 uses repo_id in filesystem paths and replica URLs.
+		// repo_id is the key of the configured set and appears in logs and statuses.
 		"traversal repo_id":  `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"../../x","origin_url":"https://git.example.com/a"}]}`,
 		"dotdot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"..","origin_url":"https://git.example.com/a"}]}`,
 		"dot repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".","origin_url":"https://git.example.com/a"}]}`,
@@ -382,7 +383,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 // Only the two pure traversal components "." and ".." are rejected beyond the charset; every other
 // contract-valid id — a leading "-", ".git", a trailing ".", an embedded ".." like "a..b", and
 // case-distinct ids — must be accepted here. Point-of-use safety (git argv, filesystem paths, case
-// folding) is Phase 3's responsibility, not this config-validation guard's.
+// folding) is closed where repo_id is used (Mirrors.Dir hashes it), not by this config-validation guard.
 func TestApplyConfigRepoIDAccepted(t *testing.T) {
 	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
 	c := newTestClient(t, "")
@@ -390,7 +391,7 @@ func TestApplyConfigRepoIDAccepted(t *testing.T) {
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
 		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
 		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine
-		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (Phase 3 passes it safely)
+		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (it is never a git argument)
 		[3]string{".git", "https://git.example.com/d", ""},  // leading dot is contract-valid
 		[3]string{"a.", "https://git.example.com/e", ""},    // trailing dot is contract-valid
 		[3]string{"a..b", "https://git.example.com/f", ""},  // embedded ".." (not the bare "..") is contract-valid

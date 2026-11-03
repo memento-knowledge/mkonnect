@@ -1,12 +1,12 @@
 // Command mkonnect-gitsync is the git-sync connector: it bridges customer-internal git
 // repositories to the Memento platform over the same secure, ML-DSA-65-authenticated WebSocket
 // tunnel as the API connector. It is a separate binary because it is a separate process with
-// its own registration-token kind, its own key, and (from Phase 3) its own toolchain needs.
+// its own registration-token kind, its own key, and its own toolchain needs (a git binary).
 //
-// This is a Phase 2 skeleton: it enrols, handshakes, heartbeats, and dispatches the git-sync
-// protocol messages, but the sync algorithm itself is not yet implemented. Packaging and
-// release of this binary are tracked separately (memento-knowledge/mkonnect#48); nothing builds
-// or ships it as an image yet.
+// It enrols, handshakes, heartbeats, and mirrors each configured repository: a clone or fetch
+// from the customer origin, then a push of its branches and tags to the Memento replica. Packaging
+// and release of this binary are tracked separately (memento-knowledge/mkonnect#48); nothing
+// builds or ships it as an image yet.
 package main
 
 import (
@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
@@ -64,10 +65,10 @@ func main() {
 		log.Fatalf("mkonnect-gitsync: local config load failed: %v", err)
 	}
 
-	// The reachability probe shells out to git; warn loudly if the image lacks a usable git so the
-	// operator sees a packaging problem rather than silent "unreachable" results.
+	// Both the reachability probe and the mirror sync shell out to git; warn loudly if the image
+	// lacks a usable git so the operator sees a packaging problem rather than silent failures.
 	if ok, detail := gitsync.GitVersionOK(); !ok {
-		log.Printf("mkonnect-gitsync: WARNING: %s; the origin reachability check needs git >= 2.31", detail)
+		log.Printf("mkonnect-gitsync: WARNING: %s; syncing and the origin reachability check need git >= 2.31", detail)
 	}
 
 	bootID, err := randomBootID()
@@ -78,15 +79,24 @@ func main() {
 	log.Printf("mkonnect-gitsync starting — connector=%s gateway=%s protocol=%s version=%s providers=%d",
 		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion, version.Version, len(local.Names()))
 
-	// No SIGHUP reload in Phase 2: there is nothing to reload yet (the local config is read
-	// once and the sync loop does not exist). A reload path arrives with the Phase 3/4 work
-	// that gives it something to pick up.
+	// There is no SIGHUP reload: the local provider config is read once at startup, so a change
+	// (including a revoked credential) takes effect on restart. A reload path is a Phase 4 item.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local, gitsync.NewGitProber(), nil, bootID)
 	client.Run(ctx)
+
+	// Cancelling ctx kills each running git (its own process group, so a terminal Ctrl-C does not
+	// reach it), but asynchronously. Wait, briefly, for those syncs to stop so no git process that
+	// holds a credential outlives the daemon.
+	wctx, cancel := context.WithTimeout(context.Background(), shutdownWait)
+	defer cancel()
+	client.Wait(wctx)
 }
+
+// shutdownWait bounds how long the daemon waits, after cancellation, for syncs to stop.
+const shutdownWait = 10 * time.Second
 
 // randomBootID returns a random per-process identifier so the platform can tell a status stream
 // apart from the one before a restart (a sequence number alone restarts at a lower value).

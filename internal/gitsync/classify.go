@@ -24,10 +24,20 @@ const (
 const maxErrorDetail = 200
 
 var (
-	// urlRE and pathRE find the remote locations and local paths git echoes in its errors. They are
-	// scrubbed from any raw detail: error_detail must never be a URL, host, or path.
+	// urlRE, pathRE and hostRE find the remote locations, local paths and bare hostnames/addresses
+	// git (or curl, for a proxy) echoes in its errors. They are scrubbed from any raw detail:
+	// error_detail must never be a URL, host, or path, because each is customer infrastructure.
 	urlRE  = regexp.MustCompile(`https?://\S+`)
 	pathRE = regexp.MustCompile(`(^|[\s(])/[^\s)]+`)
+	hostRE = regexp.MustCompile(`\b(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+(?::\d+)?\b`)
+
+	// refStatusRE matches the per-ref status lines git prints for a fetch or push (" * [new tag] v1
+	// -> v1", " ! [remote rejected] main -> main (reason)"). Their ref NAMES are arbitrary text the
+	// remote chose, so they must not steer classification or reach error_detail.
+	refStatusRE    = regexp.MustCompile(`^ [!*+=-] `)
+	remoteHeaderRE = regexp.MustCompile(`^(To|From) \S+$`)
+	bracketRE      = regexp.MustCompile(`\[[^\]]*\]`)
+	reasonRE       = regexp.MustCompile(`\(([^()]*)\)\s*$`)
 )
 
 var (
@@ -36,7 +46,7 @@ var (
 		"terminal prompts disabled", "401 unauthorized", "403 forbidden", "http basic: access denied",
 	}
 	connMarkers = []string{
-		"could not resolve host", "couldn't resolve host", "connection refused", "connection timed out",
+		"could not resolve host", "couldn't resolve host", "could not resolve proxy", "connection refused", "connection timed out",
 		"timed out", "could not connect", "failed to connect", "network is unreachable",
 		"no route to host", "connection reset", "ssl", "tls", "certificate",
 	}
@@ -78,7 +88,7 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 		return ErrOriginUnreachable, ""
 	}
 
-	s := strings.ToLower(string(quotedRE.ReplaceAll(stderr, []byte("''"))))
+	s := matchText(stderr)
 
 	// Local faults come first and apply to either side. Lines prefixed "remote:" are the far end
 	// speaking, so a replica reporting its own full disk is not our disk exhaustion.
@@ -126,6 +136,45 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	return ErrUnclassified, rawDetail(err, stderr)
 }
 
+// scrubRefLines removes what a remote controls but is not an explanation: the "To <url>" / "From
+// <url>" header lines, and the ref names in per-ref status lines. A rejected ref keeps its status
+// and git's parenthesised reason (" ! [remote rejected] main -> main (hook declined)" becomes
+// "[remote rejected] (hook declined)"), which is the part that explains the failure.
+func scrubRefLines(s string) string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		switch {
+		case remoteHeaderRE.MatchString(line):
+		case refStatusRE.MatchString(line) && strings.Contains(line, "->"):
+			kept := bracketRE.FindString(line)
+			if m := reasonRE.FindStringSubmatch(line); m != nil {
+				kept += " (" + m[1] + ")"
+			}
+			if kept = strings.TrimSpace(kept); kept != "" {
+				out = append(out, kept)
+			}
+		default:
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// matchText is the text keyword matching runs on: lower-cased, with ref names and remote headers
+// scrubbed and the single-quoted URL git echoes removed (so a hostname or branch containing "tls"
+// or "quota" cannot be mistaken for a failure of that kind).
+func matchText(stderr []byte) string {
+	return strings.ToLower(quotedRE.ReplaceAllString(scrubRefLines(string(stderr)), "''"))
+}
+
+// isCorruptMirror reports whether a failed fetch says the LOCAL mirror is unusable, which is
+// repaired by recloning. Lines the remote sent ("remote:") and ref names are excluded: an origin
+// reporting its own corruption, or a branch named "fix-corrupt-cache", must not make the connector
+// delete a healthy mirror and download the whole repository again.
+func isCorruptMirror(stderr []byte) bool {
+	return containsAny(localLines(matchText(stderr)), corruptMirrorMarkers)
+}
+
 // localLines returns s with every "remote:"-prefixed line removed.
 func localLines(s string) string {
 	var b strings.Builder
@@ -143,13 +192,14 @@ func localLines(s string) string {
 // first "fatal:"/"error:" line (else its last non-empty line, else the process error), with quoted
 // text, URLs and absolute paths removed, control characters dropped, and the length bounded.
 func rawDetail(err error, stderr []byte) string {
-	line := pickDetailLine(string(stderr))
+	line := pickDetailLine(scrubRefLines(string(stderr)))
 	if line == "" && err != nil {
 		line = err.Error()
 	}
 	line = quotedRE.ReplaceAllString(line, "''")
 	line = urlRE.ReplaceAllString(line, "<url>")
 	line = pathRE.ReplaceAllString(line, "${1}<path>")
+	line = hostRE.ReplaceAllString(line, "<host>")
 	line = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '

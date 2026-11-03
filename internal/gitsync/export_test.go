@@ -20,14 +20,14 @@ func (c *Client) SetCriticalPatchForTest(v bool) { c.criticalPatchRequired.Store
 // assert that a bad host is rejected (an error), not merely that it fails to match a provider.
 func CanonicalHostKeyForTest(raw string) (string, error) { return canonicalHostKey(raw) }
 
-// CanonicalRemoteURLForTest exposes the host key and the re-serialized canonical URL Phase 3 dials,
+// CanonicalRemoteURLForTest exposes the host key and the re-serialized canonical URL the sync dials,
 // so a test can assert both the match identity and the exact string that would be contacted.
 func CanonicalRemoteURLForTest(raw string) (hostKey, fullURL string, err error) {
 	return canonicalRemoteURL(raw)
 }
 
 // RepoStateForTest returns the retained provider name, canonical URL, and match flag for a repo_id
-// after applyConfig, so a test can assert Phase 3 will dial the validated canonical URL.
+// after applyConfig, so a test can assert the sync dials the validated canonical URL.
 func (c *Client) RepoStateForTest(repoID string) (provider, canonicalURL string, matched, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -36,7 +36,7 @@ func (c *Client) RepoStateForTest(repoID string) (provider, canonicalURL string,
 }
 
 // ReplicaMaterialForTest returns the replica push URL and push token retained for a repo_id, so a
-// test can assert what a host-matched repository holds for Phase 3 to push with. The token is
+// test can assert what a host-matched repository holds for the sync to push with. The token is
 // revealed only here, never by production code paths that log.
 func (c *Client) ReplicaMaterialForTest(repoID string) (replicaURL, pushToken string, found bool) {
 	c.mu.Lock()
@@ -55,6 +55,16 @@ func (c *Client) RecordResultForTest(repoID, state, errType string) {
 		c.repos[repoID] = r
 	}
 }
+
+// FinishSyncForTest reports a sync result for the given target as a finishing sync would, so a test
+// can check that a result for a target the platform has since reconfigured is ignored.
+func (c *Client) FinishSyncForTest(repoID, canonicalURL, replicaURL, state, errType string) {
+	c.finishSync(repoID, syncTask{RepoID: repoID, CanonicalURL: canonicalURL, ReplicaURL: replicaURL},
+		syncResult{State: state, ErrorType: errType})
+}
+
+// MirrorsRootForTest returns the directory the client keeps its mirrors under.
+func (c *Client) MirrorsRootForTest() string { return c.mgr.deps.mirrors.Root }
 
 // SetChmodForTest overrides the chmod used by LoadLocalConfig so a test can exercise the
 // read-only-mount fallback (chmod cannot be made to fail portably as the file's owner). It
