@@ -3,12 +3,10 @@ package gitsync
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -89,11 +87,11 @@ func (p *gitProber) Probe(ctx context.Context, e LocalEntry) (OriginResult, erro
 	defer cancel()
 
 	// An empty HOME keeps git from reading the invoking user's ~/.gitconfig or credential store.
-	home, err := os.MkdirTemp("", "gitsync-probe-home-")
+	home, cleanup, err := newTempHome()
 	if err != nil {
 		return "", fmt.Errorf("probe setup failed: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(home) }()
+	defer cleanup()
 
 	argv := []string{"git", "ls-remote", "--", e.BaseURL, "HEAD"}
 	// Run in the empty HOME so git cannot discover an ambient repository's .git/config (url.insteadOf,
@@ -110,56 +108,11 @@ func (p *gitProber) Probe(ctx context.Context, e LocalEntry) (OriginResult, erro
 	return classifyLsRemote(err, stderr), nil
 }
 
-// probeEnv builds a minimal, explicit environment for git. It never copies os.Environ() wholesale:
-// an inherited GIT_SSL_NO_VERIFY, url.*.insteadOf, http.proxy, GIT_TRACE, or a credential helper
-// could weaken TLS, redirect the target, or dump the Authorization header. Only PATH, an empty
-// HOME, locale, and explicitly chosen proxy/CA variables are passed through. The credential is
-// injected as an http.extraHeader via GIT_CONFIG_* (git >= 2.31) so it stays out of argv and the
-// URL. Note: GIT_CONFIG_VALUE_* is readable via /proc/<pid>/environ (mode 0400) by the same user —
-// the same exposure as the connector's own environment, not secret from the owner, but not visible
-// to other users or in a process list the way an argv would be.
+// probeEnv builds the locked-down environment for probing e: the shared base environment plus the
+// credential as a header scoped to e's base URL (see credConfig), so the origin credential is never
+// attached to a request for any other URL.
 func probeEnv(e LocalEntry, home string) []string {
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + home,
-		"LC_ALL=C",
-		"LANGUAGE=",
-		"GIT_CONFIG_NOSYSTEM=1",
-		// GIT_CONFIG_GLOBAL needs git >= 2.32; on 2.31 it is ignored, but HOME is an empty temp dir
-		// so there is no ~/.gitconfig to read either way. (GitVersionOK gates the image at >= 2.31.)
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=",
-	}
-	// Pass through only proxy and CA configuration, deliberately.
-	for _, k := range []string{
-		"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy",
-		"SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO",
-	} {
-		if v, ok := os.LookupEnv(k); ok {
-			env = append(env, k+"="+v)
-		}
-	}
-
-	cfg := [][2]string{
-		// Never let the Authorization header follow a redirect to another host or to http.
-		{"http.followRedirects", "false"},
-		{"credential.helper", ""},
-		{"core.askPass", ""},
-	}
-	switch e.Auth {
-	case "bearer":
-		cfg = append(cfg, [2]string{"http.extraHeader", "Authorization: Bearer " + e.Token.Reveal()})
-	case "basic":
-		creds := base64.StdEncoding.EncodeToString([]byte(e.Username + ":" + e.Token.Reveal()))
-		cfg = append(cfg, [2]string{"http.extraHeader", "Authorization: Basic " + creds})
-	}
-	env = append(env, "GIT_CONFIG_COUNT="+strconv.Itoa(len(cfg)))
-	for i, kv := range cfg {
-		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]))
-		env = append(env, fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
-	}
-	return env
+	return gitConfigEnv(gitBaseEnv(home), credConfig(e.BaseURL, e.Auth, e.Username, e.Token))
 }
 
 var (
