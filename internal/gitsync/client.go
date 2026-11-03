@@ -102,20 +102,53 @@ const (
 	rfc3339Nano = "2006-01-02T15:04:05.000000000Z07:00"
 )
 
-// repoState is the Phase-2 retained subset of a configured repository. The push token is
-// deliberately NOT retained: Phase 2 never pushes, and holding it only widens the leak surface.
+// repoState is the retained state of a configured repository.
 //
-// The raw origin_url string is deliberately NOT retained either. When a repository host-matches a
-// local provider, applyConfig resolves and stores the matched provider name plus the validated,
-// re-serialized canonical origin URL. Phase 3 dials canonicalURL directly and never re-parses an
+// The raw origin_url string is deliberately NOT retained. When a repository host-matches a local
+// provider, applyConfig resolves and stores the matched provider name plus the validated,
+// re-serialized canonical origin URL. The sync dials canonicalURL directly and never re-parses an
 // unvalidated string with git's URL parser (whose host interpretation can diverge from ours), so
 // the host that was match-checked is byte-for-byte the host that gets contacted.
+//
+// The push token is retained, in memory only and as a self-redacting Secret, and only for a
+// repository that is host-matched and has a usable replica URL: a repository that can never be
+// synced holds no secret. Hardening it at rest is Phase 4.
 type repoState struct {
 	repoID       string
 	provider     string // matched local provider name, "" when unmatched
-	canonicalURL string // validated, re-serialized origin URL for Phase 3 to dial, "" when unmatched
+	canonicalURL string // validated, re-serialized origin URL the sync dials, "" when unmatched
 	expiresAt    string // push_token_expires_at (RFC3339), "" when none
 	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+
+	replicaURL string // validated, re-serialized https replica URL, "" when unmatched or unusable
+	pushToken  Secret // platform push token for replicaURL, empty when replicaURL is
+	// result is the recorded outcome of the last sync attempt, or the reason the configuration is
+	// unusable. A zero State means no outcome yet, which is reported as pending.
+	result  syncResult
+	syncing bool // a sync is in flight
+}
+
+// errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
+// is unusable. It is deliberately generic: the status must never echo the platform-supplied URL.
+const errInvalidReplica = "invalid replica configuration"
+
+// validReplicaURL validates a platform-supplied replica push URL and returns its re-serialized
+// canonical form. The push token travels to this URL, so it must be https; it gets the same host
+// validation as an origin so the host that is validated is the host that is dialled.
+func validReplicaURL(raw string) (string, bool) {
+	_, full, err := canonicalRemoteURL(raw)
+	if err != nil || !strings.HasPrefix(full, "https://") {
+		return "", false
+	}
+	return full, true
+}
+
+// sameSyncIdentity reports whether two states describe the same sync target, so a prior result is
+// still meaningful. The push token is deliberately not part of it: a refreshed token for the same
+// repository does not invalidate its last result.
+func sameSyncIdentity(a, b repoState) bool {
+	return a.matched == b.matched && a.provider == b.provider &&
+		a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
 }
 
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
@@ -294,12 +327,34 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 				}
 			}
 		}
-		next[r.RepoID] = repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		st := repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		if matched {
+			// A bad replica fails this one repository, not the whole message: the others are
+			// independent and halting them all would be disproportionate.
+			if replicaURL, ok := validReplicaURL(r.ReplicaPushURL); ok && r.PushToken != "" {
+				st.replicaURL, st.pushToken = replicaURL, r.PushToken
+			} else {
+				st.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
+			}
+		}
+		next[r.RepoID] = st
 	}
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")
 	}
 	c.mu.Lock()
+	// Carry a prior result and in-flight marker across a configuration that leaves a repository's
+	// sync target unchanged (the platform re-sends config on every token refresh), so a healthy
+	// repository is not reset to pending. A changed target starts over.
+	for id, st := range next {
+		if old, ok := c.repos[id]; ok && sameSyncIdentity(old, st) {
+			if st.result.State == "" {
+				st.result = old.result
+			}
+			st.syncing = old.syncing
+			next[id] = st
+		}
+	}
 	c.repos = next
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
@@ -325,26 +380,26 @@ func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 }
 
 // syncTargets resolves a git_sync_now repo_id to the repositories it addresses, restricted to the
-// matchable set (configured AND host-matched to a local provider). An empty repo_id is the
-// provisional "all matchable repositories" fan-out.
+// syncable set (configured, host-matched to a local provider, with a usable replica). An empty
+// repo_id is the provisional "all syncable repositories" fan-out.
 func (c *Client) syncTargets(repoID string) []string {
-	matchable := c.matchableRepos()
+	syncable := c.syncableRepos()
 	if repoID == "" {
-		return matchable
+		return syncable
 	}
-	if slices.Contains(matchable, repoID) {
+	if slices.Contains(syncable, repoID) {
 		return []string{repoID}
 	}
 	return nil
 }
 
-// matchableRepos returns the sorted repo_ids that host-match a local provider, using the match
-// resolved at applyConfig time.
-func (c *Client) matchableRepos() []string {
+// syncableRepos returns the sorted repo_ids that can be synced: host-matched to a local provider
+// (resolved at applyConfig time) and carrying a usable replica URL.
+func (c *Client) syncableRepos() []string {
 	snapshot := c.snapshotRepos()
 	var out []string
 	for _, r := range snapshot {
-		if r.matched {
+		if r.matched && r.replicaURL != "" {
 			out = append(out, r.repoID)
 		}
 	}
@@ -382,12 +437,20 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	var earliest *time.Time
 	for _, r := range snapshot {
 		st := proto.GitSyncRepoStatus{RepoID: r.repoID}
-		if r.matched {
-			st.State = StatePending
-		} else {
+		switch {
+		case !r.matched:
 			st.State = StateError
 			st.ErrorType = ErrOriginAccessDenied
 			st.ErrorDetail = "host not configured locally"
+		case r.syncing:
+			st.State = StateSyncing
+		case r.result.State != "":
+			st.State = r.result.State
+			st.ErrorType = r.result.ErrorType
+			st.ErrorDetail = r.result.ErrorDetail
+			st.Warnings = r.result.Warnings
+		default:
+			st.State = StatePending
 		}
 		repos = append(repos, st)
 		if t, ok := parseExpiry(r.expiresAt); ok && (earliest == nil || t.Before(*earliest)) {

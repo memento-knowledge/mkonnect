@@ -161,23 +161,40 @@ const oneProvider = `{"origin":{"base_url":"https://git.example.com/"}}`
 // configJSON builds a git_sync_config frame. version is a JSON literal ("7", "null", "" to omit).
 // Each repo is {repo_id, origin_url, push_token_expires_at}; an empty expiry is omitted.
 func configJSON(version string, repos ...[3]string) json.RawMessage {
+	objs := make([]string, len(repos))
+	for i, r := range repos {
+		objs[i] = repoJSON(r[0], r[1], r[2], "https://replica.example.com/r/"+r[0]+".git", testPushToken)
+	}
+	return configJSONRaw(version, objs...)
+}
+
+const testPushToken = "push-token-abcdefghij"
+
+// repoJSON builds one repositories[] entry. An empty expiry, replica URL, or token is omitted.
+func repoJSON(id, origin, expiry, replica, token string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, `{"repo_id":%q,"origin_url":%q`, id, origin)
+	if expiry != "" {
+		fmt.Fprintf(&sb, `,"push_token_expires_at":%q`, expiry)
+	}
+	if replica != "" {
+		fmt.Fprintf(&sb, `,"replica_push_url":%q`, replica)
+	}
+	if token != "" {
+		fmt.Fprintf(&sb, `,"push_token":%q`, token)
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+// configJSONRaw wraps already-built repository objects in a git_sync_config frame.
+func configJSONRaw(version string, repoObjs ...string) json.RawMessage {
 	var sb strings.Builder
 	sb.WriteString(`{"type":"git_sync_config"`)
 	if version != "" {
 		sb.WriteString(`,"config_version":` + version)
 	}
-	sb.WriteString(`,"repositories":[`)
-	for i, r := range repos {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		fmt.Fprintf(&sb, `{"repo_id":%q,"origin_url":%q`, r[0], r[1])
-		if r[2] != "" {
-			fmt.Fprintf(&sb, `,"push_token_expires_at":%q`, r[2])
-		}
-		sb.WriteString("}")
-	}
-	sb.WriteString("]}")
+	sb.WriteString(`,"repositories":[` + strings.Join(repoObjs, ",") + `]}`)
 	return json.RawMessage(sb.String())
 }
 
@@ -691,7 +708,10 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 		if err := wsjson.Write(r.Context(), conn, map[string]any{
 			"type":           "git_sync_config",
 			"config_version": 1,
-			"repositories":   []map[string]any{{"repo_id": "repo-a", "origin_url": "https://git.example.com/a.git"}},
+			"repositories": []map[string]any{{
+				"repo_id": "repo-a", "origin_url": "https://git.example.com/a.git",
+				"replica_push_url": "https://replica.example.com/r/repo-a.git", "push_token": testPushToken,
+			}},
 		}); err != nil {
 			return
 		}

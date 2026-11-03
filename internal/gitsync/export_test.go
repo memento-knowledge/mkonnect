@@ -35,6 +35,27 @@ func (c *Client) RepoStateForTest(repoID string) (provider, canonicalURL string,
 	return r.provider, r.canonicalURL, r.matched, ok
 }
 
+// ReplicaMaterialForTest returns the replica push URL and push token retained for a repo_id, so a
+// test can assert what a host-matched repository holds for Phase 3 to push with. The token is
+// revealed only here, never by production code paths that log.
+func (c *Client) ReplicaMaterialForTest(repoID string) (replicaURL, pushToken string, found bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.repos[repoID]
+	return r.replicaURL, r.pushToken.Reveal(), ok
+}
+
+// RecordResultForTest records a sync outcome for a repository the way a completed sync does, so a
+// test can assert how a later configuration treats an existing result.
+func (c *Client) RecordResultForTest(repoID, state, errType string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.repos[repoID]; ok {
+		r.result = syncResult{State: state, ErrorType: errType}
+		c.repos[repoID] = r
+	}
+}
+
 // SetChmodForTest overrides the chmod used by LoadLocalConfig so a test can exercise the
 // read-only-mount fallback (chmod cannot be made to fail portably as the file's owner). It
 // returns a function that restores the real chmod.
