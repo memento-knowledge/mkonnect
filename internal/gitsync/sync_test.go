@@ -272,16 +272,41 @@ func TestSyncRepoReplicaAuthRejectedVersusExpired(t *testing.T) {
 	}
 }
 
-// A long clone can outlive the token: valid when the sync started, expired by the time the push is
-// refused, so the 401 must read as an expired token rather than a rejected credential.
-func TestSyncRepoTokenExpiringDuringCloneIsReportedExpired(t *testing.T) {
+// A long clone can outlive the token: valid when the sync started, expired by the time the clone is
+// done. The connector knows the token is expired, so it must not push with it — even if the replica
+// would (wrongly, or by clock skew) still accept it, in which case the sync would report ok having
+// used a credential the platform has declared dead.
+func TestSyncRepoTokenExpiringDuringCloneIsNotUsedToPush(t *testing.T) {
 	clock := syncNow
 	f := &fakeGit{}
 	f.script = func(c gitCall) ([]byte, error) {
-		switch c.sub() {
-		case "clone":
+		if c.sub() == "clone" {
 			clock = clock.Add(2 * time.Hour) // the clone ran past the token's expiry
-		case "push":
+		}
+		return nil, nil // a replica that would happily accept the push
+	}
+	d := newTestDeps(t, f)
+	d.now = func() time.Time { return clock }
+	task := testTask()
+	task.TokenExpiresAt = syncNow.Add(time.Hour).Format(time.RFC3339)
+
+	got := syncRepo(context.Background(), d, task)
+	if got.State != StateError || got.ErrorType != ErrPushTokenExpired {
+		t.Fatalf("result = %+v, want error/push_token_expired", got)
+	}
+	if slices.Contains(f.subs(), "push") {
+		t.Errorf("a push was run with a token known to be expired; sequence = %v", f.subs())
+	}
+}
+
+// A token that is valid when the push starts but expires while it runs is the replica's to judge:
+// when it refuses, the 401 reads as an expired token rather than a rejected credential.
+func TestSyncRepoTokenExpiringDuringPushIsReportedExpired(t *testing.T) {
+	clock := syncNow
+	f := &fakeGit{}
+	f.script = func(c gitCall) ([]byte, error) {
+		if c.sub() == "push" {
+			clock = clock.Add(2 * time.Hour) // the push ran past the token's expiry
 			return []byte("fatal: unable to access 'https://replica.example.com/r/repo-a.git/': The requested URL returned error: 401"), errExit
 		}
 		return nil, nil

@@ -460,7 +460,11 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 }
 
 // startSyncs hands repositories to the sync manager unless a critical security update is required,
-// which suspends all syncing.
+// which suspends all syncing. ctx is the one the gateway gives HandleMessage: the process-lifetime
+// Connect context, NOT a connection's, so a drain or reconnect does not cancel a sync (only shutdown
+// does). That is part of the gateway's Handler contract and is pinned by its
+// TestHandlerContextLifetimes; this package's TestSyncAndItsRerunSurviveLosingTheConnection pins
+// the consequence. Status replies use the connection's own context, captured in OnConnected.
 func (c *Client) startSyncs(ctx context.Context, repoIDs []string) {
 	if len(repoIDs) == 0 {
 		return

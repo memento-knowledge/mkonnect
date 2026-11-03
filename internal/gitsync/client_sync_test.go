@@ -344,6 +344,34 @@ func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
 	}
 }
 
+// A gateway drain or reconnect ends the connection, not the work: HandleMessage is given the
+// process-lifetime context (pinned in internal/gateway), so a sync in flight when the connection
+// drops is not cancelled, and a trigger that arrives afterwards still gets its trailing rerun.
+func TestSyncAndItsRerunSurviveLosingTheConnection(t *testing.T) {
+	g := &scriptedGit{gate: make(chan struct{})}
+	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	process := context.Background() // what the gateway hands HandleMessage
+	connCtx, loseConnection := context.WithCancel(process)
+	s := &stubSender{}
+	c.OnConnected(connCtx, s)
+
+	cfg := configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""})
+	c.HandleMessage(process, s, "git_sync_config", cfg)
+	waitFor(t, func() bool { return g.count("clone") == 1 })
+
+	loseConnection() // the gateway drains; the connection (and only it) is gone
+	c.HandleMessage(process, &stubSender{}, "git_sync_now", rawJSON(`{"type":"git_sync_now","repo_id":"repo-a"}`))
+
+	close(g.gate)
+	waitFor(t, func() bool { return g.count("push") == 2 }) // the sync, then its one trailing rerun
+	if got := g.count("clone"); got != 1 {
+		t.Errorf("clones = %d, want 1: the in-flight sync must not have been cancelled and restarted", got)
+	}
+	if got := g.count("fetch"); got != 1 {
+		t.Errorf("fetches = %d, want 1 (the trailing rerun reuses the mirror)", got)
+	}
+}
+
 func TestMirrorsRootIsMadeAbsolute(t *testing.T) {
 	c := newTestClientOpts(t, oneProvider, &fakeProber{result: gitsync.OriginReachable}, fixedNow,
 		gitsync.WithMirrorsRoot("relative/mirrors"))

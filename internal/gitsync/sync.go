@@ -110,6 +110,14 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
+	// The clone or fetch can outlive the token. Re-check immediately before using it: a token the
+	// platform has declared expired is not used, whether or not the replica would still accept it.
+	// (A token that expires while the push itself is running is the replica's to judge; it is not
+	// cut short by the connector's clock, which may be skewed.)
+	if d.tokenExpired(t) {
+		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
+	}
+
 	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--prune", "--force", "--", t.ReplicaURL}, pushRefspecs...)
 	pushEnv := gitConfigEnv(gitBaseEnv(home), credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken))
 	stderr, err := d.runBounded(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home)

@@ -162,6 +162,104 @@ func TestHandlerCallbackOrderAndDispatch(t *testing.T) {
 	}
 }
 
+// ctxHandler captures the context the gateway hands each callback.
+type ctxHandler struct {
+	mu                          sync.Mutex
+	connected, handled, drained context.Context
+}
+
+func (h *ctxHandler) OnHandshake(gateway.HandshakeInfo) {}
+func (h *ctxHandler) OnConnected(ctx context.Context, _ gateway.Sender) {
+	h.mu.Lock()
+	h.connected = ctx
+	h.mu.Unlock()
+}
+func (h *ctxHandler) OnHeartbeat(context.Context, gateway.Sender) error { return nil }
+func (h *ctxHandler) HandleMessage(ctx context.Context, _ gateway.Sender, _ string, _ json.RawMessage) {
+	h.mu.Lock()
+	h.handled = ctx
+	h.mu.Unlock()
+}
+func (h *ctxHandler) OnDraining(ctx context.Context) {
+	h.mu.Lock()
+	h.drained = ctx
+	h.mu.Unlock()
+}
+
+// TestHandlerContextLifetimes pins which context each callback receives, because a connector kind
+// builds on it: HandleMessage and OnDraining get the process-lifetime Connect context, so work
+// started from them (a long repository sync) is NOT cancelled when the connection drops or the
+// gateway drains and can finish across a reconnect; OnConnected gets a connection-scoped context
+// that ends with the connection. Both end when the process-lifetime context does.
+func TestHandlerContextLifetimes(t *testing.T) {
+	ok := handshakeOkWithKey(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+
+		var nonce [32]byte
+		if err := writeGatewayChallenge(r.Context(), conn, nonce); err != nil {
+			t.Errorf("write challenge: %v", err)
+			return
+		}
+		var hello gatewayHelloMsg
+		if err := wsjson.Read(r.Context(), conn, &hello); err != nil {
+			t.Errorf("read hello: %v", err)
+			return
+		}
+		if err := wsjson.Write(r.Context(), conn, ok); err != nil {
+			t.Errorf("write handshake_ok: %v", err)
+			return
+		}
+		for _, typ := range []string{"custom_thing", "going_away"} {
+			if err := wsjson.Write(r.Context(), conn, map[string]string{"type": typ}); err != nil {
+				t.Errorf("write %s: %v", typ, err)
+				return
+			}
+		}
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+
+	h := &ctxHandler{}
+	client := gateway.NewClient(newTestConfig(srv.URL), auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), h)
+	process, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+
+	if err := client.Connect(process); err != nil {
+		t.Fatalf("Connect returned an error: %v", err)
+	}
+
+	h.mu.Lock()
+	connected, handled, drained := h.connected, h.handled, h.drained
+	h.mu.Unlock()
+	if connected == nil || handled == nil || drained == nil {
+		t.Fatalf("a callback did not run: OnConnected=%v HandleMessage=%v OnDraining=%v", connected != nil, handled != nil, drained != nil)
+	}
+
+	// The connection is over (the gateway drained).
+	if connected.Err() == nil {
+		t.Error("OnConnected's context must end with the connection")
+	}
+	if err := handled.Err(); err != nil {
+		t.Errorf("HandleMessage's context ended with the connection (%v); work started from it would be cancelled by every drain or reconnect", err)
+	}
+	if err := drained.Err(); err != nil {
+		t.Errorf("OnDraining's context ended with the connection: %v", err)
+	}
+
+	// Shutdown ends them.
+	shutdown()
+	if handled.Err() == nil || drained.Err() == nil {
+		t.Error("HandleMessage's and OnDraining's contexts must end when the process-lifetime context does")
+	}
+}
+
 // TestOnHeartbeatErrorClosesConnection verifies the documented contract that a Handler can
 // force a reconnect by returning an error from OnHeartbeat: the gateway closes the
 // connection and Connect returns, just as a failed health write would.
