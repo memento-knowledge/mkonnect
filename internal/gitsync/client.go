@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,10 +54,37 @@ const WarnLFSNotReplicated = "lfs_not_replicated"
 // Caps on an inbound git_sync_config so a hostile or malformed push cannot amplify into every
 // status (each accepted repository is echoed in every heartbeat status).
 const (
-	maxConfigRepos       = 4096
+	maxConfigRepos = 4096
+	// maxRepoIDLength is the platform-contract bound on repo_id. It is at or above the 255-byte
+	// NAME_MAX of common filesystems (ext4, xfs, APFS), so Phase 3 MUST NOT use repo_id directly as a
+	// filename (and never suffixed, e.g. "<id>.git") — it has to map it to a bounded directory name;
+	// see the note on validRepoID. Must stay <= 1000 (see repoIDRE).
 	maxRepoIDLength      = 256
 	maxConfigVersionSize = 256
 )
+
+// repoIDRE constrains a platform-supplied repo_id to a safe charset and length. repo_id is used in
+// local filesystem paths and replica push URLs in Phase 3, so anything outside this set — path
+// separators, NUL, control characters, whitespace — is a traversal or injection vector and is
+// rejected at config-validation time. The length bound is single-sourced from maxRepoIDLength,
+// which must stay <= 1000: RE2 caps a bounded repetition at 1000, so a larger value would panic in
+// MustCompile at package init.
+var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
+
+// validRepoID reports whether a repo_id conforms to the platform contract: the charset and length
+// of repoIDRE, with the two pure path-traversal components "." and ".." additionally rejected
+// (they name a directory rather than a repository and cannot be a safe path component anywhere).
+//
+// It deliberately does NOT reject other contract-valid ids — a leading "-", ".git", a trailing ".",
+// an embedded ".." such as "a..b", or ids that differ only in case. Those are safe to STORE; the
+// only risks they carry are at the point of USE (a git argv element, a filesystem path, a
+// case-insensitive filesystem), which Phase 3 must defend independently (pass repo_id after "--" or
+// never in option position, map it to a bounded fixed-format directory name, and fold case when it
+// builds paths). Over-restricting here instead would reject platform-valid configurations whole and
+// halt sync for every repository in the message, so the guard is kept to the agreed contract.
+func validRepoID(id string) bool {
+	return repoIDRE.MatchString(id) && id != "." && id != ".."
+}
 
 const (
 	// statusWriteTimeout bounds the connection-time status write, before the heartbeat exists to
@@ -75,11 +104,18 @@ const (
 
 // repoState is the Phase-2 retained subset of a configured repository. The push token is
 // deliberately NOT retained: Phase 2 never pushes, and holding it only widens the leak surface.
+//
+// The raw origin_url string is deliberately NOT retained either. When a repository host-matches a
+// local provider, applyConfig resolves and stores the matched provider name plus the validated,
+// re-serialized canonical origin URL. Phase 3 dials canonicalURL directly and never re-parses an
+// unvalidated string with git's URL parser (whose host interpretation can diverge from ours), so
+// the host that was match-checked is byte-for-byte the host that gets contacted.
 type repoState struct {
-	repoID    string
-	originURL string
-	expiresAt string // push_token_expires_at (RFC3339), "" when none
-	matched   bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+	repoID       string
+	provider     string // matched local provider name, "" when unmatched
+	canonicalURL string // validated, re-serialized origin URL for Phase 3 to dial, "" when unmatched
+	expiresAt    string // push_token_expires_at (RFC3339), "" when none
+	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
 }
 
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
@@ -233,8 +269,12 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	}
 	next := make(map[string]repoState, len(msg.Repositories))
 	for _, r := range msg.Repositories {
-		if r.RepoID == "" || len(r.RepoID) > maxRepoIDLength {
-			slog.Warn("git_sync_config has an entry with an empty or oversized repo_id; leaving configuration unchanged")
+		if !validRepoID(r.RepoID) {
+			// repo_id will be used in local filesystem paths and replica push URLs in Phase 3, so a
+			// value outside the contract charset (or a "." / ".." traversal component) is rejected
+			// here, not silently carried. Not logged verbatim: a hostile id could carry
+			// log-injection bytes.
+			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
 			return false
 		}
 		if _, dup := next[r.RepoID]; dup {
@@ -243,12 +283,18 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		}
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
 		// (loaded at startup, no live reload), so the result is stable until the next config and
-		// need not be recomputed on every status.
-		matched := c.local != nil
-		if matched {
-			_, _, matched = c.local.MatchProvider(r.OriginURL)
+		// need not be recomputed on every status. The origin is parsed once: its canonical host key
+		// selects the provider and its canonical URL is retained for Phase 3 to dial.
+		var provider, canonicalURL string
+		matched := false
+		if c.local != nil {
+			if hostKey, fullURL, err := canonicalRemoteURL(r.OriginURL); err == nil {
+				if name, _, ok := c.local.matchByHostKey(hostKey); ok {
+					provider, canonicalURL, matched = name, fullURL, true
+				}
+			}
 		}
-		next[r.RepoID] = repoState{repoID: r.RepoID, originURL: r.OriginURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		next[r.RepoID] = repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
 	}
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")

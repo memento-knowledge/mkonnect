@@ -232,6 +232,39 @@ func TestHostMatchStates(t *testing.T) {
 	}
 }
 
+// TestRepoStateStoresCanonicalURL asserts that a host-matched repository retains the matched
+// provider name and the validated, re-serialized canonical origin URL (not the raw origin string),
+// so Phase 3 dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
+// origin fails canonicalization outright (repo-c, a homoglyph host) retain neither.
+func TestRepoStateStoresCanonicalURL(t *testing.T) {
+	c := newTestClient(t, oneProvider) // provider "origin" at https://git.example.com/
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1",
+		[3]string{"repo-a", "https://GIT.example.com/team/a.git", ""},
+		[3]string{"repo-b", "https://other.example.com/b.git", ""},
+		[3]string{"repo-c", "https://gİt.example.com/c.git", ""})) // non-ASCII host: canonicalization errors
+
+	provider, canonURL, matched, found := c.RepoStateForTest("repo-a")
+	if !found || !matched {
+		t.Fatalf("repo-a: found=%v matched=%v, want both true", found, matched)
+	}
+	if provider != "origin" {
+		t.Errorf("repo-a provider = %q, want %q", provider, "origin")
+	}
+	if want := "https://git.example.com:443/team/a.git"; canonURL != want {
+		t.Errorf("repo-a canonicalURL = %q, want %q (ASCII-lowercased host, explicit port, path kept)", canonURL, want)
+	}
+
+	for _, id := range []string{"repo-b", "repo-c"} {
+		provider, canonURL, matched, found := c.RepoStateForTest(id)
+		if !found {
+			t.Fatalf("%s not retained", id)
+		}
+		if matched || provider != "" || canonURL != "" {
+			t.Errorf("unmatched %s: matched=%v provider=%q canonicalURL=%q, want false/\"\"/\"\"", id, matched, provider, canonURL)
+		}
+	}
+}
+
 func TestStatusNullBeforeConfig(t *testing.T) {
 	c := newTestClient(t, "") // empty local config: no probe fires
 	s := &stubSender{}
@@ -274,6 +307,14 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"duplicate repo_id":   `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"},{"repo_id":"x","origin_url":"https://git.example.com/b"}]}`,
 		"empty repo_id":       `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"","origin_url":"https://git.example.com/a"}]}`,
 		"non-scalar version":  `{"type":"git_sync_config","config_version":{"n":1},"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"}]}`,
+		// repo_id charset: traversal, control, and bare-dot ids are rejected as a whole message, since
+		// Phase 3 uses repo_id in filesystem paths and replica URLs.
+		"traversal repo_id":  `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"../../x","origin_url":"https://git.example.com/a"}]}`,
+		"dotdot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"..","origin_url":"https://git.example.com/a"}]}`,
+		"dot repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".","origin_url":"https://git.example.com/a"}]}`,
+		"nul repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0000b","origin_url":"https://git.example.com/a"}]}`,
+		"control repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0001b","origin_url":"https://git.example.com/a"}]}`,
+		"whitespace repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a b","origin_url":"https://git.example.com/a"}]}`,
 	}
 	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
@@ -295,6 +336,69 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 				t.Errorf("configuration should be unchanged after rejection: repos=%v version=%s", st.Repositories, st.ConfigVersion)
 			}
 		})
+	}
+}
+
+// TestApplyConfigRepoIDAccepted is the positive companion: repo_ids using the full legal charset,
+// including a maximum-length id, are accepted so the charset rule cannot be over-tightened silently.
+// Only the two pure traversal components "." and ".." are rejected beyond the charset; every other
+// contract-valid id — a leading "-", ".git", a trailing ".", an embedded ".." like "a..b", and
+// case-distinct ids — must be accepted here. Point-of-use safety (git argv, filesystem paths, case
+// folding) is Phase 3's responsibility, not this config-validation guard's.
+func TestApplyConfigRepoIDAccepted(t *testing.T) {
+	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
+	c := newTestClient(t, "")
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
+		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
+		[3]string{"a.b.c", "https://git.example.com/b", ""}, // interior dots are fine
+		[3]string{"-rf", "https://git.example.com/c", ""},   // leading '-' is contract-valid (Phase 3 passes it safely)
+		[3]string{".git", "https://git.example.com/d", ""},  // leading dot is contract-valid
+		[3]string{"a.", "https://git.example.com/e", ""},    // trailing dot is contract-valid
+		[3]string{"a..b", "https://git.example.com/f", ""},  // embedded ".." (not the bare "..") is contract-valid
+		[3]string{"Repo", "https://git.example.com/g", ""},  // case-distinct ids are NOT duplicates
+		[3]string{"repo", "https://git.example.com/h", ""},
+		[3]string{maxID, "https://git.example.com/i", ""}))
+
+	rs := repoStates(lastStatus(t, s.messages()))
+	for _, id := range []string{"repo.a_b-c", "a.b.c", "-rf", ".git", "a.", "a..b", "Repo", "repo", maxID} {
+		if _, ok := rs[id]; !ok {
+			t.Errorf("repo_id %q was not accepted", id)
+		}
+	}
+}
+
+// TestApplyConfigRejectionPreservesPrevious asserts the validate-then-swap contract end-to-end: a
+// config whose FIRST entry is valid but a LATER entry is invalid must be rejected whole, leaving the
+// previously-accepted configuration (its version and repositories) untouched — no partial apply.
+func TestApplyConfigRejectionPreservesPrevious(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	// Accept a good config first (version 1, repo "good").
+	c.HandleMessage(context.Background(), s, "git_sync_config",
+		configJSON("1", [3]string{"good", "https://git.example.com/a.git", ""}))
+
+	// A later message whose first entry is valid but whose second is an invalid repo_id.
+	bad := `{"type":"git_sync_config","config_version":2,"repositories":[` +
+		`{"repo_id":"ok","origin_url":"https://git.example.com/a.git"},` +
+		`{"repo_id":"../evil","origin_url":"https://git.example.com/b.git"}]}`
+	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(bad))
+
+	// Build a fresh status so the assertion reflects the connector's live configuration, not the
+	// status cached from the earlier accepted config.
+	if err := c.OnHeartbeat(context.Background(), s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	st := lastStatus(t, s.messages())
+	if string(st.ConfigVersion) != "1" {
+		t.Errorf("config_version = %s, want 1 (rejected config must not advance the version)", st.ConfigVersion)
+	}
+	rs := repoStates(st)
+	if _, ok := rs["good"]; !ok {
+		t.Error("the previously-accepted repo 'good' was dropped by a rejected config")
+	}
+	if _, ok := rs["ok"]; ok {
+		t.Error("the valid first entry of the rejected config was partially applied ('ok' leaked in)")
 	}
 }
 
