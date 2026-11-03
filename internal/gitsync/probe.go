@@ -54,9 +54,11 @@ func NewGitProber() *gitProber { return &gitProber{run: runGit} }
 // available on PATH. When it returns false, the reachability probe cannot inject the credential and
 // the git-sync image is misconfigured — a packaging concern, surfaced as a startup warning.
 func GitVersionOK() (ok bool, detail string) {
-	out, err := exec.Command("git", "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "--version").Output()
 	if err != nil {
-		return false, "git was not found on PATH"
+		return false, "git was not found on PATH or did not respond"
 	}
 	fields := strings.Fields(string(out)) // e.g. "git version 2.39.3"
 	if len(fields) < 3 {
@@ -123,6 +125,8 @@ func probeEnv(e LocalEntry, home string) []string {
 		"LC_ALL=C",
 		"LANGUAGE=",
 		"GIT_CONFIG_NOSYSTEM=1",
+		// GIT_CONFIG_GLOBAL needs git >= 2.32; on 2.31 it is ignored, but HOME is an empty temp dir
+		// so there is no ~/.gitconfig to read either way. (GitVersionOK gates the image at >= 2.31.)
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",

@@ -79,6 +79,7 @@ type repoState struct {
 	repoID    string
 	originURL string
 	expiresAt string // push_token_expires_at (RFC3339), "" when none
+	matched   bool   // origin_url binds to a local provider (resolved once, at applyConfig)
 }
 
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
@@ -240,7 +241,14 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 			slog.Warn("git_sync_config has a duplicate repo_id; leaving configuration unchanged", "repo_id", r.RepoID)
 			return false
 		}
-		next[r.RepoID] = repoState{repoID: r.RepoID, originURL: r.OriginURL, expiresAt: r.PushTokenExpiresAt}
+		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
+		// (loaded at startup, no live reload), so the result is stable until the next config and
+		// need not be recomputed on every status.
+		matched := c.local != nil
+		if matched {
+			_, _, matched = c.local.MatchProvider(r.OriginURL)
+		}
+		next[r.RepoID] = repoState{repoID: r.RepoID, originURL: r.OriginURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
 	}
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")
@@ -284,17 +292,14 @@ func (c *Client) syncTargets(repoID string) []string {
 	return nil
 }
 
-// matchableRepos returns the sorted repo_ids whose origin_url host-matches a local provider. The
-// configured set is cloned under mu and released before MatchProvider (the Store has its own lock),
-// so no lock is held across the match.
+// matchableRepos returns the sorted repo_ids that host-match a local provider, using the match
+// resolved at applyConfig time.
 func (c *Client) matchableRepos() []string {
 	snapshot := c.snapshotRepos()
 	var out []string
 	for _, r := range snapshot {
-		if c.local != nil {
-			if _, _, ok := c.local.MatchProvider(r.originURL); ok {
-				out = append(out, r.repoID)
-			}
+		if r.matched {
+			out = append(out, r.repoID)
 		}
 	}
 	slices.Sort(out)
@@ -331,7 +336,7 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	var earliest *time.Time
 	for _, r := range snapshot {
 		st := proto.GitSyncRepoStatus{RepoID: r.repoID}
-		if c.hostMatched(r.originURL) {
+		if r.matched {
 			st.State = StatePending
 		} else {
 			st.State = StateError
@@ -364,15 +369,6 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 		}
 	}
 	return status
-}
-
-// hostMatched reports whether originURL binds to a local provider by canonical scheme+host+port.
-func (c *Client) hostMatched(originURL string) bool {
-	if c.local == nil {
-		return false
-	}
-	_, _, ok := c.local.MatchProvider(originURL)
-	return ok
 }
 
 // maybeProbe launches a pre-config origin reachability probe on a goroutine if the connector has no

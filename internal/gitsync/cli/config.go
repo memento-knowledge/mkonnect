@@ -60,14 +60,19 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 	}
 
 	fs := flag.NewFlagSet("config set", flag.ContinueOnError)
-	fs.SetOutput(w)
-	fs.Usage = func() { fmt.Fprintln(w, setUsage) }
+	// Discard the flag package's own output so a parse error is reported once — by the caller, which
+	// prints the returned error to stderr — rather than also to w here.
+	fs.SetOutput(io.Discard)
 	baseURL := fs.String("base-url", "", "Origin base URL, e.g. https://git.example.com/")
 	auth := fs.String("auth", "", "Authentication mode: bearer or basic")
 	username := fs.String("username", "", "Username (basic auth only)")
 	tokenStdin := fs.Bool("token-stdin", false, "Read the token/password from stdin")
 	fs.String("token", "", "Unsupported; use --token-stdin")
 	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(w, setUsage)
+			return nil
+		}
 		return err
 	}
 
