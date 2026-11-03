@@ -55,11 +55,11 @@ const WarnLFSNotReplicated = "lfs_not_replicated"
 // status (each accepted repository is echoed in every heartbeat status).
 const (
 	maxConfigRepos = 4096
-	// maxRepoIDLength is held below the 255-byte NAME_MAX of common filesystems (ext4, xfs, APFS)
-	// with headroom: Phase 3 uses repo_id as a path component, possibly with a suffix (e.g. a
-	// "<id>.git" working directory), so an id that cannot be a single filename must be rejected at
-	// config time rather than failing with ENAMETOOLONG mid-sync. Must stay <= 1000 (see repoIDRE).
-	maxRepoIDLength      = 200
+	// maxRepoIDLength is the platform-contract bound on repo_id. It is at or above the 255-byte
+	// NAME_MAX of common filesystems (ext4, xfs, APFS), so Phase 3 MUST NOT use repo_id directly as a
+	// filename (and never suffixed, e.g. "<id>.git") — it has to map it to a bounded directory name;
+	// see the note on validRepoID. Must stay <= 1000 (see repoIDRE).
+	maxRepoIDLength      = 256
 	maxConfigVersionSize = 256
 )
 

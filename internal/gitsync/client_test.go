@@ -326,7 +326,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		// case-insensitive filesystems and are rejected as a duplicate.
 		"case-insensitive duplicate repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"Repo","origin_url":"https://git.example.com/a"},{"repo_id":"repo","origin_url":"https://git.example.com/b"}]}`,
 	}
-	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 201) + `","origin_url":"https://git.example.com/a"}]}`
+	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
 
 	for name, raw := range cases {
@@ -352,7 +352,7 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 // TestApplyConfigRepoIDAccepted is the positive companion: repo_ids using the full legal charset,
 // including a maximum-length id, are accepted so the charset rule cannot be over-tightened silently.
 func TestApplyConfigRepoIDAccepted(t *testing.T) {
-	maxID := strings.Repeat("a", 200) // exactly maxRepoIDLength, must be accepted
+	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
 	c := newTestClient(t, "")
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
