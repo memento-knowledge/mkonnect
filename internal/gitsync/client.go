@@ -62,16 +62,21 @@ const (
 // repoIDRE constrains a platform-supplied repo_id to a safe charset and length. repo_id is used in
 // local filesystem paths and replica push URLs in Phase 3, so anything outside this set — path
 // separators, NUL, control characters, whitespace — is a traversal or injection vector and is
-// rejected at config-validation time. The length bound is single-sourced from maxRepoIDLength.
+// rejected at config-validation time. The length bound is single-sourced from maxRepoIDLength,
+// which must stay <= 1000: RE2 caps a bounded repetition at 1000, so a larger value would panic in
+// MustCompile at package init.
 var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
 
-// validRepoID reports whether a repo_id is safe to use as a path component. "." and "..", though
-// within the charset, are themselves path-traversal components and are rejected.
+// validRepoID reports whether a repo_id is safe to use as a path component. Beyond the charset:
+// "." and ".." are themselves path-traversal components, and a leading "-" could be read as an
+// option flag when repo_id is later passed as a git argv element, so both are rejected. (This is
+// slightly stricter than the bare charset regex, by design — restricting now is cheap, whereas
+// loosening a stored-config contract later is not.)
 func validRepoID(id string) bool {
 	if !repoIDRE.MatchString(id) {
 		return false
 	}
-	return id != "." && id != ".."
+	return id != "." && id != ".." && !strings.HasPrefix(id, "-")
 }
 
 const (
@@ -96,8 +101,8 @@ const (
 // The raw origin_url string is deliberately NOT retained either. When a repository host-matches a
 // local provider, applyConfig resolves and stores the matched provider name plus the validated,
 // re-serialized canonical origin URL. Phase 3 dials canonicalURL directly and never re-parses an
-// unvalidated string with git's URL parser, so the host that was match-checked is exactly the host
-// that gets contacted and repo i's host can never be matched against provider j.
+// unvalidated string with git's URL parser (whose host interpretation can diverge from ours), so
+// the host that was match-checked is byte-for-byte the host that gets contacted.
 type repoState struct {
 	repoID       string
 	provider     string // matched local provider name, "" when unmatched

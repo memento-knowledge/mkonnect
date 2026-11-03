@@ -232,14 +232,16 @@ func TestHostMatchStates(t *testing.T) {
 	}
 }
 
-// TestRepoStateStoresCanonicalURL asserts Fix #2: a host-matched repository retains the matched
+// TestRepoStateStoresCanonicalURL asserts that a host-matched repository retains the matched
 // provider name and the validated, re-serialized canonical origin URL (not the raw origin string),
-// so Phase 3 dials exactly the authorized host. An unmatched repository retains neither.
+// so Phase 3 dials exactly the authorized host. A host-mismatched repository (repo-b) and one whose
+// origin fails canonicalization outright (repo-c, a homoglyph host) retain neither.
 func TestRepoStateStoresCanonicalURL(t *testing.T) {
 	c := newTestClient(t, oneProvider) // provider "origin" at https://git.example.com/
 	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1",
 		[3]string{"repo-a", "https://GIT.example.com/team/a.git", ""},
-		[3]string{"repo-b", "https://other.example.com/b.git", ""}))
+		[3]string{"repo-b", "https://other.example.com/b.git", ""},
+		[3]string{"repo-c", "https://gİt.example.com/c.git", ""})) // non-ASCII host: canonicalization errors
 
 	provider, canonURL, matched, found := c.RepoStateForTest("repo-a")
 	if !found || !matched {
@@ -252,12 +254,14 @@ func TestRepoStateStoresCanonicalURL(t *testing.T) {
 		t.Errorf("repo-a canonicalURL = %q, want %q (ASCII-lowercased host, explicit port, path kept)", canonURL, want)
 	}
 
-	provider, canonURL, matched, found = c.RepoStateForTest("repo-b")
-	if !found {
-		t.Fatal("repo-b not retained")
-	}
-	if matched || provider != "" || canonURL != "" {
-		t.Errorf("unmatched repo-b: matched=%v provider=%q canonicalURL=%q, want false/\"\"/\"\"", matched, provider, canonURL)
+	for _, id := range []string{"repo-b", "repo-c"} {
+		provider, canonURL, matched, found := c.RepoStateForTest(id)
+		if !found {
+			t.Fatalf("%s not retained", id)
+		}
+		if matched || provider != "" || canonURL != "" {
+			t.Errorf("unmatched %s: matched=%v provider=%q canonicalURL=%q, want false/\"\"/\"\"", id, matched, provider, canonURL)
+		}
 	}
 }
 
@@ -311,6 +315,8 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"nul repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0000b","origin_url":"https://git.example.com/a"}]}`,
 		"control repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0001b","origin_url":"https://git.example.com/a"}]}`,
 		"whitespace repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a b","origin_url":"https://git.example.com/a"}]}`,
+		// A leading '-' could be read as an option flag when repo_id becomes a git argv element.
+		"leading-dash repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"-rf","origin_url":"https://git.example.com/a"}]}`,
 	}
 	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
@@ -332,6 +338,25 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 				t.Errorf("configuration should be unchanged after rejection: repos=%v version=%s", st.Repositories, st.ConfigVersion)
 			}
 		})
+	}
+}
+
+// TestApplyConfigRepoIDAccepted is the positive companion: repo_ids using the full legal charset,
+// including a maximum-length id, are accepted so the charset rule cannot be over-tightened silently.
+func TestApplyConfigRepoIDAccepted(t *testing.T) {
+	maxID := strings.Repeat("a", 256) // exactly maxRepoIDLength, must be accepted
+	c := newTestClient(t, "")
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1",
+		[3]string{"repo.a_b-c", "https://git.example.com/a", ""},
+		[3]string{".git", "https://git.example.com/b", ""},
+		[3]string{maxID, "https://git.example.com/c", ""}))
+
+	rs := repoStates(lastStatus(t, s.messages()))
+	for _, id := range []string{"repo.a_b-c", ".git", maxID} {
+		if _, ok := rs[id]; !ok {
+			t.Errorf("repo_id %q was not accepted", id)
+		}
 	}
 }
 

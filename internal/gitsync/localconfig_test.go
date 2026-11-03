@@ -341,9 +341,11 @@ func TestMatchProvider(t *testing.T) {
 }
 
 // TestCanonicalHostRejectsAmbiguous asserts that the host-canonicalization underpinning the match
-// guard REJECTS (errors on) non-ASCII, Unicode-lookalike, and ambiguous-numeric hosts, rather than
-// silently folding them onto an ASCII host. A Unicode case-fold (strings.ToLower) would map several
-// of these onto a legitimate ASCII host while git/curl dial a different, attacker-registrable host.
+// guard REJECTS (errors on) non-ASCII, Unicode-lookalike, IPv6-zone, and ambiguous-numeric hosts.
+// The rejection is done by canonicalASCIIHost's ASCII-charset validation and its final-label numeric
+// check (not by the ASCII-only lowercasing, which only ever sees already-ASCII input). Each would
+// otherwise resolve, in git/curl, to a different host than any ASCII provider it textually resembles
+// — a bypass of the "match-checked host == dialed host" invariant.
 func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
 	bad := []struct {
 		name, url string
@@ -356,8 +358,12 @@ func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
 		{"percent-encoded non-ASCII", "https://git%C4%B0hub.com/x"},
 		{"bare integer IPv4", "https://2130706433/x"},
 		{"leading-zero octal octet", "https://010.0.0.1/x"},
-		{"hex octet", "https://0x7f.0.0.1/x"},
+		{"hex final octet", "https://0x7f.0.0.1/x"},
+		{"hex run final label", "https://127.0.0.0x1/x"},
+		{"bare hex integer", "https://0x7f000001/x"},
+		{"hex octet mid-dotted", "https://1.2.3.0x4/x"},
 		{"empty label (double dot)", "https://github..com/x"},
+		{"ipv6 zone id", "https://[fe80::1%25eth0]/x"},
 	}
 	for _, tt := range bad {
 		t.Run(tt.name, func(t *testing.T) {
@@ -368,9 +374,31 @@ func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
 	}
 }
 
+// TestCanonicalHostAcceptsLegitimate pins legitimate hosts that must NOT be false-rejected, so a
+// future tightening of the charset or numeric rules cannot silently break valid operator configs or
+// origins. Underscores appear in internal (non-public-DNS) git hostnames and are safe here because
+// matching is ASCII string equality, not DNS resolution.
+func TestCanonicalHostAcceptsLegitimate(t *testing.T) {
+	good := []string{
+		"https://git.example.com/x",
+		"https://123.example.com/x", // all-digit NON-final label is a valid name
+		"https://localhost/x",
+		"https://git_server/x",                                  // underscore: internal host
+		"https://" + strings.Repeat("a", 63) + ".example.com/x", // max-length label
+		"https://git.example.com./x",                            // trailing FQDN dot
+		"https://[2001:db8::1]/x",                               // IPv6 literal
+		"https://127.0.0.1/x",                                   // IPv4 literal
+	}
+	for _, u := range good {
+		if _, err := gitsync.CanonicalHostKeyForTest(u); err != nil {
+			t.Errorf("CanonicalHostKey(%q) errored, want accepted: %v", u, err)
+		}
+	}
+}
+
 // TestHostMatchNoUnicodeBypass is the end-to-end guard: a provider configured at an ASCII host must
 // never be matched by a platform-supplied origin whose host only Unicode-folds or numeric-decodes to
-// that host. If this regresses (e.g. strings.ToLower reappears), these origins would match.
+// that host. The canonicalization rejects each lookalike outright, so none can bind the provider.
 func TestHostMatchNoUnicodeBypass(t *testing.T) {
 	s, err := gitsync.New(newStorePath(t))
 	if err != nil {

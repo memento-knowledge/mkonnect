@@ -128,11 +128,19 @@ func validateRemoteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// asciiToLower lowercases ASCII letters only, leaving every other byte untouched. Host comparison
-// must never use Unicode case-folding: strings.ToLower maps characters such as U+0130 ('İ') and
-// U+212A ('K', Kelvin sign) onto ASCII letters, so a non-ASCII origin host could case-fold onto a
-// configured ASCII host while git and curl resolve it to a different, attacker-registrable host.
-// Hosts are constrained to ASCII by canonicalASCIIHost, so ASCII-only folding is complete here.
+// numericHostLabelRE matches the inet_aton numeric forms a host's final label must not take: a
+// decimal or leading-zero-octal digit run, or a "0x"/"0X" hex run. It is applied only to the
+// rightmost label (see canonicalASCIIHost), which is where inet_aton decides whether to read the
+// whole host as an IPv4 address.
+var numericHostLabelRE = regexp.MustCompile(`^(?:[0-9]+|0[xX][0-9a-fA-F]*)$`)
+
+// asciiToLower lowercases ASCII letters only, leaving every other byte untouched. It is the
+// defense-in-depth half of the host guard: the PRIMARY guard is canonicalASCIIHost's ASCII
+// validation, which rejects every non-ASCII host before any folding happens. ASCII-only folding
+// ensures that even if that validation were later loosened, host comparison could never Unicode
+// case-fold — strings.ToLower maps characters such as U+0130 ('İ') and U+212A ('K', Kelvin sign)
+// onto ASCII letters, which would let a non-ASCII origin fold onto a configured ASCII host while
+// git and curl resolve it to a different, attacker-registrable host.
 func asciiToLower(s string) string {
 	var b []byte
 	for i := 0; i < len(s); i++ {
@@ -150,44 +158,48 @@ func asciiToLower(s string) string {
 }
 
 // canonicalASCIIHost validates a URL host and returns its canonical comparison form. An IP literal
-// (IPv4 or IPv6, as netip accepts it) is canonicalized via netip. Otherwise the host must be an
-// ASCII letter-digit-hyphen name, which is ASCII-lowercased. Everything else is rejected, so the
-// host that is match-checked is exactly the host git will dial. Rejected forms include: non-ASCII
-// and internationalized hosts (e.g. U+0130, U+212A, fullwidth letters/digits), Unicode "dot"
-// lookalikes such as the ideographic full stop U+3002, zero-width characters (U+200B), any
-// percent-encoding, and ambiguous numeric forms that netip rejects but curl/inet_aton dial as an
-// IPv4 address — a bare integer like "2130706433", a leading-zero octal octet like "010.0.0.1", or
-// a hex octet like "0x7f.0.0.1". If internationalized domains are ever required, normalize BOTH
-// sides via golang.org/x/net/idna (idna.Lookup.ToASCII) before comparing, never with strings.ToLower.
+// (IPv4 or IPv6, as netip accepts it, but never with a zone) is canonicalized via netip. Otherwise
+// the host must be an ASCII letter-digit-hyphen-underscore name, which is ASCII-lowercased.
+// Everything else is rejected, so the host that is match-checked is exactly the host git will dial.
+// Rejected forms include: non-ASCII and internationalized hosts (e.g. U+0130, U+212A, fullwidth
+// letters/digits), Unicode "dot" lookalikes such as the ideographic full stop U+3002, zero-width
+// characters (U+200B), any percent-encoding, an IPv6 zone (e.g. "fe80::1%eth0"), and the ambiguous
+// numeric forms that netip rejects but curl/inet_aton dial as an IPv4 address when the host's final
+// label is numeric — a bare integer like "2130706433", a leading-zero octal octet like "010.0.0.1",
+// or a hex run like "0x7f000001" or "127.0.0.0x1". If internationalized domains are ever required,
+// normalize BOTH sides via golang.org/x/net/idna (idna.Lookup.ToASCII), never with strings.ToLower.
 func canonicalASCIIHost(host string) (string, error) {
 	if host == "" {
 		return "", errors.New("must include a host")
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
+		// An IPv6 zone is attacker-chosen text that is neither charset-checked nor ASCII-lowercased and
+		// can address a link-local interface, so reject it rather than carry it into the dialed URL.
+		if ip.Zone() != "" {
+			return "", errors.New("must not include an IPv6 zone")
+		}
 		return ip.String(), nil
 	}
 	labels := strings.Split(host, ".")
-	for i, label := range labels {
+	for _, label := range labels {
 		if label == "" || len(label) > 63 {
 			return "", errors.New("has an invalid host")
 		}
-		allDigits := true
 		for j := 0; j < len(label); j++ {
 			switch c := label[j]; {
 			case c >= '0' && c <= '9':
-			case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'):
-				allDigits = false
-			case c == '-':
-				allDigits = false
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+			case c == '-', c == '_':
 			default:
-				return "", errors.New("host must be an ASCII name (letters, digits, hyphen) or an IP literal")
+				return "", errors.New("host must be an ASCII name (letters, digits, hyphen, underscore) or an IP literal; use the punycode (xn--) form for internationalized domains")
 			}
 		}
-		// An all-numeric final label is not a DNS name but an inet_aton numeric IPv4 form that netip
-		// already rejected above; curl/git would still dial it as an address, so reject it here.
-		if allDigits && i == len(labels)-1 {
-			return "", errors.New("has an ambiguous numeric host")
-		}
+	}
+	// A real DNS top-level label is never purely numeric or a "0x" hex run; those are the inet_aton
+	// forms that netip rejected above but curl/git still dial as an address. inet_aton reinterprets a
+	// host as an address only when its FINAL label is numeric, so rejecting that label is sufficient.
+	if numericHostLabelRE.MatchString(labels[len(labels)-1]) {
+		return "", errors.New("has an ambiguous numeric host")
 	}
 	return asciiToLower(host), nil
 }
