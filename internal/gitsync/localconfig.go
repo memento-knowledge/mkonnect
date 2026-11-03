@@ -128,38 +128,117 @@ func validateRemoteURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
-// canonicalHostKey reduces a URL to a comparable "scheme://host:port" identity: lowercased host,
-// trailing FQDN dot stripped, IP literals canonicalized, and the port normalized to an explicit
-// integer (default ports made explicit) so that https://h, https://h:443 and https://h.:0443 all
-// compare equal while http:// never matches https://. It is the basis for both the host-match
-// guard and duplicate-host detection.
-func canonicalHostKey(raw string) (string, error) {
-	u, err := validateRemoteURL(raw)
-	if err != nil {
-		return "", err
+// asciiToLower lowercases ASCII letters only, leaving every other byte untouched. Host comparison
+// must never use Unicode case-folding: strings.ToLower maps characters such as U+0130 ('İ') and
+// U+212A ('K', Kelvin sign) onto ASCII letters, so a non-ASCII origin host could case-fold onto a
+// configured ASCII host while git and curl resolve it to a different, attacker-registrable host.
+// Hosts are constrained to ASCII by canonicalASCIIHost, so ASCII-only folding is complete here.
+func asciiToLower(s string) string {
+	var b []byte
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			if b == nil {
+				b = []byte(s)
+			}
+			b[i] = c + ('a' - 'A')
+		}
 	}
-	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if b == nil {
+		return s
+	}
+	return string(b)
+}
+
+// canonicalASCIIHost validates a URL host and returns its canonical comparison form. An IP literal
+// (IPv4 or IPv6, as netip accepts it) is canonicalized via netip. Otherwise the host must be an
+// ASCII letter-digit-hyphen name, which is ASCII-lowercased. Everything else is rejected, so the
+// host that is match-checked is exactly the host git will dial. Rejected forms include: non-ASCII
+// and internationalized hosts (e.g. U+0130, U+212A, fullwidth letters/digits), Unicode "dot"
+// lookalikes such as the ideographic full stop U+3002, zero-width characters (U+200B), any
+// percent-encoding, and ambiguous numeric forms that netip rejects but curl/inet_aton dial as an
+// IPv4 address — a bare integer like "2130706433", a leading-zero octal octet like "010.0.0.1", or
+// a hex octet like "0x7f.0.0.1". If internationalized domains are ever required, normalize BOTH
+// sides via golang.org/x/net/idna (idna.Lookup.ToASCII) before comparing, never with strings.ToLower.
+func canonicalASCIIHost(host string) (string, error) {
 	if host == "" {
 		return "", errors.New("must include a host")
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		host = ip.String()
+		return ip.String(), nil
 	}
+	labels := strings.Split(host, ".")
+	for i, label := range labels {
+		if label == "" || len(label) > 63 {
+			return "", errors.New("has an invalid host")
+		}
+		allDigits := true
+		for j := 0; j < len(label); j++ {
+			switch c := label[j]; {
+			case c >= '0' && c <= '9':
+			case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'):
+				allDigits = false
+			case c == '-':
+				allDigits = false
+			default:
+				return "", errors.New("host must be an ASCII name (letters, digits, hyphen) or an IP literal")
+			}
+		}
+		// An all-numeric final label is not a DNS name but an inet_aton numeric IPv4 form that netip
+		// already rejected above; curl/git would still dial it as an address, so reject it here.
+		if allDigits && i == len(labels)-1 {
+			return "", errors.New("has an ambiguous numeric host")
+		}
+	}
+	return asciiToLower(host), nil
+}
+
+// canonicalPort normalizes u's port to an explicit 1-65535 integer string, making the scheme's
+// default explicit when none is present, so https://h, https://h:443 and https://h:0443 all compare
+// equal while http:// never matches https://.
+func canonicalPort(u *url.URL) (string, error) {
 	port := u.Port()
 	if port == "" {
 		if u.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
+			return "443", nil
 		}
-	} else {
-		n, err := strconv.Atoi(port)
-		if err != nil || n <= 0 || n > 65535 {
-			return "", errors.New("has an invalid port")
-		}
-		port = strconv.Itoa(n)
+		return "80", nil
 	}
-	return u.Scheme + "://" + net.JoinHostPort(host, port), nil
+	n, err := strconv.Atoi(port)
+	if err != nil || n <= 0 || n > 65535 {
+		return "", errors.New("has an invalid port")
+	}
+	return strconv.Itoa(n), nil
+}
+
+// canonicalRemoteURL validates raw and returns both its canonical host key (scheme://host:port, used
+// for provider matching and duplicate-host detection) and a re-serialized absolute URL whose
+// authority is exactly that canonical host:port, with the trailing FQDN dot stripped and the path
+// preserved. Phase 3 MUST dial fullURL rather than re-parsing the raw origin string: git's URL
+// parser and ours can diverge, so re-serializing from the validated host guarantees the host that
+// was match-checked is byte-for-byte the host that gets contacted.
+func canonicalRemoteURL(raw string) (hostKey, fullURL string, err error) {
+	u, err := validateRemoteURL(raw)
+	if err != nil {
+		return "", "", err
+	}
+	host, err := canonicalASCIIHost(strings.TrimSuffix(u.Hostname(), "."))
+	if err != nil {
+		return "", "", err
+	}
+	port, err := canonicalPort(u)
+	if err != nil {
+		return "", "", err
+	}
+	authority := net.JoinHostPort(host, port)
+	cu := &url.URL{Scheme: u.Scheme, Host: authority, Path: u.Path, RawPath: u.RawPath}
+	return u.Scheme + "://" + authority, cu.String(), nil
+}
+
+// canonicalHostKey reduces a URL to its comparable scheme://host:port identity (see
+// canonicalRemoteURL). It is the basis for both the host-match guard and duplicate-host detection.
+func canonicalHostKey(raw string) (string, error) {
+	hostKey, _, err := canonicalRemoteURL(raw)
+	return hostKey, err
 }
 
 // LocalEntry is the operator-supplied local configuration for one provider: an origin base URL
@@ -368,10 +447,17 @@ func (s *Store) MatchProvider(originURL string) (name string, e LocalEntry, ok b
 	if err != nil {
 		return "", LocalEntry{}, false
 	}
+	return s.matchByHostKey(hk)
+}
+
+// matchByHostKey returns the provider whose base URL canonicalizes to hostKey. The caller passes a
+// host key already derived by canonicalRemoteURL/canonicalHostKey, so the origin is parsed once.
+// Iteration is sorted for deterministic selection.
+func (s *Store) matchByHostKey(hostKey string) (name string, e LocalEntry, ok bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, n := range slices.Sorted(maps.Keys(s.data)) {
-		if ehk, err := canonicalHostKey(s.data[n].BaseURL); err == nil && ehk == hk {
+		if ehk, err := canonicalHostKey(s.data[n].BaseURL); err == nil && ehk == hostKey {
 			return n, s.data[n], true
 		}
 	}

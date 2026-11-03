@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +59,21 @@ const (
 	maxConfigVersionSize = 256
 )
 
+// repoIDRE constrains a platform-supplied repo_id to a safe charset and length. repo_id is used in
+// local filesystem paths and replica push URLs in Phase 3, so anything outside this set — path
+// separators, NUL, control characters, whitespace — is a traversal or injection vector and is
+// rejected at config-validation time. The length bound is single-sourced from maxRepoIDLength.
+var repoIDRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,` + strconv.Itoa(maxRepoIDLength) + `}$`)
+
+// validRepoID reports whether a repo_id is safe to use as a path component. "." and "..", though
+// within the charset, are themselves path-traversal components and are rejected.
+func validRepoID(id string) bool {
+	if !repoIDRE.MatchString(id) {
+		return false
+	}
+	return id != "." && id != ".."
+}
+
 const (
 	// statusWriteTimeout bounds the connection-time status write, before the heartbeat exists to
 	// tear down a wedged connection.
@@ -75,11 +92,18 @@ const (
 
 // repoState is the Phase-2 retained subset of a configured repository. The push token is
 // deliberately NOT retained: Phase 2 never pushes, and holding it only widens the leak surface.
+//
+// The raw origin_url string is deliberately NOT retained either. When a repository host-matches a
+// local provider, applyConfig resolves and stores the matched provider name plus the validated,
+// re-serialized canonical origin URL. Phase 3 dials canonicalURL directly and never re-parses an
+// unvalidated string with git's URL parser, so the host that was match-checked is exactly the host
+// that gets contacted and repo i's host can never be matched against provider j.
 type repoState struct {
-	repoID    string
-	originURL string
-	expiresAt string // push_token_expires_at (RFC3339), "" when none
-	matched   bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+	repoID       string
+	provider     string // matched local provider name, "" when unmatched
+	canonicalURL string // validated, re-serialized origin URL for Phase 3 to dial, "" when unmatched
+	expiresAt    string // push_token_expires_at (RFC3339), "" when none
+	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
 }
 
 // Client is the git-sync connector. It implements gateway.Handler and drives a gateway.Client for
@@ -233,8 +257,11 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	}
 	next := make(map[string]repoState, len(msg.Repositories))
 	for _, r := range msg.Repositories {
-		if r.RepoID == "" || len(r.RepoID) > maxRepoIDLength {
-			slog.Warn("git_sync_config has an entry with an empty or oversized repo_id; leaving configuration unchanged")
+		if !validRepoID(r.RepoID) {
+			// repo_id will be used in local filesystem paths and replica push URLs in Phase 3, so a
+			// value outside the safe charset (or a "." / ".." traversal component) is rejected here,
+			// not silently carried. Not logged verbatim: a hostile id could carry log-injection bytes.
+			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
 			return false
 		}
 		if _, dup := next[r.RepoID]; dup {
@@ -243,12 +270,18 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		}
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
 		// (loaded at startup, no live reload), so the result is stable until the next config and
-		// need not be recomputed on every status.
-		matched := c.local != nil
-		if matched {
-			_, _, matched = c.local.MatchProvider(r.OriginURL)
+		// need not be recomputed on every status. The origin is parsed once: its canonical host key
+		// selects the provider and its canonical URL is retained for Phase 3 to dial.
+		var provider, canonicalURL string
+		matched := false
+		if c.local != nil {
+			if hostKey, fullURL, err := canonicalRemoteURL(r.OriginURL); err == nil {
+				if name, _, ok := c.local.matchByHostKey(hostKey); ok {
+					provider, canonicalURL, matched = name, fullURL, true
+				}
+			}
 		}
-		next[r.RepoID] = repoState{repoID: r.RepoID, originURL: r.OriginURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		next[r.RepoID] = repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
 	}
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")

@@ -339,3 +339,88 @@ func TestMatchProvider(t *testing.T) {
 		})
 	}
 }
+
+// TestCanonicalHostRejectsAmbiguous asserts that the host-canonicalization underpinning the match
+// guard REJECTS (errors on) non-ASCII, Unicode-lookalike, and ambiguous-numeric hosts, rather than
+// silently folding them onto an ASCII host. A Unicode case-fold (strings.ToLower) would map several
+// of these onto a legitimate ASCII host while git/curl dial a different, attacker-registrable host.
+func TestCanonicalHostRejectsAmbiguous(t *testing.T) {
+	bad := []struct {
+		name, url string
+	}{
+		{"capital-dotted-I U+0130", "https://gİthub.com/x"},    // ToLower("İ") == "i"
+		{"kelvin-sign U+212A", "https://Kelvin.example.com/x"}, // ToLower("K") == "k"
+		{"fullwidth letters", "https://ｇithub.com/x"},          // U+FF47 fullwidth g
+		{"ideographic-full-stop U+3002", "https://github。com/x"},
+		{"zero-width-space U+200B", "https://git\u200bhub.com/x"},
+		{"percent-encoded non-ASCII", "https://git%C4%B0hub.com/x"},
+		{"bare integer IPv4", "https://2130706433/x"},
+		{"leading-zero octal octet", "https://010.0.0.1/x"},
+		{"hex octet", "https://0x7f.0.0.1/x"},
+		{"empty label (double dot)", "https://github..com/x"},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			if hk, err := gitsync.CanonicalHostKeyForTest(tt.url); err == nil {
+				t.Errorf("CanonicalHostKey(%q) = %q, nil; want an error (host must be rejected)", tt.url, hk)
+			}
+		})
+	}
+}
+
+// TestHostMatchNoUnicodeBypass is the end-to-end guard: a provider configured at an ASCII host must
+// never be matched by a platform-supplied origin whose host only Unicode-folds or numeric-decodes to
+// that host. If this regresses (e.g. strings.ToLower reappears), these origins would match.
+func TestHostMatchNoUnicodeBypass(t *testing.T) {
+	s, err := gitsync.New(newStorePath(t))
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := s.Set("gh", gitsync.LocalEntry{BaseURL: "https://github.com/"}); err != nil {
+		t.Fatalf("set gh: %v", err)
+	}
+	lookalikes := []string{
+		"https://gİthub.com/owner/repo.git",       // İ folds to i
+		"https://github。com/owner/repo.git",       // ideographic dot
+		"https://git\u200bhub.com/owner/repo.git", // zero-width space
+		"https://git%C4%B0hub.com/owner/repo.git", // percent-encoded
+	}
+	for _, origin := range lookalikes {
+		if name, _, ok := s.MatchProvider(origin); ok {
+			t.Errorf("MatchProvider(%q) matched provider %q; a Unicode/encoded lookalike must not bind", origin, name)
+		}
+	}
+	// A configured base_url with such a host must itself be rejected, so a bypass host can never be
+	// stored as a provider either.
+	if err := s.Set("evil", gitsync.LocalEntry{BaseURL: "https://gİthub.com/"}); err == nil {
+		t.Error("Set accepted a provider with a non-ASCII host; want rejection")
+	}
+}
+
+// TestCanonicalRemoteURLReserialized asserts the Phase-3 dial URL: the host is canonicalized to the
+// exact string that was match-checked (ASCII-lowercased, trailing dot stripped, explicit port) and
+// the repository path is preserved, so git dials byte-for-byte the host that was authorized.
+func TestCanonicalRemoteURLReserialized(t *testing.T) {
+	tests := []struct {
+		name, origin, wantKey, wantURL string
+	}{
+		{"mixed case + default port", "https://GitHub.com/owner/repo.git", "https://github.com:443", "https://github.com:443/owner/repo.git"},
+		{"trailing dot + explicit port", "https://github.com.:443/o/r.git", "https://github.com:443", "https://github.com:443/o/r.git"},
+		{"ipv6 literal", "https://[2001:DB8::1]/o/r.git", "https://[2001:db8::1]:443", "https://[2001:db8::1]:443/o/r.git"},
+		{"http default port", "http://git.example.com/o/r.git", "http://git.example.com:80", "http://git.example.com:80/o/r.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hk, full, err := gitsync.CanonicalRemoteURLForTest(tt.origin)
+			if err != nil {
+				t.Fatalf("CanonicalRemoteURL(%q) error: %v", tt.origin, err)
+			}
+			if hk != tt.wantKey {
+				t.Errorf("hostKey = %q, want %q", hk, tt.wantKey)
+			}
+			if full != tt.wantURL {
+				t.Errorf("fullURL = %q, want %q", full, tt.wantURL)
+			}
+		})
+	}
+}

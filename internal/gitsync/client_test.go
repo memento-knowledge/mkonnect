@@ -232,6 +232,35 @@ func TestHostMatchStates(t *testing.T) {
 	}
 }
 
+// TestRepoStateStoresCanonicalURL asserts Fix #2: a host-matched repository retains the matched
+// provider name and the validated, re-serialized canonical origin URL (not the raw origin string),
+// so Phase 3 dials exactly the authorized host. An unmatched repository retains neither.
+func TestRepoStateStoresCanonicalURL(t *testing.T) {
+	c := newTestClient(t, oneProvider) // provider "origin" at https://git.example.com/
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSON("1",
+		[3]string{"repo-a", "https://GIT.example.com/team/a.git", ""},
+		[3]string{"repo-b", "https://other.example.com/b.git", ""}))
+
+	provider, canonURL, matched, found := c.RepoStateForTest("repo-a")
+	if !found || !matched {
+		t.Fatalf("repo-a: found=%v matched=%v, want both true", found, matched)
+	}
+	if provider != "origin" {
+		t.Errorf("repo-a provider = %q, want %q", provider, "origin")
+	}
+	if want := "https://git.example.com:443/team/a.git"; canonURL != want {
+		t.Errorf("repo-a canonicalURL = %q, want %q (ASCII-lowercased host, explicit port, path kept)", canonURL, want)
+	}
+
+	provider, canonURL, matched, found = c.RepoStateForTest("repo-b")
+	if !found {
+		t.Fatal("repo-b not retained")
+	}
+	if matched || provider != "" || canonURL != "" {
+		t.Errorf("unmatched repo-b: matched=%v provider=%q canonicalURL=%q, want false/\"\"/\"\"", matched, provider, canonURL)
+	}
+}
+
 func TestStatusNullBeforeConfig(t *testing.T) {
 	c := newTestClient(t, "") // empty local config: no probe fires
 	s := &stubSender{}
@@ -274,6 +303,14 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 		"duplicate repo_id":   `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"},{"repo_id":"x","origin_url":"https://git.example.com/b"}]}`,
 		"empty repo_id":       `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"","origin_url":"https://git.example.com/a"}]}`,
 		"non-scalar version":  `{"type":"git_sync_config","config_version":{"n":1},"repositories":[{"repo_id":"x","origin_url":"https://git.example.com/a"}]}`,
+		// repo_id charset: traversal, control, and bare-dot ids are rejected as a whole message, since
+		// Phase 3 uses repo_id in filesystem paths and replica URLs.
+		"traversal repo_id":  `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"../../x","origin_url":"https://git.example.com/a"}]}`,
+		"dotdot repo_id":     `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"..","origin_url":"https://git.example.com/a"}]}`,
+		"dot repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":".","origin_url":"https://git.example.com/a"}]}`,
+		"nul repo_id":        `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0000b","origin_url":"https://git.example.com/a"}]}`,
+		"control repo_id":    `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a\u0001b","origin_url":"https://git.example.com/a"}]}`,
+		"whitespace repo_id": `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"a b","origin_url":"https://git.example.com/a"}]}`,
 	}
 	oversized := `{"type":"git_sync_config","config_version":1,"repositories":[{"repo_id":"` + strings.Repeat("a", 257) + `","origin_url":"https://git.example.com/a"}]}`
 	cases["oversized repo_id"] = oversized
