@@ -24,15 +24,16 @@ func gcMirrorName(repoID string) string {
 // gcHarness drives sweepMirrors against a real temporary root with injectable time, remove and
 // claim, and captures the log.
 type gcHarness struct {
-	t       *testing.T
-	root    string
-	keep    map[string]struct{}
-	now     time.Time
-	busy    map[string]bool
-	claim   func(name string, do func() error) (bool, error)
-	remove  func(r *os.Root, name string) error
-	removed []string // names handed to remove, root-relative
-	log     bytes.Buffer
+	t              *testing.T
+	root           string
+	keep           map[string]struct{}
+	now            time.Time
+	busy           map[string]bool
+	lastConfigured map[string]time.Time
+	claim          func(name string, do func() error) (bool, error)
+	remove         func(r *os.Root, name string) error
+	removed        []string // names handed to remove, root-relative
+	log            bytes.Buffer
 }
 
 func newGCHarness(t *testing.T) *gcHarness {
@@ -56,12 +57,13 @@ func (h *gcHarness) sweepCtx(ctx context.Context) sweepResult {
 		claim = func(_ string, do func() error) (bool, error) { return true, do() }
 	}
 	return sweepMirrors(ctx, sweepParams{
-		Root:  h.root,
-		Keep:  h.keep,
-		Now:   h.now,
-		Grace: mirrorGCGrace,
-		Busy:  func(name string) bool { return h.busy[name] },
-		Claim: claim,
+		Root:           h.root,
+		Keep:           h.keep,
+		Now:            h.now,
+		Grace:          mirrorGCGrace,
+		Busy:           func(name string) bool { return h.busy[name] },
+		LastConfigured: func(name string) (time.Time, bool) { t, ok := h.lastConfigured[name]; return t, ok },
+		Claim:          claim,
 		Remove: func(r *os.Root, name string) error {
 			h.removed = append(h.removed, name)
 			if h.remove != nil {
@@ -645,4 +647,63 @@ func TestSweepStopsWhenContextIsCancelled(t *testing.T) {
 	if !h.exists(m, "HEAD") || len(h.removed) != 0 {
 		t.Fatal("a cancelled sweep must not delete anything")
 	}
+}
+
+func TestSweepMarkOlderThanTheLastTimeConfiguredIsStale(t *testing.T) {
+	h := newGCHarness(t)
+	h.keep[gcMirrorName("other")] = struct{}{}
+	stale := h.mirror("returned-then-left")
+	current := h.mirror("left-and-stayed-away")
+	h.mark(stale, gcNow.Add(-2*mirrorGCGrace))
+	h.mark(current, gcNow.Add(-2*mirrorGCGrace))
+	// The first came back (and left again) after its mark was written; the second never did.
+	h.lastConfigured = map[string]time.Time{stale: gcNow.Add(-mirrorGCGrace)}
+
+	res := h.sweep()
+
+	if !h.exists(stale, "HEAD") {
+		t.Fatal("a mirror whose repository was configured again after the mark was written lost its grace period")
+	}
+	got, ok := h.markerTime(stale)
+	if !ok || !got.Equal(gcNow) {
+		t.Fatalf("stale mark not restarted: %v valid=%v", got, ok)
+	}
+	if h.exists(current) {
+		t.Fatal("an overdue orphan that never came back was not removed")
+	}
+	if res.Marked != 1 || res.Removed != 1 {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+func TestSweepDistrustsAClockBeforeTheSanityFloor(t *testing.T) {
+	t.Run("a sweep with an implausible current time does nothing", func(t *testing.T) {
+		h := newGCHarness(t)
+		h.keep[gcMirrorName("other")] = struct{}{}
+		m := h.mirror("repo-a")
+		h.mark(m, time.Unix(0, 0).Add(-time.Hour)) // before the epoch: "overdue" under any clock
+		h.now = time.Unix(0, 0).Add(10 * mirrorGCGrace)
+		fresh := h.mirror("repo-b")
+
+		res := h.sweep()
+
+		if !h.exists(m, "HEAD") || h.exists(fresh, orphanMarkerName) || res != (sweepResult{}) {
+			t.Fatalf("swept with the clock before the sanity floor (result %+v)", res)
+		}
+	})
+	t.Run("a mark dated before the floor is not trusted", func(t *testing.T) {
+		h := newGCHarness(t)
+		h.keep[gcMirrorName("other")] = struct{}{}
+		m := h.mirror("repo-a")
+		h.mark(m, time.Date(1990, 1, 1, 0, 0, 0, 0, time.UTC)) // written while the clock was wrong
+
+		h.sweep()
+
+		if !h.exists(m, "HEAD") {
+			t.Fatal("removed a mirror on the strength of a mark dated before the sanity floor")
+		}
+		if got, ok := h.markerTime(m); !ok || !got.Equal(gcNow) {
+			t.Fatalf("mark not restarted: %v valid=%v", got, ok)
+		}
+	})
 }

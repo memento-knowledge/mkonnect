@@ -385,3 +385,66 @@ func TestRunStartsMirrorGC(t *testing.T) {
 	c.handleConfig(gcConfigMsg("repo-a"))
 	gcEventually(t, "Run's cleanup loop to mark the orphan", func() bool { return h.exists(orphan, orphanMarkerName) })
 }
+
+// TestMirrorGCReturnThenLeaveRestartsTheGrace pins the rule "returning to the configuration clears the
+// mark" for the cases where no sweep sees the mirror configured: sweeps are paused, or two
+// configurations arrive before the loop wakes.
+func TestMirrorGCReturnThenLeaveRestartsTheGrace(t *testing.T) {
+	cases := []struct {
+		name  string
+		pause func(c *Client) (resume func())
+	}{
+		{"sweeps paused by a critical update", func(c *Client) func() {
+			c.criticalPatchRequired.Store(true)
+			return func() { c.criticalPatchRequired.Store(false) }
+		}},
+		{"two configurations before one sweep", func(*Client) func() { return func() {} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newGCHarness(t)
+			clock := newGCClock(gcNow)
+			c := newGCClient(t, h, clock)
+			c.handleConfig(gcConfigMsg("repo-a"))
+			r := h.overdueOrphan(clock, "repo-r") // marked long ago, when it was last absent
+
+			resume := tc.pause(c)
+			c.handleConfig(gcConfigMsg("repo-a", "repo-r")) // repo-r comes back ...
+			c.handleConfig(gcConfigMsg("repo-a"))           // ... and leaves again before any sweep saw it
+			resume()
+			c.collectMirrors(context.Background())
+
+			if !h.exists(r, "HEAD") {
+				t.Fatal("a repository that came back and left again was removed without a fresh grace period")
+			}
+			clock.add(mirrorGCGrace - time.Hour)
+			c.collectMirrors(context.Background())
+			if !h.exists(r, "HEAD") {
+				t.Fatal("removed before the restarted grace period elapsed")
+			}
+			clock.add(2 * time.Hour)
+			c.collectMirrors(context.Background())
+			if h.exists(r) {
+				t.Fatal("not removed after the restarted grace period elapsed")
+			}
+		})
+	}
+}
+
+func TestStartMirrorGCTwiceKeepsASingleLoop(t *testing.T) {
+	h := newGCHarness(t)
+	c := newGCClient(t, h, newGCClock(gcNow))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		c.Wait(context.Background())
+	})
+
+	c.startMirrorGC(ctx)
+	first := c.gc.currentDone()
+	c.startMirrorGC(ctx)
+
+	if c.gc.currentDone() != first {
+		t.Fatal("a second start replaced the first loop's done channel, so Wait would not cover it")
+	}
+}

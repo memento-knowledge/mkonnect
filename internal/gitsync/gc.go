@@ -61,6 +61,12 @@ const (
 	gcTrashDirName = ".mkonnect-gc-trash"
 )
 
+// mirrorGCClockFloor is the earliest time the wall clock may read for a sweep to trust it. A host that
+// boots with an unset clock (the epoch) would otherwise write marks that look ancient once the clock is
+// corrected, expiring the grace period at once. Before the floor nothing is swept, and a mark dated
+// before it is rewritten rather than believed, so a wrong clock can only delay removal.
+var mirrorGCClockFloor = time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+
 var (
 	// mirrorDirRE matches exactly the directory names Mirrors.Dir produces.
 	mirrorDirRE = regexp.MustCompile(`^[0-9a-f]{64}\.git$`)
@@ -95,6 +101,9 @@ type sweepParams struct {
 	// Busy reports whether a sync of the mirror is queued or running. Such a mirror is neither marked
 	// nor removed.
 	Busy func(name string) bool
+	// LastConfigured reports when the mirror was last seen in an accepted configuration. A mark older
+	// than that is stale: the repository came back after it was written. May be nil.
+	LastConfigured func(name string) (time.Time, bool)
 	// Claim runs tombstone, which moves the mirror aside, atomically with respect to a sync starting
 	// for it, and reports whether it ran. It must decline (false, nil) when a sync is queued or running
 	// or the repository is configured again.
@@ -110,6 +119,10 @@ func sweepMirrors(ctx context.Context, p sweepParams) sweepResult {
 	var res sweepResult
 	if p.Log == nil {
 		p.Log = slog.Default()
+	}
+	if p.Now.Before(mirrorGCClockFloor) {
+		p.Log.Warn("mirror cleanup skipped: the system clock reads an implausibly early time")
+		return res
 	}
 	clean := filepath.Clean(p.Root)
 	if !filepath.IsAbs(clean) || filepath.Dir(clean) == clean {
@@ -203,6 +216,14 @@ func (s *sweeper) sweepOne(name string) {
 		s.writeMarker(name)
 		return
 	}
+	if s.p.LastConfigured != nil {
+		if last, seen := s.p.LastConfigured(name); seen && since.Before(last) {
+			// The repository was configured again after this mark was written, so the mark describes an
+			// earlier absence; the grace period starts over.
+			s.writeMarker(name)
+			return
+		}
+	}
 	if age := s.p.Now.Sub(since); age >= s.p.Grace {
 		s.removeDue(name, age)
 	}
@@ -223,7 +244,7 @@ func (s *sweeper) removeDue(name string, age time.Duration) {
 	}
 	if !claimed {
 		s.res.Busy++
-		s.p.Log.Debug("mirror cleanup: mirror is in use or configured again; leaving it", "mirror", name)
+		s.p.Log.Debug("mirror cleanup: mirror not claimed (in use, configured again, or cleanup paused); leaving it", "mirror", name)
 		return
 	}
 	if err := s.p.Remove(s.root, moved); err != nil {
@@ -295,6 +316,10 @@ func (s *sweeper) recoverTombstones(ctx context.Context) {
 		}
 		fi, err := s.root.Lstat(path)
 		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				s.res.Failed++
+				s.p.Log.Warn("mirror cleanup: cannot inspect a set-aside mirror; will retry", "mirror", n, "reason", errReason(err))
+			}
 			continue
 		}
 		if fi.Mode().Type() != fs.ModeDir {
@@ -313,7 +338,8 @@ func (s *sweeper) recoverTombstones(ctx context.Context) {
 }
 
 // readMarker returns when the mirror was first seen orphaned. A missing marker, or one that is not a
-// regular file, is oversized, does not parse, or is dated in the future, reports false.
+// regular file, is oversized, does not parse, or is dated in the future or before the clock floor,
+// reports false.
 func (s *sweeper) readMarker(name string) (time.Time, bool) {
 	path := filepath.Join(name, orphanMarkerName)
 	fi, err := s.root.Lstat(path)
@@ -330,7 +356,7 @@ func (s *sweeper) readMarker(name string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(b)))
-	if err != nil || t.After(s.p.Now) {
+	if err != nil || t.After(s.p.Now) || t.Before(mirrorGCClockFloor) {
 		return time.Time{}, false
 	}
 	return t.UTC(), true
@@ -461,10 +487,30 @@ type mirrorGC struct {
 
 	mu   sync.Mutex
 	done chan struct{} // closed when the loop started by startMirrorGC has exited
+	// configured is when each mirror was last seen in an accepted configuration. It is kept even while
+	// sweeps are paused, so an orphan mark written before a repository came back is recognised as stale
+	// however the sweeps and configurations interleave.
+	configured map[string]time.Time
 }
 
 func newMirrorGC() *mirrorGC {
-	return &mirrorGC{wake: make(chan struct{}, 1), interval: mirrorGCInterval}
+	return &mirrorGC{wake: make(chan struct{}, 1), interval: mirrorGCInterval, configured: map[string]time.Time{}}
+}
+
+// noteConfigured records that every mirror in keep is configured as of at.
+func (g *mirrorGC) noteConfigured(keep map[string]struct{}, at time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for name := range keep {
+		g.configured[name] = at
+	}
+}
+
+func (g *mirrorGC) lastConfigured(name string) (time.Time, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	t, ok := g.configured[name]
+	return t, ok
 }
 
 // configApplied records the outcome of a git_sync_config and, when it was accepted, asks for a sweep.
@@ -499,6 +545,17 @@ func (g *mirrorGC) wait(ctx context.Context) {
 
 // dirName returns the directory name Mirrors.Dir gives repoID: the name sweepMirrors matches against.
 func (m Mirrors) dirName(repoID string) string { return filepath.Base(m.Dir(repoID)) }
+
+// noteConfigApplied is called after every git_sync_config, accepted or not, on the gateway read loop.
+// It records which mirrors the new configuration keeps before it wakes the cleanup loop.
+func (c *Client) noteConfigApplied(accepted bool) {
+	if accepted {
+		if keep, ok := c.acceptedMirrorKeep(); ok {
+			c.gc.noteConfigured(keep, c.now())
+		}
+	}
+	c.gc.configApplied(accepted)
+}
 
 // acceptedMirrorKeep returns the mirror directory names of every repository in the accepted
 // configuration (matched or not: any configured repository keeps its mirror). It reports false when no
@@ -559,14 +616,15 @@ func (c *Client) collectMirrors(ctx context.Context) {
 		remove = (*os.Root).RemoveAll
 	}
 	res := sweepMirrors(ctx, sweepParams{
-		Root:   c.mgr.deps.mirrors.Root,
-		Keep:   keep,
-		Now:    c.now(),
-		Grace:  mirrorGCGrace,
-		Busy:   c.mgr.mirrorBusy,
-		Claim:  c.claimMirror,
-		Remove: remove,
-		Log:    slog.Default(),
+		Root:           c.mgr.deps.mirrors.Root,
+		Keep:           keep,
+		Now:            c.now(),
+		Grace:          mirrorGCGrace,
+		Busy:           c.mgr.mirrorBusy,
+		LastConfigured: c.gc.lastConfigured,
+		Claim:          c.claimMirror,
+		Remove:         remove,
+		Log:            slog.Default(),
 	})
 	if res != (sweepResult{}) {
 		slog.Info("mirror cleanup finished", "marked", res.Marked, "cleared", res.Cleared, "busy", res.Busy,
@@ -575,14 +633,18 @@ func (c *Client) collectMirrors(ctx context.Context) {
 }
 
 // startMirrorGC starts the cleanup loop: a sweep after each accepted configuration (the wake signal)
-// and one every mirrorGCInterval. It runs until ctx ends; Wait confirms it has stopped. It is meant to
-// be called once, from Run. Sweeps run here, never on the gateway read loop.
+// and one every mirrorGCInterval. It runs until ctx ends; Wait confirms it has stopped. It starts at
+// most one loop per Client, so it is safe to call from Run more than once. Sweeps run here, never on the gateway read loop.
 func (c *Client) startMirrorGC(ctx context.Context) {
 	if mirrorGCDisabled() {
 		slog.Info("mirror cleanup is disabled", "env", mirrorGCEnvVar)
 	}
 	done := make(chan struct{})
 	c.gc.mu.Lock()
+	if c.gc.done != nil { // already running: a second loop would sweep the same root concurrently
+		c.gc.mu.Unlock()
+		return
+	}
 	c.gc.done = done
 	c.gc.mu.Unlock()
 	go func() {

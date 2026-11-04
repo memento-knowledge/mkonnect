@@ -259,7 +259,7 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 	switch typ {
 	case "git_sync_config":
 		accepted := c.applyConfig(raw)
-		c.gc.configApplied(accepted)
+		c.noteConfigApplied(accepted)
 		if accepted {
 			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
 			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
