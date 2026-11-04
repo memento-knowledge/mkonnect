@@ -1,0 +1,15 @@
+# Keep the build context small and free of local or non-source state. Both Dockerfiles copy the
+# whole context, so anything listed here never reaches a build layer or the cache key.
+.git
+.github
+.claude
+.worktrees
+.idea
+.vscode
+.DS_Store
+docs
+charts
+scripts
+dist
+*.md
+Dockerfile*
