@@ -62,6 +62,44 @@ type GitSyncConfigMsg struct {
 	// Repositories is the full desired set on each push. A nil slice (the field absent on the wire)
 	// is rejected by the connector rather than treated as "sync nothing".
 	Repositories []GitSyncRepoConfig `json:"repositories"`
+	// Schedule tunes how often the connector re-syncs each repository. INFERRED: the field name and
+	// shape are the connector's guess. Absent means "use the built-in default".
+	Schedule *GitSyncSchedule `json:"schedule,omitempty"`
+	// Limits bounds the resources a sync may use. INFERRED: the field name and shape are the
+	// connector's guess. Absent means "use the built-in defaults".
+	Limits *GitSyncLimits `json:"limits,omitempty"`
+}
+
+// GitSyncSchedule is the platform-supplied sync cadence within a GitSyncConfigMsg. INFERRED.
+type GitSyncSchedule struct {
+	// IntervalSeconds is the delay between periodic re-syncs of each repository, in seconds. Nil
+	// (absent) means the built-in default; the connector accepts 60 through 86400.
+	IntervalSeconds *int `json:"interval_seconds,omitempty"`
+}
+
+// GitSyncLimits is the platform-supplied set of resource bounds within a GitSyncConfigMsg. INFERRED:
+// every name below is the connector's guess. Each field is a pointer so that nil (absent) can mean
+// "use the built-in default", which is distinct from an explicit 0 where 0 is itself meaningful
+// (for example "unbatched" or "no ceiling"). The connector rejects the whole configuration, rather
+// than clamping, if any supplied value is out of range. The accepted ranges quoted below are
+// enforced, and defined authoritatively, by gitsync.ResolveLimits.
+type GitSyncLimits struct {
+	// MaxConcurrency is how many repositories sync at once; accepted 1 through 32.
+	MaxConcurrency *int `json:"max_concurrency,omitempty"`
+	// PushBatchRefs is the maximum number of refs sent per push, so a very large mirror is pushed in
+	// batches; 0 means unbatched, otherwise accepted 100 through 100000.
+	PushBatchRefs *int `json:"push_batch_refs,omitempty"`
+	// PackThreads is the thread count handed to git when packing; 0 means git's own default,
+	// otherwise accepted up to 64.
+	PackThreads *int `json:"pack_threads,omitempty"`
+	// PackWindowMemoryMB is the per-thread delta-window memory bound handed to git when packing, in
+	// MiB; 0 means git's own default, otherwise accepted 16 through 65536.
+	PackWindowMemoryMB *int `json:"pack_window_memory_mb,omitempty"`
+	// MaxRepositoryMB is the on-disk size ceiling for one mirrored repository, in MiB; 0 means no
+	// ceiling, otherwise accepted 1 through 10485760.
+	MaxRepositoryMB *int `json:"max_repository_mb,omitempty"`
+	// PushTimeoutSeconds bounds a single push, in seconds; accepted 60 through 86400.
+	PushTimeoutSeconds *int `json:"push_timeout_seconds,omitempty"`
 }
 
 // GitSyncRepoConfig is one repository entry within a GitSyncConfigMsg.
@@ -113,6 +151,59 @@ type GitSyncStatusMsg struct {
 	OriginCheck *OriginCheck `json:"origin_check,omitempty"`
 	// Repositories is the per-repository state; always a (possibly empty) array, never null.
 	Repositories []GitSyncRepoStatus `json:"repositories"`
+	// ConfigError reports that the most recent git_sync_config was rejected as a whole, naming the
+	// version that was refused and why; omitted when the last configuration was accepted or none has
+	// arrived. INFERRED: the connector's guess at how a rejection is surfaced.
+	ConfigError *GitSyncConfigError `json:"config_error,omitempty"`
+	// Suspended, when non-empty, says the connector has stopped syncing for a connector-wide reason
+	// rather than a per-repository one; omitted while running. The only value is
+	// GitSyncSuspendedCriticalUpdate. INFERRED: the connector's guess.
+	Suspended string `json:"suspended,omitempty"`
+}
+
+// Wire values for GitSyncConfigError.Reason. INFERRED: the platform may rename them, so they are
+// pinned by a test and defined only here.
+const (
+	// GitSyncConfigErrTooManyRepositories: the configuration listed more repositories than the
+	// connector accepts.
+	GitSyncConfigErrTooManyRepositories = "too_many_repositories"
+	// GitSyncConfigErrInvalidRepoID: a repo_id was empty or not a valid repository name.
+	GitSyncConfigErrInvalidRepoID = "invalid_repo_id"
+	// GitSyncConfigErrDuplicateRepoID: two entries carried the same repo_id.
+	GitSyncConfigErrDuplicateRepoID = "duplicate_repo_id"
+	// GitSyncConfigErrInvalidConfigVersion: config_version was not a JSON scalar or exceeded the
+	// connector's size cap.
+	GitSyncConfigErrInvalidConfigVersion = "invalid_config_version"
+	// GitSyncConfigErrLimitsOutOfRange: a schedule or limits value was outside its accepted range.
+	GitSyncConfigErrLimitsOutOfRange = "limits_out_of_range"
+	// GitSyncConfigErrMalformedMessage: the message could not be decoded, or a required field was
+	// missing or of the wrong type.
+	GitSyncConfigErrMalformedMessage = "malformed_message"
+	// GitSyncConfigErrReplicaHostMismatch: a replica_push_url named a host other than the replica host
+	// pinned at install (GIT_SYNC_REPLICA_HOST). RESERVED: this value is defined here so the wire
+	// contract is complete; it is emitted by the replica-host pinning check, which is implemented
+	// separately. Until that check exists the connector does not enforce the pin.
+	GitSyncConfigErrReplicaHostMismatch = "replica_host_mismatch"
+	// GitSyncConfigErrReplicaHostNotPinned: no replica host is pinned at install (GIT_SYNC_REPLICA_HOST
+	// is absent or empty). RESERVED, with the same caveat. The intended behaviour is to fail closed:
+	// reject every configuration and never push. It is a separate value from a mismatch so an
+	// operator can tell an incomplete install from a bad URL.
+	GitSyncConfigErrReplicaHostNotPinned = "replica_host_not_pinned"
+)
+
+// GitSyncSuspendedCriticalUpdate is the GitSyncStatusMsg.Suspended value meaning the connector has
+// stopped syncing until it is upgraded. INFERRED.
+const GitSyncSuspendedCriticalUpdate = "critical_update_required"
+
+// GitSyncConfigError describes a whole-configuration rejection. INFERRED.
+type GitSyncConfigError struct {
+	// ConfigVersion is the version of the rejected configuration, echoed opaquely (any JSON scalar);
+	// present as null when the rejected message carried no usable version (deliberately not
+	// omitempty, as on GitSyncStatusMsg).
+	ConfigVersion json.RawMessage `json:"config_version"`
+	// Reason is one of the GitSyncConfigErr* values. It never carries a value taken from the
+	// rejected message.
+	Reason string `json:"reason"`
 }
 
 // OriginCheck is the connector-level reachability result reported before any repository is
@@ -130,6 +221,29 @@ type GitSyncRepoStatus struct {
 	State string `json:"state"`
 	// OriginDefaultBranch is the repository's default branch at the origin, omitted while unknown.
 	OriginDefaultBranch string `json:"origin_default_branch,omitempty"`
+	// LastAttemptAt is when the most recent sync attempt started (RFC3339 UTC); omitted when the
+	// repository has never been attempted. INFERRED.
+	LastAttemptAt *string `json:"last_attempt_at,omitempty"`
+	// LastSuccessAt is when the most recent successful sync finished (RFC3339 UTC). INFERRED.
+	//
+	// The intended wire form is present as null until the first success, so the platform can tell
+	// "never succeeded" from "field not supported", the same convention as ConfigVersion. It is
+	// omitempty for now only because the connector does not yet record success times: emitting null
+	// would wrongly tell the platform that healthy repositories have never succeeded. The change
+	// that starts populating it must drop omitempty here and update the status goldens and
+	// TestGitSyncNewStatusFieldPresence.
+	LastSuccessAt *string `json:"last_success_at,omitempty"`
+	// DurationMS is how long the most recently FINISHED attempt took, in milliseconds; omitted until
+	// an attempt has finished. While a re-sync is in flight, LastAttemptAt names that attempt but
+	// this and the two fields below still describe the previous finished one. INFERRED.
+	DurationMS *int64 `json:"duration_ms,omitempty"`
+	// RefsPushed is how many refs the most recently finished attempt pushed; omitted until an
+	// attempt has finished. Zero is a valid value (nothing changed), which is why this is a pointer.
+	// INFERRED.
+	RefsPushed *int `json:"refs_pushed,omitempty"`
+	// NewestOriginCommitAt is the committer time of the newest commit seen at the origin by the
+	// most recently finished attempt (RFC3339 UTC); omitted while unknown. INFERRED.
+	NewestOriginCommitAt *string `json:"newest_origin_commit_at,omitempty"`
 	// ErrorType is a typed failure code when State is "error"; omitted otherwise.
 	ErrorType string `json:"error_type,omitempty"`
 	// ErrorDetail is a short, sanitised detail (never a URL, host, or path). It carries the raw

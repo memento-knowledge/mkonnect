@@ -24,6 +24,7 @@
     {
       "repo_id": "repo-c",
       "state": "ok",
+      "last_success_at": "2026-01-02T03:00:00Z",
       "warnings": ["lfs_not_replicated"]
     }
   ]

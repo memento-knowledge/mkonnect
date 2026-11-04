@@ -95,18 +95,18 @@ func (h *hookLog) begunIDs() []string {
 	return slices.Clone(h.begun)
 }
 
-// gatedGit is a thread-safe fake git whose clone blocks until released, so a test can hold a sync
+// gatedGit is a thread-safe fake git whose first-run fetch blocks until released, so a test can hold a sync
 // in flight.
 type gatedGit struct {
 	gate    chan struct{}
 	once    sync.Once
-	clones  atomic.Int32
+	fetches atomic.Int32
 	running atomic.Int32
 	maxRun  atomic.Int32
-	fail    []byte // when set, clone fails with this stderr
+	fail    []byte // when set, the fetch fails with this stderr
 
 	mu        sync.Mutex
-	cloneEnvs []string // each clone's environment, joined
+	fetchEnvs []string // each fetch's environment, joined
 }
 
 func newGatedGit() *gatedGit { return &gatedGit{gate: make(chan struct{})} }
@@ -118,17 +118,17 @@ func (g *gatedGit) release() { g.once.Do(func() { close(g.gate) }) }
 func (g *gatedGit) envs() []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return slices.Clone(g.cloneEnvs)
+	return slices.Clone(g.fetchEnvs)
 }
 
 func (g *gatedGit) run(ctx context.Context, argv, env []string, _ string) ([]byte, error) {
-	if (gitCall{argv: argv}).sub() != "clone" {
+	if (gitCall{argv: argv}).sub() != "fetch" {
 		return nil, nil
 	}
 	g.mu.Lock()
-	g.cloneEnvs = append(g.cloneEnvs, strings.Join(env, "\n"))
+	g.fetchEnvs = append(g.fetchEnvs, strings.Join(env, "\n"))
 	g.mu.Unlock()
-	g.clones.Add(1)
+	g.fetches.Add(1)
 	n := g.running.Add(1)
 	for {
 		m := g.maxRun.Load()
@@ -268,14 +268,14 @@ func TestManagerCoalescesConcurrentEnqueueForSameRepo(t *testing.T) {
 	m := newTestManager(t, 4, g, h)
 
 	m.enqueue(context.Background(), []string{"repo-a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 	m.enqueue(context.Background(), []string{"repo-a"})
 	m.enqueue(context.Background(), []string{"repo-a"})
 	m.enqueue(context.Background(), []string{"repo-a"})
 
 	time.Sleep(30 * time.Millisecond)
-	if n := g.clones.Load(); n != 1 {
-		t.Fatalf("clones while the first sync is in flight = %d, want 1", n)
+	if n := g.fetches.Load(); n != 1 {
+		t.Fatalf("fetches while the first sync is in flight = %d, want 1", n)
 	}
 	if max := g.maxRun.Load(); max != 1 {
 		t.Errorf("max concurrent syncs of one repo = %d, want 1", max)
@@ -283,8 +283,8 @@ func TestManagerCoalescesConcurrentEnqueueForSameRepo(t *testing.T) {
 
 	g.release()
 	eventually(t, func() bool { return m.idle() })
-	if n := g.clones.Load(); n != 2 {
-		t.Errorf("total clones = %d, want exactly 2 (the sync plus ONE trailing rerun for three triggers)", n)
+	if n := g.fetches.Load(); n != 2 {
+		t.Errorf("total fetches = %d, want exactly 2 (the sync plus ONE trailing rerun for three triggers)", n)
 	}
 	if got := len(h.results("repo-a")); got != 2 {
 		t.Errorf("recorded results = %d, want 2", got)
@@ -299,7 +299,7 @@ func TestManagerTrailingRerunUsesRefreshedMaterial(t *testing.T) {
 	m := newTestManager(t, 4, g, h)
 
 	m.enqueue(context.Background(), []string{"repo-a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 	h.setToken("repo-a", "token-after-refresh-xyz")
 	m.enqueue(context.Background(), []string{"repo-a"})
 
@@ -307,7 +307,7 @@ func TestManagerTrailingRerunUsesRefreshedMaterial(t *testing.T) {
 	eventually(t, func() bool { return m.idle() })
 	envs := g.envs()
 	if len(envs) != 2 {
-		t.Fatalf("clones = %d, want 2", len(envs))
+		t.Fatalf("fetches = %d, want 2", len(envs))
 	}
 	if !strings.Contains(envs[0], "token-before-refresh-abc") || strings.Contains(envs[0], "token-after-refresh-xyz") {
 		t.Error("the first sync must use the material it started with")
@@ -326,7 +326,7 @@ func TestManagerQueuedSyncUsesMaterialResolvedWhenItRuns(t *testing.T) {
 	m := newTestManager(t, 1, g, h)
 
 	m.enqueue(context.Background(), []string{"a"}) // "a" takes the only slot...
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 	m.enqueue(context.Background(), []string{"b"}) // ...so "b" is queued behind it
 	h.setToken("b", "token-when-it-runs-xyz1")
 
@@ -348,14 +348,14 @@ func TestManagerQueuedSyncThatBecomesUnsyncableIsNotRun(t *testing.T) {
 	m := newTestManager(t, 1, g, h)
 
 	m.enqueue(context.Background(), []string{"a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 	m.enqueue(context.Background(), []string{"b"}) // queued behind "a"
 	h.setSkip("b", true)                           // the platform removed it while it waited
 
 	g.release()
 	eventually(t, func() bool { return m.idle() })
-	if n := g.clones.Load(); n != 1 {
-		t.Errorf("clones = %d, want only \"a\": a repository withdrawn while queued must not be synced", n)
+	if n := g.fetches.Load(); n != 1 {
+		t.Errorf("fetches = %d, want only \"a\": a repository withdrawn while queued must not be synced", n)
 	}
 	if !slices.Contains(h.releasedIDs(), "b") {
 		t.Errorf("released = %v, want b's syncing mark cleared", h.releasedIDs())
@@ -369,15 +369,15 @@ func TestManagerSuspendedStopsQueuedWorkAndReruns(t *testing.T) {
 	m := newTestManager(t, 1, g, h)
 
 	m.enqueue(context.Background(), []string{"a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 	m.enqueue(context.Background(), []string{"b"}) // queued behind "a"
 	m.enqueue(context.Background(), []string{"a"}) // a trailing rerun of "a"
 	h.suspended.Store(true)
 
 	g.release()
 	eventually(t, func() bool { return m.idle() })
-	if n := g.clones.Load(); n != 1 {
-		t.Errorf("clones = %d, want 1: the queued repo and the rerun must not start while suspended", n)
+	if n := g.fetches.Load(); n != 1 {
+		t.Errorf("fetches = %d, want 1: the queued repo and the rerun must not start while suspended", n)
 	}
 	for _, id := range []string{"a", "b"} {
 		if !slices.Contains(h.releasedIDs(), id) && len(h.results(id)) == 0 {
@@ -417,8 +417,8 @@ func TestManagerSkipsRepoThatIsNoLongerSyncable(t *testing.T) {
 
 	m.enqueue(context.Background(), []string{"gone"})
 	time.Sleep(20 * time.Millisecond)
-	if g.clones.Load() != 0 || len(h.begunIDs()) != 0 || !m.idle() {
-		t.Errorf("a repo that is not syncable must not start: clones=%d begun=%v", g.clones.Load(), h.begunIDs())
+	if g.fetches.Load() != 0 || len(h.begunIDs()) != 0 || !m.idle() {
+		t.Errorf("a repo that is not syncable must not start: fetches=%d begun=%v", g.fetches.Load(), h.begunIDs())
 	}
 }
 
@@ -439,7 +439,7 @@ func TestManagerDrainWaitsThenReturnsAtItsBound(t *testing.T) {
 	g, h := newGatedGit(), newHookLog()
 	m := newTestManager(t, 2, g, h)
 	m.enqueue(context.Background(), []string{"repo-a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 
 	dctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
@@ -463,7 +463,7 @@ func TestManagerDrainReturnsPromptlyWhenSyncsFinish(t *testing.T) {
 	g, h := newGatedGit(), newHookLog()
 	m := newTestManager(t, 2, g, h)
 	m.enqueue(context.Background(), []string{"repo-a"})
-	eventually(t, func() bool { return g.clones.Load() == 1 })
+	eventually(t, func() bool { return g.fetches.Load() == 1 })
 
 	go func() { time.Sleep(30 * time.Millisecond); g.release() }()
 	dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -499,7 +499,7 @@ func TestManagerCancelledContextLeavesReposPending(t *testing.T) {
 			t.Errorf("%s was left marked syncing after cancellation", id)
 		}
 	}
-	if g.clones.Load() != 1 {
-		t.Errorf("clones = %d, want only the one that held the slot", g.clones.Load())
+	if g.fetches.Load() != 1 {
+		t.Errorf("fetches = %d, want only the one that held the slot", g.fetches.Load())
 	}
 }

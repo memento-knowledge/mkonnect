@@ -47,9 +47,11 @@ func TestClassifyGitFailure(t *testing.T) {
 		{"replica refused", replicaSide, exit, "fatal: unable to access 'https://replica.example.com/r/': Failed to connect to replica.example.com port 443: Connection refused", false, ErrReplicaUnreachable},
 		{"replica tls", replicaSide, exit, "fatal: unable to access 'https://replica.example.com/r/': SSL certificate problem: self signed certificate", false, ErrReplicaUnreachable},
 		{"replica 503", replicaSide, exit, "fatal: unable to access 'https://replica.example.com/r/': The requested URL returned error: 503", false, ErrReplicaUnreachable},
-		{"replica size limit", replicaSide, exit, "remote: error: repository size limit exceeded\nTo https://replica.example.com/r.git\n ! [remote rejected] main -> main (pre-receive hook declined)", false, ErrRepositoryOverLimit},
-		{"replica pack too large", replicaSide, exit, "error: remote unpack failed: pack exceeds maximum allowed size", false, ErrRepositoryOverLimit},
-		{"replica 413", replicaSide, exit, "fatal: unable to access 'https://replica.example.com/r/': The requested URL returned error: 413", false, ErrRepositoryOverLimit},
+		{"replica size limit", replicaSide, exit, "remote: error: repository size limit exceeded\nTo https://replica.example.com/r.git\n ! [remote rejected] main -> main (pre-receive hook declined)", false, ErrReplicaRejected},
+		{"replica pack too large", replicaSide, exit, "error: remote unpack failed: pack exceeds maximum allowed size", false, ErrReplicaRejected},
+		{"replica 413", replicaSide, exit, "fatal: unable to access 'https://replica.example.com/r/': The requested URL returned error: 413", false, ErrReplicaRejected},
+		{"replica quota", replicaSide, exit, "remote: error: storage quota exceeded for this repository", false, ErrReplicaRejected},
+		{"replica payload too large", replicaSide, exit, "error: RPC failed; HTTP 413 curl 22 The requested URL returned error: 413", false, ErrReplicaRejected},
 		{"replica hook declined", replicaSide, exit, "To https://replica.example.com/r.git\n ! [remote rejected] main -> main (pre-receive hook declined)", false, ErrReplicaRejected},
 		{"replica deadline is push timeout", replicaSide, timedOut, "", false, ErrPushTimeout},
 
@@ -60,6 +62,20 @@ func TestClassifyGitFailure(t *testing.T) {
 		{"replica-side disk full is not local", replicaSide, exit, "remote: fatal: write error: No space left on device\n ! [remote rejected] main -> main (unpacker error)", false, ErrReplicaRejected},
 		{"out of memory", originSide, exit, "fatal: Out of memory, malloc failed (tried to allocate 1073741824 bytes)", false, ErrJobOutOfMemory},
 		{"killed with no deadline is oom", replicaSide, errors.New("signal: killed"), "", false, ErrJobOutOfMemory},
+		// A child git process the kernel killed (git prints "<cmd> died of signal 9" and exits 128).
+		{"index-pack killed by signal 9", originSide, exit, "error: index-pack died of signal 9", false, ErrJobOutOfMemory},
+		{"pack-objects killed by signal 9", replicaSide, exit, "error: pack-objects died of signal 9\nfatal: the remote end hung up unexpectedly", false, ErrJobOutOfMemory},
+		{"git-remote-https killed by signal 9", replicaSide, exit, "error: git-remote-https died of signal 9", false, ErrJobOutOfMemory},
+		// Only signal 9 is the OOM killer: other signals, and numbers merely starting with 9, are not.
+		{"index-pack killed by signal 15 is not oom", originSide, exit, "error: index-pack died of signal 15", false, ErrUnclassified},
+		{"signal 90 is not oom", originSide, exit, "error: index-pack died of signal 90", false, ErrUnclassified},
+		// A "remote:" line is the far end speaking: its child dying is not our memory.
+		{"remote side signal 9 is not local oom", replicaSide, exit, "remote: error: index-pack died of signal 9\n ! [remote rejected] main -> main (unpacker error)", false, ErrReplicaRejected},
+		// Server-supplied text that is not on a "remote:" line (a rejected-ref reason, a relayed error)
+		// can name a dying child too; only git's own "<cmd> died of signal 9" line counts.
+		{"signal 9 in a rejected-ref reason is not local oom", replicaSide, exit, " ! [remote rejected] main -> main (index-pack died of signal 9)", false, ErrReplicaRejected},
+		{"signal 9 in a relayed unpack error is not local oom", replicaSide, exit, "error: remote unpack failed: index-pack died of signal 9\n ! [remote rejected] main -> main (unpacker error)", false, ErrReplicaRejected},
+		{"signal 9 in a server error is not local oom", originSide, exit, "fatal: remote error: index-pack died of signal 9", false, ErrUnclassified},
 
 		{"unrecognized origin", originSide, exit, "fatal: something unexpected went wrong", false, ErrUnclassified},
 		{"unrecognized replica", replicaSide, exit, "fatal: something unexpected went wrong", false, ErrUnclassified},
@@ -103,8 +119,22 @@ func TestClassifyGitFailureIgnoresRefNames(t *testing.T) {
 
 	// The reason in a rejected line still counts: it is git's explanation, not a ref name.
 	quota := " ! [remote rejected] main -> main (repository size limit exceeded)\n"
-	if got, _ := classifyGitFailure(replicaSide, exit, []byte(quota), false); got != ErrRepositoryOverLimit {
-		t.Errorf("a size-limit reason = %q, want repository_over_limit", got)
+	if got, _ := classifyGitFailure(replicaSide, exit, []byte(quota), false); got != ErrReplicaRejected {
+		t.Errorf("a size-limit reason = %q, want replica_rejected", got)
+	}
+}
+
+// A ref name must not steer the OOM classification either. Ref names cannot contain spaces, so this
+// is a cheap guard on the scrubbing; the realistic route for server text is a rejected-ref reason,
+// which TestClassifyGitFailure covers.
+func TestClassifyGitFailureIgnoresSignalNamedRefs(t *testing.T) {
+	exit := errors.New("exit status 128")
+	fetch := "From https://git.example.com/group/repo-a\n" +
+		" * [new branch]      index-pack-died-of-signal-9 -> index-pack-died-of-signal-9\n" +
+		" ! [rejected]        died-of-signal-9 -> died-of-signal-9 (non-fast-forward)\n" +
+		"fatal: something unexpected went wrong\n"
+	if got, _ := classifyGitFailure(originSide, exit, []byte(fetch), false); got != ErrUnclassified {
+		t.Errorf("an unknown failure beside signal-named refs = %q, want unclassified", got)
 	}
 }
 

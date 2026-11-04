@@ -93,7 +93,7 @@ func TestCredConfigScopesHeaderToURL(t *testing.T) {
 func TestCredConfigNeverInArgv(t *testing.T) {
 	const token = "secret-token-abcdefghij"
 	remote := "https://git.example.com/repo-a"
-	argv := []string{"git", "clone", "--mirror", "--", remote, "/var/mirrors/abc.git"}
+	argv := []string{"git", "--git-dir=/var/mirrors/abc.git", "fetch", "--prune", "--force", "--", remote, "+refs/heads/*:refs/heads/*"}
 	env := gitConfigEnv(gitBaseEnv("/tmp/h"), credConfig(remote, "bearer", "", Secret(token)))
 
 	for _, a := range argv {

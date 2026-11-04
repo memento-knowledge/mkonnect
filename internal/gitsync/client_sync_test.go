@@ -21,10 +21,11 @@ const (
 	originToken       = "origin-token-abcdefghij"
 )
 
-// scriptedGit is a thread-safe fake git for client tests. A non-nil gate holds every clone until
-// released; fail makes a subcommand exit non-zero with the given stderr. A test that sets a gate
-// registers t.Cleanup(g.release) right after building its client, so a test that fails early does not
-// leave a sync blocked: that cleanup then runs before the client's, which waits for syncs to stop.
+// scriptedGit is a thread-safe fake git for client tests. A non-nil gate holds every fetch until
+// released (tests release it before a second sync); fail makes a subcommand exit non-zero with the
+// given stderr. A test that sets a gate registers t.Cleanup(g.release) right after building its
+// client, so a test that fails early does not leave a sync blocked: that cleanup then runs before the
+// client's, which waits for syncs to stop.
 type scriptedGit struct {
 	mu    sync.Mutex
 	argvs [][]string
@@ -40,7 +41,7 @@ func (g *scriptedGit) release() { g.once.Do(func() { close(g.gate) }) }
 func subOf(argv []string) string {
 	for _, a := range argv {
 		switch a {
-		case "clone", "fetch", "push":
+		case "init", "fetch", "push":
 			return a
 		}
 	}
@@ -54,7 +55,7 @@ func (g *scriptedGit) run(ctx context.Context, argv, env []string, _ string) ([]
 	gate, stderr := g.gate, g.fail[subOf(argv)]
 	g.mu.Unlock()
 
-	if gate != nil && subOf(argv) == "clone" {
+	if gate != nil && subOf(argv) == "fetch" {
 		select {
 		case <-gate:
 		case <-ctx.Done():
@@ -64,8 +65,8 @@ func (g *scriptedGit) run(ctx context.Context, argv, env []string, _ string) ([]
 	if stderr != nil {
 		return stderr, errors.New("exit status 128")
 	}
-	if subOf(argv) == "clone" {
-		// A real clone creates the mirror, which is what makes the next sync a fetch.
+	if subOf(argv) == "init" {
+		// A real init creates the mirror, which is what makes the next sync a plain fetch.
 		if err := os.MkdirAll(argv[len(argv)-1], 0o700); err != nil {
 			return nil, err
 		}
@@ -128,10 +129,10 @@ func TestConfigStartsSyncAndStatusReflectsResult(t *testing.T) {
 		t.Fatalf("state right after config = %q, want syncing", got)
 	}
 
-	waitFor(t, func() bool { return g.count("clone") == 1 })
-	argv, env := g.call(t, "clone")
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
+	argv, env := g.call(t, "fetch")
 	if !contains(argv, "https://git.example.com:443/team/a.git") {
-		t.Errorf("clone argv %v must dial the validated canonical URL", argv)
+		t.Errorf("fetch argv %v must dial the validated canonical URL", argv)
 	}
 	if !contains(env, "Authorization: Bearer "+originToken) || !contains(env, "http.https://git.example.com:443/team/a.git/.extraHeader") {
 		t.Error("the matched provider's credential must be injected, scoped to the repository URL")
@@ -145,7 +146,10 @@ func TestConfigStartsSyncAndStatusReflectsResult(t *testing.T) {
 		t.Error("the push must carry the push token only, never the origin credential")
 	}
 	if contains(env, testPushToken) {
-		t.Error("the clone must never carry the push token")
+		t.Error("the fetch must never carry the push token")
+	}
+	if _, initEnv := g.call(t, "init"); contains(initEnv, originToken) || contains(initEnv, testPushToken) {
+		t.Error("git init talks to no remote and must carry no credential")
 	}
 }
 
@@ -184,7 +188,7 @@ func TestSyncNowRunsAnotherSync(t *testing.T) {
 	waitFor(t, func() bool { return g.count("push") == pushes+1 })
 	waitFor(t, func() bool { return repoStatusNow(t, s, "repo-a").State == gitsync.StateOK })
 	if g.count("fetch") == 0 {
-		t.Error("a second sync of a repository with a mirror must fetch, not clone again")
+		t.Error("a second sync of a repository with a mirror must fetch, not init again")
 	}
 }
 
@@ -209,7 +213,7 @@ func TestCriticalPatchSuppressesSyncs(t *testing.T) {
 
 func TestSyncFailureIsReportedAsTypedError(t *testing.T) {
 	g := &scriptedGit{fail: map[string][]byte{
-		"clone": []byte("fatal: unable to access 'https://git.example.com/team/a.git/': The requested URL returned error: 403"),
+		"fetch": []byte("fatal: unable to access 'https://git.example.com/team/a.git/': The requested URL returned error: 403"),
 	}}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
 	s := &stubSender{}
@@ -239,7 +243,7 @@ func TestOnDrainingWaitsBrieflyForInFlightSync(t *testing.T) {
 	ctx := context.Background()
 	c.OnConnected(ctx, s)
 	c.HandleMessage(ctx, s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))
-	waitFor(t, func() bool { return g.count("clone") == 1 })
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
 
 	start := time.Now()
 	c.OnDraining(ctx)
@@ -341,7 +345,7 @@ func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
 
 	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config",
 		configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))
-	waitFor(t, func() bool { return g.count("clone") == 1 })
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
 
 	before := len(conn.messages())
 	closeConn()
@@ -367,18 +371,18 @@ func TestSyncAndItsRerunSurviveLosingTheConnection(t *testing.T) {
 
 	cfg := configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""})
 	c.HandleMessage(process, s, "git_sync_config", cfg)
-	waitFor(t, func() bool { return g.count("clone") == 1 })
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
 
 	loseConnection() // the gateway drains; the connection (and only it) is gone
 	c.HandleMessage(process, &stubSender{}, "git_sync_now", rawJSON(`{"type":"git_sync_now","repo_id":"repo-a"}`))
 
 	g.release()
 	waitFor(t, func() bool { return g.count("push") == 2 }) // the sync, then its one trailing rerun
-	if got := g.count("clone"); got != 1 {
-		t.Errorf("clones = %d, want 1: the in-flight sync must not have been cancelled and restarted", got)
+	if got := g.count("init"); got != 1 {
+		t.Errorf("inits = %d, want 1: the in-flight sync must not have been cancelled and restarted", got)
 	}
-	if got := g.count("fetch"); got != 1 {
-		t.Errorf("fetches = %d, want 1 (the trailing rerun reuses the mirror)", got)
+	if got := g.count("fetch"); got != 2 {
+		t.Errorf("fetches = %d, want 2 (the sync, then the trailing rerun on the existing mirror)", got)
 	}
 }
 
@@ -387,7 +391,7 @@ func TestMirrorsRootIsMadeAbsolute(t *testing.T) {
 		gitsync.WithMirrorsRoot("relative/mirrors"))
 	root := c.MirrorsRootForTest()
 	if !filepath.IsAbs(root) || !strings.HasSuffix(root, filepath.Join("relative", "mirrors")) {
-		t.Errorf("mirrors root = %q, want an absolute path: git runs in a temp dir, so a relative root would clone into it and lose the mirror", root)
+		t.Errorf("mirrors root = %q, want an absolute path: git runs in a temp dir, so a relative root would create the mirror in it and lose it", root)
 	}
 }
 
@@ -400,7 +404,7 @@ func TestWaitReturnsOnceCancelledSyncsHaveStopped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.HandleMessage(ctx, &stubSender{}, "git_sync_config",
 		configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))
-	waitFor(t, func() bool { return g.count("clone") == 1 })
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
 	cancel()
 
 	wctx, wcancel := context.WithTimeout(context.Background(), 3*time.Second)

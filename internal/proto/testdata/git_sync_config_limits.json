@@ -1,0 +1,24 @@
+{
+  "type": "git_sync_config",
+  "config_version": "2026-01-02.1",
+  "repositories": [
+    {
+      "repo_id": "repo-a",
+      "origin_url": "https://git.example.com/team/repo-a.git",
+      "replica_push_url": "https://replica.example.com/mirror/repo-a.git",
+      "push_token": "synthetic-push-token-aaaa1111",
+      "push_token_expires_at": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "schedule": {
+    "interval_seconds": 900
+  },
+  "limits": {
+    "max_concurrency": 2,
+    "push_batch_refs": 5000,
+    "pack_threads": 0,
+    "pack_window_memory_mb": 256,
+    "max_repository_mb": 20480,
+    "push_timeout_seconds": 1800
+  }
+}
