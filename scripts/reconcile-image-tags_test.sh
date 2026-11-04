@@ -361,13 +361,13 @@ log_lacks '^(build|push|buildx) '
 grep -Fq "sha256:dddd" "$case_dir/stderr"
 grep -Fq "sha256:eeee" "$case_dir/stderr"
 
-# 12. A registry error other than "not found" stops the run before anything is built or pushed.
+# 11. A registry error other than "not found" stops the run before anything is built or pushed.
 new_case registry-denied
 FAKE_AWS_DENY=1 expect_failure
 log_lacks '^(build|push|buildx|pull) '
 unset FAKE_AWS_DENY
 
-# 13. Usage errors and a missing Dockerfile are rejected.
+# 12. Usage errors and a missing Dockerfile are rejected.
 if bash "$reconcile" --repository "$repository" 2>/dev/null; then
   printf 'incomplete arguments unexpectedly accepted\n' >&2
   exit 1

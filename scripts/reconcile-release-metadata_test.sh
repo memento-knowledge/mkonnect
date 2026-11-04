@@ -70,10 +70,13 @@ expect keep with-git-sync with-git-sync true
 expect keep without-git-sync without-git-sync true
 expect keep with-git-sync with-git-sync false
 
-# A draft may change only the git-sync fields, in either direction.
+# A draft may change the git-sync fields from null to a digest and back.
 expect replace without-git-sync with-git-sync true
 expect replace with-git-sync without-git-sync true
-expect replace with-git-sync with-other-git-sync true
+
+# ...but only between null and a digest: one published digest never becomes another.
+expect_conflict with-git-sync with-other-git-sync true "from one image digest to another"
+expect_conflict with-other-git-sync with-git-sync true "from one image digest to another"
 
 # A published release is never changed.
 expect_conflict without-git-sync with-git-sync false "published"

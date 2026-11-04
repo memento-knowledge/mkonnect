@@ -147,6 +147,9 @@ jobs:
           path: dist
           if-no-files-found: error
           retention-days: 7
+          # "Re-run all jobs" creates a new attempt of the same run, whose verify job uploads
+          # the same artifact name again; without this the upload fails on the earlier one.
+          overwrite: true
 
   # The git-sync image is published on a best-effort basis. A failure here (including a failed
   # build) must never block the connector image, the chart, or the GitHub Release, so the job is
@@ -414,10 +417,17 @@ jobs:
             # Prints "keep" or "replace", or fails on a conflict (see the script for the rules).
             action=$(bash scripts/reconcile-release-metadata.sh \
               --existing "$work/existing/$asset" --generated "$work/generated/$asset" --draft "$is_draft")
-            if [ "$action" = replace ]; then
-              echo "replacing $asset on draft release $RELEASE_TAG: only the git-sync fields differ"
-              gh release upload "$RELEASE_TAG" "$work/generated/$asset" --clobber
-            fi
+            case "$action" in
+              keep) ;;
+              replace)
+                echo "replacing $asset on draft release $RELEASE_TAG: only the git-sync fields differ"
+                gh release upload "$RELEASE_TAG" "$work/generated/$asset" --clobber
+                ;;
+              *)
+                echo "unexpected release metadata action: $action" >&2
+                exit 1
+                ;;
+            esac
           else
             gh release upload "$RELEASE_TAG" "$work/generated/$asset"
           fi

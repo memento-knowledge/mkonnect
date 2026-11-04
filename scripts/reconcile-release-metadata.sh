@@ -5,11 +5,13 @@
 # Prints one word on stdout:
 #   keep     the existing asset is byte-identical to the regenerated file; leave it alone.
 #   replace  the release is still a draft and the files differ only in the git-sync fields
-#            (git_sync_release_id, git_sync_image_digest); the caller may replace the asset.
-#            A draft has no consumers, and this keeps a full "re-run all jobs" after a failed
-#            git-sync build from wedging the release.
+#            (git_sync_release_id, git_sync_image_digest), and only between null (not
+#            published) and a digest; the caller may replace the asset. A draft has no
+#            consumers, and this keeps a re-run after a failed git-sync job from wedging the
+#            release.
 # Exits 1 (printing the reason to stderr) for anything else: a published release is never
-# changed, and a difference in release_id, chart_version or connector_image_digest is a conflict.
+# changed, a difference in release_id, chart_version or connector_image_digest is a conflict,
+# and so is a change from one git-sync digest to a different one.
 
 set -euo pipefail
 
@@ -71,5 +73,13 @@ for field in schema_version release_id chart_version connector_image_digest; do
   [[ $(jq -c --arg f "$field" '.[$f]' "$existing") == "$(jq -c --arg f "$field" '.[$f]' "$generated")" ]] ||
     fail "$field differs between the existing asset and the regenerated file"
 done
+
+# ...and only between "not published" (null) and "published" (a digest). Both git-sync fields
+# change together (the validator requires them to be both null or both set). Changing one
+# published digest into another would mean a release tag was overwritten, which never happens.
+existing_has_git_sync=$(jq -r '.git_sync_image_digest != null' "$existing")
+generated_has_git_sync=$(jq -r '.git_sync_image_digest != null' "$generated")
+[[ $existing_has_git_sync != "$generated_has_git_sync" ]] ||
+  fail "git_sync_image_digest changes from one image digest to another, which means a release tag changed"
 
 printf 'replace\n'

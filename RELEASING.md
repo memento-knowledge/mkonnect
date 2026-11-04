@@ -49,16 +49,17 @@ The workflows use Helm `v3.18.6` for chart linting, packaging, and publication. 
 
 ## Non-blocking git-sync image
 
-The Release workflow builds and publishes the git-sync image in its own job, `publish-gitsync`. The job is marked `continue-on-error` and has a 30-minute timeout. The `publish` job (connector image, chart, and GitHub Release) waits for the git-sync job to finish, so a hung git-sync job delays it by at most that 30-minute timeout. It then runs whether the git-sync job succeeded, failed, or was skipped; it does not run if the workflow was cancelled or verification failed.
+The Release workflow builds and publishes the git-sync image in its own job, `publish-gitsync`. The job is marked `continue-on-error` and has a 30-minute timeout. The `publish` job (connector image, chart, and GitHub Release) waits for the git-sync job to finish, so a hung git-sync job delays it by at most that 30-minute timeout. It then runs whether the git-sync job succeeded or failed; it does not run if the workflow was cancelled or verification failed.
 
 Whether the git-sync image counts as published is decided by the digest the git-sync job exports, not by the job's result (with job-level `continue-on-error` the result can read `success` for a failed job). The publish job accepts the image only when the exported image is the expected `memento-gitsync` repository and the digest is a well-formed `sha256:` digest. Otherwise it records the image as not published.
 
 - The guarantee is that no git-sync tag is pushed for a build that failed: the reconcile script pushes tags only after a successful build. The workflow shows a warning annotation instead of a failed run.
-- Two edges remain, and neither affects the connector release. The release-ID tag is pushed first, so if the `sha-` tag push fails after it, the release-ID tag stays in the registry; a re-run completes the release from it. If both pushes succeed but the job then fails (for example the final digest lookup fails or the timeout hits), the metadata records the git-sync image as not published while a tag exists. Installers key off `release-metadata.json`, so the stray tag is unused.
+- Two edges remain, and neither affects the connector release. The release-ID tag is pushed first, so if the `sha-` tag push fails after it, the release-ID tag stays in the registry. While the GitHub Release is still a draft, a re-run completes the partial git-sync release from that tag. After the release is published, do not re-run the workflow: the stray release-ID tag stays, and the next release publishes git-sync again. If both pushes succeed but the job then fails (for example the final digest lookup fails or the timeout hits), the metadata records the git-sync image as not published while a tag exists. Installers key off `release-metadata.json`, so the stray tag is unused.
 - The connector image, the Helm chart, and the GitHub Release are published as usual. The release notes state that the git-sync image was not published, and the git-sync fields in `release-metadata.json` are `null`.
 - Both images use the same reconcile rules: an existing tag is accepted only when its version and revision labels match the release and its digest agrees with the other tag. The logic lives in `scripts/reconcile-image-tags.sh` and is tested by `scripts/reconcile-image-tags_test.sh`.
 - A published GitHub Release cannot be re-run. A release published without a git-sync image stays that way; the next release publishes it again. Do not create git-sync tags by hand.
-- Before the GitHub Release is published (while it is still a draft), either "Re-run failed jobs" or "Re-run all jobs" is safe; see [Release metadata](#release-metadata).
+- Re-running is only for a release that is still a draft. Use "Re-run failed jobs" by default. "Re-run all jobs" is also accepted, but it re-runs the git-sync job too: if that job hits a transient error on the re-run, the regenerated metadata has `null` git-sync fields, and on a draft that replaces metadata which had recorded a published git-sync image (the image tags stay in the registry). See [Release metadata](#release-metadata).
+- Do not publish the draft GitHub Release by hand while a workflow run is in progress: the workflow checks that the release is still a draft before it changes anything, and a manual publish between that check and its next step is not detected.
 
 Image signing and provenance attestation are documented separately once available.
 
@@ -75,17 +76,17 @@ Every GitHub Release has a `release-metadata.json` asset describing what was pub
 | `connector_image_digest` | `sha256:` digest of the API connector image. Always present. |
 | `git_sync_image_digest` | `sha256:` digest of the git-sync image, or `null` when no git-sync image was published. |
 
-`null` means the git-sync image was not published for that release (its build failed or was skipped). The two git-sync fields are always either both `null` or both set; every other field is always set. Consumers must treat `null` as "no git-sync image for this release" and not as an error.
+`null` means the git-sync image was not published for that release (its build or push failed). The two git-sync fields are always either both `null` or both set; every other field is always set. Consumers must treat `null` as "no git-sync image for this release" and not as an error.
 
 `scripts/release-metadata-json.sh` is the only script that knows this layout, and `scripts/validate-release-metadata.sh` checks files against it. The workflow validates the generated file before uploading it and validates the uploaded asset again before publishing the release. The verify job also renders and validates the file with the real release ID and chart version (and placeholder digests) before anything is pushed, so a chart version the validator rejects fails the run early.
 
 If a release already has `release-metadata.json`, the workflow regenerates it and compares (`scripts/reconcile-release-metadata.sh`):
 
 - Identical: the asset is left alone.
-- The release is still a draft and only `git_sync_release_id` and `git_sync_image_digest` differ: the asset is replaced. A draft has no consumers, and this keeps a re-run after a failed or recovered git-sync job from blocking the release.
-- `release_id`, `chart_version`, or `connector_image_digest` differs, or the release is already published: the run fails and nothing is changed. A published release's asset is never replaced.
+- The release is still a draft and the git-sync fields change between `null` and a digest (both fields change together, in either direction): the asset is replaced. A draft has no consumers, and this keeps a re-run after a failed or recovered git-sync job from blocking the release.
+- Anything else fails and nothing is changed: `release_id`, `chart_version`, or `connector_image_digest` differs; the git-sync digest changes from one value to a different one (a release tag would have changed, which never happens); or the release is already published. A published release's asset is never replaced.
 
-So after a failed run on an unpublished release, "Re-run failed jobs" and "Re-run all jobs" both work. After the release is published, do not re-run the workflow.
+Re-running a workflow for an unpublished release is designed to be safe. The verify job uploads its artifact with `overwrite: true`, so a new attempt of the same run can upload it again. The chart package is compared by content against the asset already on the draft release (see `scripts/release-asset-bundle_test.sh`), so a repackaged chart does not conflict. Use "Re-run failed jobs" by default. After the release is published, do not re-run the workflow.
 
 To check a published release:
 
@@ -165,7 +166,7 @@ gh release download "$release_id" --repo memento-knowledge/mkonnect \
 
 ## Update the git-sync base image
 
-`Dockerfile.gitsync` pins its Alpine base layer by digest, so an upstream tag move cannot change the base of a release. The image as a whole is not bit-for-bit reproducible, because the packages added on top are resolved at build time. The consequence of the pin is that Alpine security updates do not arrive on their own. Maintainers must refresh the pin on a regular schedule (for example monthly) and promptly after a security advisory that affects Alpine, `musl`, `git`, `curl`, or OpenSSL packages. The packages installed on top of the base (`git`, `ca-certificates`) are resolved from Alpine's package index at build time, so a rebuild also picks up their patched versions; the build fails if `git` is older than 2.31.
+`Dockerfile.gitsync` pins its Alpine base layer by digest, so an upstream tag move cannot change the base of a release. The packages added on top (`git`, `ca-certificates`) are resolved from Alpine's package index at build time, so the image as a whole is not bit-for-bit reproducible, and a rebuild also picks up their patched versions; the build fails if `git` is older than 2.31. The consequence of the pin is that updates to the base layer itself do not arrive on their own. Maintainers must refresh the pin on a regular schedule (for example monthly) and promptly after a security advisory that affects Alpine, `musl`, `git`, `curl`, or OpenSSL packages.
 
 1. Find the current stable Alpine release and the digest of its multi-platform index:
 
