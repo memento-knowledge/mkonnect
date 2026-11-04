@@ -33,7 +33,7 @@ type gitCall struct {
 func (c gitCall) sub() string {
 	for _, a := range c.argv {
 		switch a {
-		case "clone", "fetch", "push", "show-ref":
+		case "init", "fetch", "push", "show-ref":
 			return a
 		}
 	}
@@ -102,7 +102,35 @@ func testTask() syncTask {
 
 var errExit = errors.New("exit status 128")
 
-func TestSyncRepoCloneThenPushHappyPath(t *testing.T) {
+// wantFetchRefspecs are the only refs the mirror is fetched with: the namespaces that are pushed.
+var wantFetchRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
+
+// assertMirrorFetch checks a fetch call dials exactly the canonical origin URL, with the mirror as its
+// --git-dir, bounded to branches and tags, and with the origin credential scoped to that URL.
+func assertMirrorFetch(t *testing.T, fetch gitCall, mirrorDir string) {
+	t.Helper()
+	for _, want := range []string{"--git-dir=" + mirrorDir, "--prune", "--force"} {
+		if !slices.Contains(fetch.argv, want) {
+			t.Errorf("fetch argv = %v, want %q", fetch.argv, want)
+		}
+	}
+	// "--" ends option parsing, then the canonical URL, then exactly the two refspecs.
+	i := slices.Index(fetch.argv, "--")
+	if i < 0 || !slices.Equal(fetch.argv[i+1:], append([]string{testOriginURL}, wantFetchRefspecs...)) {
+		t.Errorf("fetch argv = %v, want `-- <canonical origin URL> %v` at the end", fetch.argv, wantFetchRefspecs)
+	}
+	if slices.Contains(fetch.argv, "+refs/*:refs/*") {
+		t.Errorf("fetch argv = %v: the mirror must not fetch every namespace", fetch.argv)
+	}
+	if !fetch.envHas("http."+testOriginURL+"/.extraHeader") || !fetch.envHas("Bearer "+testOriginTok) {
+		t.Error("fetch must carry the origin credential scoped to the origin URL")
+	}
+	if fetch.envHas(testPushTok) {
+		t.Error("the push token must never reach the origin fetch")
+	}
+}
+
+func TestSyncRepoInitsMirrorThenFetchesThenPushes(t *testing.T) {
 	f := &fakeGit{}
 	d := newTestDeps(t, f)
 	got := syncRepo(context.Background(), d, testTask())
@@ -110,25 +138,31 @@ func TestSyncRepoCloneThenPushHappyPath(t *testing.T) {
 	if got.State != StateOK || got.ErrorType != "" {
 		t.Fatalf("result = %+v, want ok", got)
 	}
-	if want := []string{"clone", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
+	if want := []string{"init", "fetch", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Fatalf("git sequence = %v, want %v", f.subs(), want)
 	}
 
-	clone, push := f.calls[0], f.calls[2]
-	if !slices.Contains(clone.argv, "--mirror") || !slices.Contains(clone.argv, testOriginURL) || !slices.Contains(clone.argv, d.mirrors.Dir("repo-a")) {
-		t.Errorf("clone argv = %v, want --mirror <canonical origin URL> <mirror dir>", clone.argv)
+	initCall, fetch, push := f.calls[0], f.calls[1], f.calls[3]
+	dir := d.mirrors.Dir("repo-a")
+	// The initial branch is explicit so the result does not depend on the git version or on
+	// init.defaultBranch, and the init never touches the network or carries a credential.
+	for _, want := range []string{"--bare", "--initial-branch=main"} {
+		if !slices.Contains(initCall.argv, want) {
+			t.Errorf("init argv = %v, want %q", initCall.argv, want)
+		}
 	}
+	if n := len(initCall.argv); n < 2 || initCall.argv[n-2] != "--" || initCall.argv[n-1] != dir {
+		t.Errorf("init argv = %v, want it to end `-- <mirror dir>`", initCall.argv)
+	}
+	if initCall.envHas(testOriginTok) || initCall.envHas(testPushTok) || initCall.envHas("extraHeader") {
+		t.Error("git init talks to no remote and must carry no credential")
+	}
+	assertMirrorFetch(t, fetch, dir)
+
 	if !slices.Contains(push.argv, testReplicaURL) || !slices.Contains(push.argv, "--prune") {
 		t.Errorf("push argv = %v, want --prune and the replica URL", push.argv)
 	}
-
 	// Each credential is scoped to its own URL and appears only on its own invocation.
-	if !clone.envHas("http."+testOriginURL+"/.extraHeader") || !clone.envHas("Bearer "+testOriginTok) {
-		t.Error("clone must carry the origin credential scoped to the origin URL")
-	}
-	if clone.envHas(testPushTok) {
-		t.Error("the push token must never reach the origin clone")
-	}
 	if !push.envHas("http."+testReplicaURL+"/.extraHeader") || !push.envHas("Bearer "+testPushTok) {
 		t.Error("push must carry the push token scoped to the replica URL")
 	}
@@ -215,9 +249,61 @@ func TestSyncRepoFetchesWhenMirrorExists(t *testing.T) {
 	if want := []string{"fetch", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Fatalf("git sequence = %v, want %v", f.subs(), want)
 	}
-	fetch := f.calls[0]
-	if !slices.Contains(fetch.argv, "--prune") || !slices.Contains(fetch.argv, testOriginURL) || !slices.Contains(fetch.argv, "--git-dir="+d.mirrors.Dir("repo-a")) {
-		t.Errorf("fetch argv = %v, want --prune, the canonical origin URL and the mirror's --git-dir", fetch.argv)
+	assertMirrorFetch(t, f.calls[0], d.mirrors.Dir("repo-a"))
+}
+
+// A failed first fetch leaves an initialised but empty repository. It must not survive to be mistaken
+// for a healthy mirror, so it is removed and the next attempt starts from init again.
+func TestSyncRepoFailedFirstFetchRemovesTheInitialisedMirror(t *testing.T) {
+	d := newTestDeps(t, nil)
+	dir := d.mirrors.Dir("repo-a")
+	f := &fakeGit{script: func(c gitCall) ([]byte, error) {
+		switch c.sub() {
+		case "init":
+			return nil, os.MkdirAll(dir, 0o700) // what a real git init leaves behind
+		case "fetch":
+			return []byte("fatal: unable to access 'https://git.example.com/group/repo-a/': Could not resolve host: git.example.com"), errExit
+		}
+		return nil, nil
+	}}
+	d.run = f.run
+
+	got := syncRepo(context.Background(), d, testTask())
+	if got.State != StateError || got.ErrorType != ErrOriginUnreachable {
+		t.Fatalf("result = %+v, want error/origin_unreachable", got)
+	}
+	if want := []string{"init", "fetch"}; !slices.Equal(f.subs(), want) {
+		t.Errorf("git sequence = %v, want %v", f.subs(), want)
+	}
+	if d.mirrors.Exists("repo-a") {
+		t.Error("an initialised mirror whose first fetch failed must be removed")
+	}
+}
+
+func TestSyncRepoInitFailureIsClassifiedAndStops(t *testing.T) {
+	d := newTestDeps(t, nil)
+	dir := d.mirrors.Dir("repo-a")
+	f := &fakeGit{script: func(c gitCall) ([]byte, error) {
+		if c.sub() == "init" {
+			// A real init that runs out of disk part-way leaves the directory behind.
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, err
+			}
+			return []byte("fatal: cannot mkdir /var/mirrors/abc.git/objects: No space left on device"), errExit
+		}
+		return nil, nil
+	}}
+	d.run = f.run
+	got := syncRepo(context.Background(), d, testTask())
+
+	if got.State != StateError || got.ErrorType != ErrLocalDiskExhausted {
+		t.Fatalf("result = %+v, want error/local_disk_exhausted", got)
+	}
+	if want := []string{"init"}; !slices.Equal(f.subs(), want) {
+		t.Errorf("git sequence = %v: nothing may run after a failed init", f.subs())
+	}
+	if d.mirrors.Exists("repo-a") {
+		t.Error("a failed init must not leave a partial mirror behind")
 	}
 }
 
@@ -272,16 +358,16 @@ func TestSyncRepoReplicaAuthRejectedVersusExpired(t *testing.T) {
 	}
 }
 
-// A long clone can outlive the token: valid when the sync started, expired by the time the clone is
+// A long fetch can outlive the token: valid when the sync started, expired by the time the fetch is
 // done. The connector knows the token is expired, so it must not push with it — even if the replica
 // would (wrongly, or by clock skew) still accept it, in which case the sync would report ok having
 // used a credential the platform has declared dead.
-func TestSyncRepoTokenExpiringDuringCloneIsNotUsedToPush(t *testing.T) {
+func TestSyncRepoTokenExpiringDuringFetchIsNotUsedToPush(t *testing.T) {
 	clock := syncNow
 	f := &fakeGit{}
 	f.script = func(c gitCall) ([]byte, error) {
-		if c.sub() == "clone" {
-			clock = clock.Add(2 * time.Hour) // the clone ran past the token's expiry
+		if c.sub() == "fetch" {
+			clock = clock.Add(2 * time.Hour) // the fetch ran past the token's expiry
 		}
 		return nil, nil // a replica that would happily accept the push
 	}
@@ -322,7 +408,7 @@ func TestSyncRepoTokenExpiringDuringPushIsReportedExpired(t *testing.T) {
 	}
 }
 
-func TestSyncRepoCorruptMirrorReclones(t *testing.T) {
+func TestSyncRepoCorruptMirrorIsRebuilt(t *testing.T) {
 	d := newTestDeps(t, nil)
 	dir := d.mirrors.Dir("repo-a")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -332,13 +418,16 @@ func TestSyncRepoCorruptMirrorReclones(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := &fakeGit{}
+	fetches := 0
 	f.script = func(c gitCall) ([]byte, error) {
 		switch c.sub() {
 		case "fetch":
-			return []byte("fatal: not a git repository: '" + dir + "'"), errExit
-		case "clone":
+			if fetches++; fetches == 1 {
+				return []byte("fatal: not a git repository: '" + dir + "'"), errExit
+			}
+		case "init":
 			if _, err := os.Stat(dir); err == nil {
-				t.Error("the corrupt mirror must be removed before the reclone")
+				t.Error("the corrupt mirror must be removed before it is rebuilt")
 			}
 		}
 		return nil, nil
@@ -347,22 +436,30 @@ func TestSyncRepoCorruptMirrorReclones(t *testing.T) {
 
 	got := syncRepo(context.Background(), d, testTask())
 	if got.State != StateOK {
-		t.Fatalf("result = %+v, want ok after one reclone", got)
+		t.Fatalf("result = %+v, want ok after one rebuild", got)
 	}
-	if want := []string{"fetch", "clone", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
+	if want := []string{"fetch", "init", "fetch", "show-ref", "push"}; !slices.Equal(f.subs(), want) {
 		t.Errorf("git sequence = %v, want %v", f.subs(), want)
 	}
+	assertMirrorFetch(t, f.calls[2], dir)
 }
 
-func TestSyncRepoCorruptMirrorRecloneFailureIsACleanError(t *testing.T) {
+func TestSyncRepoCorruptMirrorRebuildFailureIsACleanError(t *testing.T) {
 	d := newTestDeps(t, nil)
-	if err := os.MkdirAll(d.mirrors.Dir("repo-a"), 0o700); err != nil {
+	dir := d.mirrors.Dir("repo-a")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	f := &fakeGit{}
+	fetches := 0
 	f.script = func(c gitCall) ([]byte, error) {
-		if c.sub() == "fetch" {
-			return []byte("fatal: not a git repository"), errExit
+		switch c.sub() {
+		case "init":
+			return nil, os.MkdirAll(dir, 0o700)
+		case "fetch":
+			if fetches++; fetches == 1 {
+				return []byte("fatal: not a git repository"), errExit
+			}
 		}
 		return []byte("fatal: unable to access 'https://git.example.com/group/repo-a/': The requested URL returned error: 403"), errExit
 	}
@@ -372,8 +469,11 @@ func TestSyncRepoCorruptMirrorRecloneFailureIsACleanError(t *testing.T) {
 	if got.State != StateError || got.ErrorType != ErrOriginAccessDenied {
 		t.Fatalf("result = %+v, want error/origin_access_denied", got)
 	}
-	if want := []string{"fetch", "clone"}; !slices.Equal(f.subs(), want) {
-		t.Errorf("git sequence = %v, want exactly one reclone attempt: %v", f.subs(), want)
+	if want := []string{"fetch", "init", "fetch"}; !slices.Equal(f.subs(), want) {
+		t.Errorf("git sequence = %v, want exactly one rebuild attempt: %v", f.subs(), want)
+	}
+	if d.mirrors.Exists("repo-a") {
+		t.Error("a rebuild whose fetch failed must not leave an empty mirror behind")
 	}
 }
 

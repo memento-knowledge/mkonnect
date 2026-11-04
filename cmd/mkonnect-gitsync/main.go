@@ -3,10 +3,10 @@
 // tunnel as the API connector. It is a separate binary because it is a separate process with
 // its own registration-token kind, its own key, and its own toolchain needs (a git binary).
 //
-// It enrols, handshakes, heartbeats, and mirrors each configured repository: a clone or fetch
-// from the customer origin, then a push of its branches and tags to the Memento replica. Packaging
-// and release of this binary are tracked separately (memento-knowledge/mkonnect#48); nothing
-// builds or ships it as an image yet.
+// It enrols, handshakes, heartbeats, and mirrors each configured repository: a fetch of its
+// branches and tags from the customer origin into a local mirror, then a push of them to the
+// Memento replica. Packaging and release of this binary are tracked separately
+// (memento-knowledge/mkonnect#48); nothing builds or ships it as an image yet.
 package main
 
 import (

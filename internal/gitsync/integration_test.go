@@ -43,8 +43,8 @@ func refs(t *testing.T, gitDir string) []string {
 }
 
 // TestSyncRepoAgainstRealGit mirrors a real origin into a real replica and proves the behaviour the
-// fakes only assume: every branch and tag arrives, hidden namespaces do not, a later change
-// propagates, and a ref deleted at the origin is pruned from the replica.
+// fakes only assume: every branch and tag arrives, hidden namespaces reach neither the local mirror
+// nor the replica, a later change propagates, and a ref deleted at the origin is pruned from both.
 func TestSyncRepoAgainstRealGit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -95,6 +95,10 @@ func TestSyncRepoAgainstRealGit(t *testing.T) {
 	if !d.mirrors.Exists("repo-a") {
 		t.Fatal("the mirror directory was not created")
 	}
+	// The mirror holds only what is pushed: a forge's hidden namespaces would only cost disk.
+	if got := refs(t, d.mirrors.Dir("repo-a")); !slices.Equal(got, want) {
+		t.Fatalf("mirror refs after first sync = %v, want %v (no refs/pull/*)", got, want)
+	}
 
 	// The origin moves on: a new commit on main, and the feature branch deleted.
 	commit("two")
@@ -110,6 +114,70 @@ func TestSyncRepoAgainstRealGit(t *testing.T) {
 	want = []string{"refs/heads/main", "refs/tags/v1"}
 	if got := refs(t, replica); !slices.Equal(got, want) {
 		t.Errorf("replica refs after the origin deleted a branch = %v, want %v", got, want)
+	}
+	if got := refs(t, d.mirrors.Dir("repo-a")); !slices.Equal(got, want) {
+		t.Errorf("mirror refs after the origin deleted a branch = %v, want %v", got, want)
+	}
+}
+
+// Mirrors created before the mirror was narrowed to branches and tags came from `clone --mirror` and
+// hold every namespace. They must keep syncing, and the narrower fetch must neither fail on them nor
+// delete what they hold: the extra refs stay on disk until the mirror is rebuilt.
+func TestSyncRepoAgainstRealGitReusesAMirrorMadeByCloneMirror(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	replica := filepath.Join(root, "replica.git")
+	work := filepath.Join(root, "work")
+	for _, d := range []string{origin, replica} {
+		git(t, "", "init", "--bare", "-b", "main", d)
+	}
+	git(t, "", "init", "-b", "main", work)
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, work, "add", "file.txt")
+	git(t, work, "commit", "-m", "one")
+	git(t, work, "tag", "v1")
+	git(t, work, "push", origin, "main", "v1")
+	head := git(t, work, "rev-parse", "HEAD")
+	git(t, "", "--git-dir="+origin, "update-ref", "refs/pull/1/head", head)
+
+	d := syncDeps{mirrors: Mirrors{Root: filepath.Join(root, "mirrors")}, run: runGit, now: time.Now}
+	if err := d.mirrors.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+	git(t, "", "clone", "--mirror", "file://"+origin, d.mirrors.Dir("repo-a"))
+	legacy := []string{"refs/heads/main", "refs/pull/1/head", "refs/tags/v1"}
+	if got := refs(t, d.mirrors.Dir("repo-a")); !slices.Equal(got, legacy) {
+		t.Fatalf("fixture mirror refs = %v, want %v", got, legacy)
+	}
+
+	task := syncTask{
+		RepoID: "repo-a", CanonicalURL: "file://" + origin, ReplicaURL: "file://" + replica,
+		PushToken: Secret("push-token-abcdefghij"),
+	}
+	// The origin moves on and drops the hidden ref; the old mirror's copy of it is not pruned.
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, work, "commit", "-am", "two")
+	git(t, work, "push", origin, "main")
+	git(t, "", "--git-dir="+origin, "update-ref", "-d", "refs/pull/1/head")
+
+	if got := syncRepo(context.Background(), d, task); got.State != StateOK {
+		t.Fatalf("sync of a legacy mirror = %+v, want ok", got)
+	}
+	if got := refs(t, replica); !slices.Equal(got, []string{"refs/heads/main", "refs/tags/v1"}) {
+		t.Errorf("replica refs = %v, want branches and tags only", got)
+	}
+	if a, b := git(t, "", "--git-dir="+d.mirrors.Dir("repo-a"), "rev-parse", "main"), git(t, "", "--git-dir="+origin, "rev-parse", "main"); a != b {
+		t.Errorf("mirror main = %s, want origin main %s", a, b)
+	}
+	if got := refs(t, d.mirrors.Dir("repo-a")); !slices.Equal(got, legacy) {
+		t.Errorf("legacy mirror refs after sync = %v, want the extra namespace left in place: %v", got, legacy)
 	}
 }
 
@@ -172,6 +240,17 @@ func TestSyncRepoAgainstRealGitEmptyOriginNeverWipesReplica(t *testing.T) {
 	if refs := refs(t, replica); !slices.Equal(refs, populated) {
 		t.Errorf("replica refs after syncing an empty origin = %v, want them untouched: %v", refs, populated)
 	}
+
+	// An initialised but empty mirror, as a crash between init and the first fetch would leave, must
+	// not be taken for a healthy one: against an empty origin it is still the empty-origin error.
+	task.RepoID = "repo-c"
+	git(t, "", "init", "--bare", "-b", "main", d.mirrors.Dir("repo-c"))
+	if got := syncRepo(context.Background(), d, task); got.State != StateError || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+		t.Errorf("sync with a leftover empty mirror = %+v, want an error naming the empty origin", got)
+	}
+	if refs := refs(t, replica); !slices.Equal(refs, populated) {
+		t.Errorf("replica refs after syncing with a leftover empty mirror = %v, want them untouched: %v", refs, populated)
+	}
 }
 
 func TestSyncRepoAgainstRealGitMissingOriginIsAnError(t *testing.T) {
@@ -192,7 +271,7 @@ func TestSyncRepoAgainstRealGitMissingOriginIsAnError(t *testing.T) {
 		t.Fatalf("result = %+v, want a typed error for an origin that does not exist", got)
 	}
 	if d.mirrors.Exists("repo-a") {
-		t.Error("a failed clone must not leave a partial mirror behind")
+		t.Error("a failed first fetch must not leave an initialised, empty mirror behind")
 	}
 	if strings.Contains(got.ErrorDetail, root) {
 		t.Errorf("error_detail leaks a local path: %q", got.ErrorDetail)

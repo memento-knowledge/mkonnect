@@ -98,6 +98,9 @@ func newHTTPFixture(t *testing.T) *httpFixture {
 	git(t, work, "commit", "-m", "one")
 	git(t, work, "tag", "v1")
 	git(t, work, "push", f.originDir, "main", "v1")
+	// A hidden namespace, as a forge keeps for pull requests: the origin advertises it, the sync
+	// must neither mirror nor push it.
+	git(t, "", "--git-dir="+f.originDir, "update-ref", "refs/pull/1/head", git(t, work, "rev-parse", "HEAD"))
 
 	f.origin = newGitHTTPServer(t, filepath.Join(root, "o"), "Bearer "+httpOriginToken, http.StatusUnauthorized)
 	f.replica = newGitHTTPServer(t, filepath.Join(root, "r"), "Bearer "+httpPushToken, http.StatusUnauthorized)
@@ -118,17 +121,21 @@ func (f *httpFixture) sync() syncResult {
 	return syncRepo(ctx, f.deps, f.task)
 }
 
-// Clone, fetch and push all authenticate over real HTTP, each credential is scoped to its own host,
-// and neither server ever sees the other's credential.
+// The first fetch into the freshly initialised mirror, a later fetch and the push all authenticate
+// over real HTTP, each credential is scoped to its own host, and neither server ever sees the other's
+// credential.
 func TestSyncRepoOverHTTPKeepsEachCredentialToItsOwnHost(t *testing.T) {
 	f := newHTTPFixture(t)
 
 	if got := f.sync(); got.State != StateOK {
-		t.Fatalf("first sync (clone + push) = %+v, want ok", got)
+		t.Fatalf("first sync (init + fetch + push) = %+v, want ok", got)
 	}
 	want := []string{"refs/heads/main", "refs/tags/v1"}
 	if got := refs(t, f.replicaDir); !slices.Equal(got, want) {
 		t.Fatalf("replica refs = %v, want %v", got, want)
+	}
+	if got := refs(t, f.deps.mirrors.Dir("repo-a")); !slices.Equal(got, want) {
+		t.Fatalf("mirror refs = %v, want %v (no refs/pull/*)", got, want)
 	}
 	if got := f.sync(); got.State != StateOK { // the mirror exists now: a fetch
 		t.Fatalf("second sync (fetch + push) = %+v, want ok", got)
