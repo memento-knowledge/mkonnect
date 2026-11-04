@@ -41,7 +41,10 @@ func (c *Client) setProviders(next *Store) {
 	for id, r := range c.repos {
 		nr := bindRepo(r, set)
 		c.repos[id] = nr
-		if nr.matched && nr.bind != r.bind {
+		// A repository that is queued for a slot but has claimed nothing yet will claim the new
+		// credential when it runs: a rerun on top would sync it twice.
+		queued := r.syncing && c.attempts[id] == nil
+		if nr.matched && nr.bind != r.bind && !queued {
 			resync = append(resync, id)
 		}
 	}

@@ -12,8 +12,7 @@ import (
 	"time"
 )
 
-// The live reload of the local provider configuration (the provider file, and the token files it
-// refers to). A change is noticed by polling a digest, applied only once it has been seen twice, and
+// The live reload of the local provider configuration (the provider file). A change is noticed by polling a digest, applied only once it has been seen twice, and
 // can be forced with SIGHUP. These are constants on purpose: there is no knob and no way to turn the
 // reload off, because the only alternative to noticing a revoked credential is restarting.
 const (
@@ -27,7 +26,7 @@ const (
 )
 
 // digest identifies what one read of the configuration saw. It is derived from the bytes of the
-// provider file and the token files, so it is a function of secrets: it is never logged and never
+// provider file, so it is a function of secrets: it is never logged and never
 // leaves a package-private field.
 type digest [sha256.Size]byte
 
@@ -111,8 +110,10 @@ func (f fileSource) read(confirm bool) configBundle {
 }
 
 // peekFile is readSecureFile without its side effects: it applies the same checks through one
-// descriptor but never changes the file's mode and never logs. A mode readSecureFile would have to
-// tighten is simply reported as unusable, which is as far as a look can go.
+// descriptor but never changes the file's mode and never logs. A mode readSecureFile would tighten is
+// not an error here: whether it can be tightened is for the confirming read to find out, and a look
+// that called it unusable would hide, behind a digest shared by every unreadable file, the fix of
+// whatever made it so.
 func peekFile(path, what string, maxSize int64) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -128,9 +129,6 @@ func peekFile(path, what string, maxSize int64) ([]byte, error) {
 	}
 	if info.Size() > maxSize {
 		return nil, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
-	}
-	if !readOnlyModeAcceptable(info.Mode()) {
-		return nil, fmt.Errorf("%s has unsafe permissions", what)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
@@ -166,6 +164,10 @@ type reloader struct {
 
 	lastBad     digest // the unusable content already reported
 	haveLastBad bool
+	// badFrom is the content a look found that the confirming read then refused, so that it is not
+	// looked at, and confirmed, again every poll.
+	badFrom     digest
+	haveBadFrom bool
 }
 
 func newReloader(src configSource, applied digest, apply func(*Store)) *reloader {
@@ -246,10 +248,13 @@ func (r *reloader) run(ctx context.Context) {
 // is in force, or is the already-reported unusable one, starts nothing.
 func (r *reloader) sight(b configBundle) bool {
 	if b.digest == r.applied {
-		r.haveLastBad = false
+		r.haveLastBad, r.haveBadFrom = false, false
 		return false
 	}
 	if r.haveLastBad && b.digest == r.lastBad {
+		return false
+	}
+	if r.haveBadFrom && b.digest == r.badFrom {
 		return false
 	}
 	r.pending, r.pendingSeen = true, b.digest
@@ -263,10 +268,15 @@ func (r *reloader) confirm() (rearm bool) {
 	switch {
 	case b.digest == r.applied:
 		return false // it went back
+	case b.kind == bundleInvalid && b.digest != r.pendingSeen:
+		// The look found content that the confirming read then refused (it could not tighten the
+		// file's mode, or the file went bad): unusable, and the content that was looked at is not
+		// looked at again until it changes.
+		r.badFrom, r.haveBadFrom = r.pendingSeen, true
+		r.decide(b, false)
+		return false
 	case b.digest != r.pendingSeen:
-		// What the first sighting saw is not what is there now, or the confirming read tightened the
-		// file's mode (which changes what an unusable file reads as): count this as a new first
-		// sighting.
+		// What the first sighting saw is not what is there now: count this as a new first sighting.
 		return r.sight(b)
 	}
 	r.decide(b, false)
@@ -296,11 +306,11 @@ func (r *reloader) forced() (rearm bool) {
 func (r *reloader) decide(b configBundle, explicit bool) {
 	switch b.kind {
 	case bundleOK:
-		r.applied, r.haveLastBad = b.digest, false
+		r.applied, r.haveLastBad, r.haveBadFrom = b.digest, false, false
 		r.apply(b.store)
 	case bundleMissing:
 		slog.Error("the git-sync config file no longer exists: treating the provider configuration as empty, which revokes every provider credential and stops all syncing until the file is restored")
-		r.applied, r.haveLastBad = b.digest, false
+		r.applied, r.haveLastBad, r.haveBadFrom = b.digest, false, false
 		r.apply(nil)
 	default:
 		if explicit || !r.haveLastBad || r.lastBad != b.digest {

@@ -344,3 +344,47 @@ func TestSIGHUPWithNoChangeAppliesNothing(t *testing.T) {
 		t.Errorf("applied %d times", got.count())
 	}
 }
+
+// A file that a look finds readable but the confirming read refuses (it cannot be tightened) is
+// reported once and is not confirmed again on every poll.
+func TestFileThatCannotBeTightenedIsNotConfirmedOverAndOver(t *testing.T) {
+	logs := captureLogs(t)
+	look := okBundle("loose")
+	confirmBad := badBundle("loose-refused", loadUnreadable)
+	src := &modalSource{look: look, confirm: confirmBad}
+	_, got := startReloader(t, src, contentDigest([]byte("a")), 3*time.Millisecond, 3*time.Millisecond)
+	eventuallyTrue(t, "the report", func() bool { return strings.Count(logs.String(), "cannot be used") == 1 })
+	quietly(100 * time.Millisecond)
+	if n := src.confirms(); n != 1 {
+		t.Errorf("%d confirming reads, want 1", n)
+	}
+	if got.count() != 0 {
+		t.Errorf("applied %d times", got.count())
+	}
+	// Once the look sees something else, it is looked at again.
+	src.setLook(okBundle("fixed"))
+	src.setConfirm(okBundle("fixed"))
+	eventuallyTrue(t, "the fix to be applied", func() bool { return got.count() == 1 })
+}
+
+// modalSource answers a look and a confirming read differently.
+type modalSource struct {
+	mu       sync.Mutex
+	look     configBundle
+	confirm  configBundle
+	nConfirm int
+}
+
+func (m *modalSource) read(confirm bool) configBundle {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if confirm {
+		m.nConfirm++
+		return m.confirm
+	}
+	return m.look
+}
+
+func (m *modalSource) confirms() int             { m.mu.Lock(); defer m.mu.Unlock(); return m.nConfirm }
+func (m *modalSource) setLook(b configBundle)    { m.mu.Lock(); m.look = b; m.mu.Unlock() }
+func (m *modalSource) setConfirm(b configBundle) { m.mu.Lock(); m.confirm = b; m.mu.Unlock() }

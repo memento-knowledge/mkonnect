@@ -260,9 +260,10 @@ select, then give it only that:
 - Grant it **read access to the intended repositories only**. Read-only is all that is needed;
   git-sync never pushes to your git server. Prefer a token limited to read scopes.
 - Use a token with an **expiry** and rotate it on a schedule. To rotate, update the
-  provider configuration: git-sync applies it within seconds, stops any sync still using the old
-  credential and syncs again with the new one, so the old token can be revoked on the git server
-  straight away (see [Reloading the provider configuration](git-sync.md#reloading-the-provider-configuration)).
+  provider configuration: git-sync applies it within seconds of the file changing, stops any sync still using the old
+  credential and syncs again with the new one, so the old token can be revoked on the git server as
+  soon as git-sync's log shows the reload (on Kubernetes, once the updated Secret has reached the
+  pod; revoking earlier only makes syncs fail until it does; see [Reloading the provider configuration](git-sync.md#reloading-the-provider-configuration)).
 - Remember that a repository's history may contain material that is no longer in its current
   files. Everything reachable from a replicated branch or tag is copied.
 - On Kubernetes, supply the credential from a Secret you manage, ideally backed by your secret

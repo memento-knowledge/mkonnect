@@ -37,6 +37,9 @@ var credentialErrors = []string{ErrOriginAccessDenied, ErrCredentialRejected, Er
 type targetKey struct {
 	canonicalURL string
 	replicaURL   string
+	// bind is the provider credential the repository syncs with: a failure history built up under one
+	// credential says nothing about another, so a repository bound to a new one starts over.
+	bind binding
 }
 
 // schedHooks connect the scheduler to the connector without it knowing about the Client.
@@ -164,7 +167,7 @@ func (s *scheduler) completed(repoID string, t syncTask, res syncResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[repoID]
-	if !ok || e.key != (targetKey{canonicalURL: t.CanonicalURL, replicaURL: t.ReplicaURL}) {
+	if !ok || e.key != (targetKey{canonicalURL: t.CanonicalURL, replicaURL: t.ReplicaURL, bind: t.Bind}) {
 		return
 	}
 	success := res.State == StateOK

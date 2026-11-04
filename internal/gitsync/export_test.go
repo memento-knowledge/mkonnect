@@ -160,3 +160,21 @@ func (c *Client) StartReloadForTest(ctx context.Context) (stop func()) {
 func (c *Client) SetReloadTimingForTest(poll, settle time.Duration) {
 	c.reload.poll, c.reload.settle = poll, settle
 }
+
+// SchedulerFailuresForTest returns the consecutive failures the scheduler holds for repoID, or -1
+// when the repository is not scheduled.
+func (c *Client) SchedulerFailuresForTest(repoID string) int {
+	c.sched.mu.Lock()
+	defer c.sched.mu.Unlock()
+	if e, ok := c.sched.entries[repoID]; ok {
+		return e.failures
+	}
+	return -1
+}
+
+// ProviderTokenForTest returns the token of the provider in force under name, or "".
+func (c *Client) ProviderTokenForTest(name string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.providers.byName[name].entry.Token.Reveal()
+}

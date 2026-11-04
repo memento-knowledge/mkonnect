@@ -362,8 +362,10 @@ unset GIT_TOKEN
 
 docker exec -i mkonnect-gitsync /mkonnect-gitsync connector config list    # credentials shown masked
 docker exec -i mkonnect-gitsync /mkonnect-gitsync connector status
-docker restart mkonnect-gitsync
 ```
+
+The running connector picks the change up within a few seconds (see
+[Reloading the provider configuration](#reloading-the-provider-configuration)); it needs no restart.
 
 **Kubernetes.** The same commands work with `kubectl exec -i deploy/mkonnect-gitsync --
 /mkonnect-gitsync connector ...` when you let git-sync manage the file in its volume
@@ -404,14 +406,17 @@ Secret. The mirrors stay on the data volume under `/data/mirrors`.
 ### Reloading the provider configuration
 
 git-sync watches the provider configuration while it runs, so adding a provider, rotating a
-credential, or revoking one takes effect within a few seconds without a restart.
+credential, or revoking one takes effect without a restart, within a few seconds of the file
+changing.
 
 - **How it notices.** Every 5 seconds git-sync reads the provider file and compares it with what it
   loaded. A change is applied only after it has been seen twice, one second apart, so a file that is
   still being written, or that is saved in several steps, is not applied half-way, and a file that
   changes and changes back is not applied at all. On Kubernetes this covers a Secret mounted as a
-  volume, which the kubelet updates in place.
-- **Apply it now.** Send `SIGHUP` to the process to skip the wait:
+  volume, which the kubelet updates in place; the kubelet delivers an updated Secret to the pod
+  only after a delay (often a minute or more), and nothing git-sync does can shorten it.
+- **Apply it now.** Send `SIGHUP` to the process to skip git-sync's own wait (it re-reads the file
+  at once; it cannot make the file arrive sooner):
 
   ```bash
   docker kill --signal=HUP mkonnect-gitsync                 # Docker
@@ -869,7 +874,7 @@ clears the error.
 | Start fails with `temp directory … is not writable` | `/tmp` is not writable by uid 65532. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |
-| A credential change did not take effect | The provider configuration is read at startup. Restart git-sync; see [Configure your git server credential](#configure-your-git-server-credential). |
+| A credential change did not take effect | git-sync reloads the provider configuration while it runs. Look in its log for `local provider configuration reloaded`, or for `the git-sync config cannot be used` with its reason (it then keeps the previous configuration). On Kubernetes the kubelet delivers an updated Secret to the pod after a delay, often a minute or more. See [Reloading the provider configuration](#reloading-the-provider-configuration). |
 | `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret (git-sync reloads it without a restart), or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
 | Log warns that syncing needs git 2.31 or newer | The image does not contain a usable git. Use an official image for your release ID. |
 

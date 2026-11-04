@@ -189,3 +189,23 @@ func TestClientWithoutAProviderFileHasNoWatcher(t *testing.T) {
 	c.Reload()
 	stop()
 }
+
+// A file that could not be read at all, and is then fixed to something readable, is picked up: the
+// unreadable state must not hide its own repair.
+func TestFileRepairedAfterBeingUnreadableIsPickedUp(t *testing.T) {
+	logs := captureLogs(t)
+	c, path := newFileClient(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}), &fakeProber{result: gitsync.OriginReachable})
+	configureRepo(c, &stubSender{}, "repo-a", "https://git.example.com/team/a.git")
+	fileReload(t, c, 10*time.Millisecond, 10*time.Millisecond)
+
+	replaceFile(t, path, providersJSON([3]string{"origin", "git.example.com", tokenOne}), 0o000)
+	waitFor(t, func() bool { return strings.Contains(logs.String(), "cannot be used") })
+	if _, bound, _ := c.BindingForTest("repo-a"); !bound {
+		t.Fatal("an unreadable file revoked the configuration")
+	}
+
+	replaceFile(t, path, providersJSON([3]string{"origin", "git.example.com", tokenTwo}), 0o644)
+	waitFor(t, func() bool {
+		return c.ProviderTokenForTest("origin") == tokenTwo
+	})
+}

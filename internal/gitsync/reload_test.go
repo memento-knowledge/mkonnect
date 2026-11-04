@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -678,5 +679,139 @@ func TestBaseURLPathChangeReprobesButCancelsNothing(t *testing.T) {
 	}
 	if n := g.count("fetch"); n != 1 {
 		t.Errorf("%d fetches, want 1", n)
+	}
+}
+
+// failingAfterRelease is a git runner whose first fetch holds until released, ignoring cancellation,
+// and then fails as an access-denied origin would.
+func failingAfterRelease(entered chan struct{}, release chan struct{}) func(ctx context.Context, argv, env []string, dir string) ([]byte, error) {
+	var once sync.Once
+	return func(_ context.Context, argv, _ []string, _ string) ([]byte, error) {
+		if subOf(argv) == "fetch" {
+			first := false
+			once.Do(func() { first = true })
+			if first {
+				close(entered)
+				<-release
+				return []byte("fatal: unable to access 'https://git.example.com/x/': The requested URL returned error: 403"), errors.New("exit status 128")
+			}
+		}
+		return nil, nil
+	}
+}
+
+// The failure of a sync that used a replaced credential says nothing about the new one: it does not
+// count towards the repository's backoff.
+func TestFailureOfASupersededSyncDoesNotFeedTheBackoff(t *testing.T) {
+	t.Cleanup(gitsync.SetSupersededStopWaitForTest(50 * time.Millisecond))
+	entered, release := make(chan struct{}), make(chan struct{})
+	c := newTestClientOpts(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}),
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(failingAfterRelease(entered, release)))
+	configureRepo(c, &stubSender{}, "repo-a", "https://git.example.com/team/a.git")
+	<-entered
+	c.SetCriticalPatchForTest(true) // no rerun to mask the result
+	c.SetProvidersForTest(storeOf(t, providersJSON([3]string{"origin", "git.example.com", tokenTwo})))
+	close(release)
+	waitFor(t, func() bool { return c.AttemptsForTest() == 0 })
+	if n := c.SchedulerFailuresForTest("repo-a"); n != 0 {
+		t.Errorf("scheduler holds %d failures for the repository, want 0: the failed sync used a credential that was replaced", n)
+	}
+}
+
+// A backoff built up under one credential does not follow the repository to the next.
+func TestRotationStartsTheBackoffOver(t *testing.T) {
+	g := &scriptedGit{fail: map[string][]byte{"fetch": []byte("fatal: unable to access 'https://git.example.com/x/': The requested URL returned error: 403")}}
+	c := newTestClientOpts(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}),
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	configureRepo(c, &stubSender{}, "repo-a", "https://git.example.com/team/a.git")
+	waitFor(t, func() bool { return c.SchedulerFailuresForTest("repo-a") == 1 })
+	waitForSyncsToStop(t, c)
+
+	c.SetCriticalPatchForTest(true)
+	c.SetProvidersForTest(storeOf(t, providersJSON([3]string{"origin", "git.example.com", tokenTwo})))
+	if n := c.SchedulerFailuresForTest("repo-a"); n != 0 {
+		t.Errorf("scheduler holds %d failures after the rotation, want 0", n)
+	}
+}
+
+// ctxProber returns when its context is cancelled, and says whether that is why.
+type ctxProber struct {
+	started   chan struct{}
+	cancelled chan struct{}
+}
+
+func (p *ctxProber) Probe(ctx context.Context, _ gitsync.LocalEntry) (gitsync.OriginResult, error) {
+	select {
+	case p.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	select {
+	case p.cancelled <- struct{}{}:
+	default:
+	}
+	return "", ctx.Err()
+}
+
+// Revoking the providers stops a probe that is using them, rather than letting it run out its
+// timeout with the revoked credential.
+func TestRevokingProvidersCancelsTheProbeInFlight(t *testing.T) {
+	p := &ctxProber{started: make(chan struct{}, 1), cancelled: make(chan struct{}, 1)}
+	c := newTestClientP(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}), p)
+	c.OnConnected(context.Background(), &stubSender{})
+	<-p.started
+	c.SetProvidersForTest(storeOf(t, "{}"))
+	select {
+	case <-p.cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the probe was not cancelled when its providers were revoked")
+	}
+}
+
+// The cached origin check described the providers that were replaced: it is not reported afterwards.
+func TestReplacingProvidersClearsTheCachedOriginCheck(t *testing.T) {
+	p := &fakeProber{result: gitsync.OriginReachable}
+	c := newTestClientP(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}), p)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	waitFor(t, func() bool { return latestOriginCheck(s.messages()) != nil })
+	waitFor(t, func() bool { return !c.ProbeInFlightForTest() })
+
+	c.SetProvidersForTest(storeOf(t, "{}")) // nothing left to probe, so nothing replaces the cache
+	_ = c.OnHeartbeat(context.Background(), s)
+	if oc := lastStatus(t, s.messages()).OriginCheck; oc != nil {
+		t.Errorf("origin_check = %+v after the providers it described were removed", oc)
+	}
+}
+
+// A repository that is still waiting for a slot when its credential is rotated syncs once, with the
+// new credential: it has claimed nothing, so there is nothing to cancel and nothing to rerun.
+func TestQueuedRepositoryIsNotSyncedTwiceByARotation(t *testing.T) {
+	g := &scriptedGit{gate: make(chan struct{})}
+	c := newTestClientOpts(t, providersJSON([3]string{"a", "git.example.com", tokenOne}, [3]string{"b", "other.example.com", tokenOne}),
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", rawJSON(
+		`{"type":"git_sync_config","config_version":1,"limits":{"max_concurrency":1},"repositories":[`+
+			repoJSON("repo-a", "https://git.example.com/a.git", "", "https://replica.example.com/r/a.git", testPushToken)+","+
+			repoJSON("repo-b", "https://other.example.com/b.git", "", "https://replica.example.com/r/b.git", testPushToken)+`]}`))
+	waitFor(t, func() bool { return g.count("fetch") == 1 }) // one repository holds the only slot; the other waits
+
+	// Rotate the provider of whichever repository is waiting.
+	argv, _ := g.call(t, "fetch")
+	rotated := providersJSON([3]string{"a", "git.example.com", tokenOne}, [3]string{"b", "other.example.com", tokenTwo})
+	if contains(argv, "other.example.com") {
+		rotated = providersJSON([3]string{"a", "git.example.com", tokenTwo}, [3]string{"b", "other.example.com", tokenOne})
+	}
+	c.SetProvidersForTest(storeOf(t, rotated))
+	g.release()
+	waitFor(t, func() bool {
+		_ = c.OnHeartbeat(context.Background(), s)
+		return repoStatusNow(t, s, "repo-b").State == gitsync.StateOK && repoStatusNow(t, s, "repo-a").State == gitsync.StateOK
+	})
+	time.Sleep(100 * time.Millisecond)
+	if n := g.count("fetch"); n != 2 {
+		t.Errorf("%d fetches, want one per repository", n)
 	}
 }

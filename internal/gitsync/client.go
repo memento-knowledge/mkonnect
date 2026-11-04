@@ -366,7 +366,8 @@ func (c *Client) startReload(ctx context.Context) (stop func()) {
 
 // Reload asks the connector to re-read the provider configuration now, without the settle delay a
 // change noticed by polling waits out. The daemon calls it on SIGHUP. It never blocks; the reload
-// happens on the watcher's goroutine, so it does nothing before Run or without a file to watch.
+// happens on the watcher's goroutine: a request made before Run is held and applied when it starts,
+// and without a file to watch there is nothing to reload.
 func (c *Client) Reload() {
 	if c.reload != nil {
 		c.reload.requestReload()
@@ -679,7 +680,7 @@ func (c *Client) schedulableTargets() map[string]targetKey {
 	out := make(map[string]targetKey, len(c.repos))
 	for id, r := range c.repos {
 		if r.matched && r.replicaURL != "" {
-			out[id] = targetKey{r.canonicalURL, r.replicaURL}
+			out[id] = targetKey{r.canonicalURL, r.replicaURL, r.bind}
 		}
 	}
 	return out

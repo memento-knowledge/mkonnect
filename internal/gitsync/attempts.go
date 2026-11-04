@@ -16,8 +16,9 @@ type attempt struct {
 	bind   binding
 	cancel context.CancelCauseFunc
 	// superseded is set, under Client.mu, when the attempt's credential was replaced while it ran. The
-	// binding comparison in finishSync would also catch that, but not a credential that was replaced and
-	// then restored; this flag does.
+	// binding comparison in finishSync catches the same thing (a restored credential is a new
+	// generation, see buildProviderSet); the flag is the direct statement of it, so the drop does not
+	// rest on how generations are numbered.
 	superseded bool
 	// done is closed once finishSync has ended the attempt.
 	done chan struct{}
