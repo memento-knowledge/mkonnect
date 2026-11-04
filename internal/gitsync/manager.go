@@ -82,21 +82,53 @@ func (m *manager) enqueue(ctx context.Context, repoIDs []string) {
 		if _, ok := m.hooks.resolve(id); !ok {
 			continue
 		}
-		m.mu.Lock()
-		if _, running := m.inflight[id]; running {
-			m.rerun[id] = true
-			m.mu.Unlock()
-			continue
-		}
-		if len(m.inflight) == 0 {
-			m.idleCh = make(chan struct{})
-		}
-		m.inflight[id] = struct{}{}
-		m.mu.Unlock()
-
-		m.hooks.begin(id)
-		go m.runRepo(ctx, id)
+		m.launch(ctx, id, true)
 	}
+}
+
+// enqueueScheduled starts a periodic sync of one repository and reports whether it did. Unlike
+// enqueue it never marks a trailing rerun: a repository that is already syncing (queued or running)
+// is simply skipped, because that run already covers what the schedule wants, and a rerun would make
+// a repository slower than its interval sync back to back. It also declines when syncing is
+// suspended, ctx is done, or the repository is no longer syncable.
+func (m *manager) enqueueScheduled(ctx context.Context, id string) bool {
+	if ctx.Err() != nil || m.hooks.suspended() || m.busy(id) {
+		return false
+	}
+	if _, ok := m.hooks.resolve(id); !ok {
+		return false
+	}
+	return m.launch(ctx, id, false)
+}
+
+// launch marks id in flight and starts its sync, or reports false when it already is. rerunIfBusy
+// then records a trailing rerun instead of dropping the request.
+func (m *manager) launch(ctx context.Context, id string, rerunIfBusy bool) bool {
+	m.mu.Lock()
+	if _, running := m.inflight[id]; running {
+		if rerunIfBusy {
+			m.rerun[id] = true
+		}
+		m.mu.Unlock()
+		return false
+	}
+	if len(m.inflight) == 0 {
+		m.idleCh = make(chan struct{})
+	}
+	m.inflight[id] = struct{}{}
+	m.mu.Unlock()
+
+	m.hooks.begin(id)
+	go m.runRepo(ctx, id)
+	return true
+}
+
+// busy reports whether id is queued or running.
+func (m *manager) busy(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, running := m.inflight[id]
+	return running
 }
 
 // runRepo runs a repository's sync, then its trailing rerun if one was requested meanwhile.

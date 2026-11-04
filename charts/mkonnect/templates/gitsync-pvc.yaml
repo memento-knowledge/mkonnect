@@ -1,0 +1,18 @@
+{{- if include "mkonnect.gitsync.enabled" . -}}
+{{- $gs := include "mkonnect.gitsync.values" . | fromYaml -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mkonnect.gitsync.fullname" . }}-data
+  labels:
+    {{- include "mkonnect.gitsync.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ $gs.persistence.size }}
+  {{- if $gs.persistence.storageClass }}
+  storageClassName: {{ $gs.persistence.storageClass }}
+  {{- end }}
+{{- end }}
