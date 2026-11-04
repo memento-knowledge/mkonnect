@@ -13,6 +13,9 @@ var errCredentialSuperseded = errors.New("credential superseded")
 // attempt is the sync attempt running for one repository. It exists from claimTask until finishSync,
 // and is what a replaced credential reaches to stop the git processes using it.
 type attempt struct {
+	// seq identifies this registration: the task carries it, and finishSync ends only the attempt
+	// whose seq it still holds, so a finisher that outlived its attempt can never end a newer one.
+	seq    uint64
 	bind   binding
 	cancel context.CancelCauseFunc
 	// superseded is set, under Client.mu, when the attempt's credential was replaced while it ran. The
@@ -79,6 +82,8 @@ func (c *Client) claimTask(parent context.Context, repoID string) (syncTask, con
 		TokenExpiresAt: r.expiresAt,
 		Bind:           r.bind,
 	}
+	c.attemptSeq++
+	task.AttemptSeq = c.attemptSeq
 	if c.afterClaimRead != nil {
 		c.afterClaimRead()
 	}
@@ -90,19 +95,25 @@ func (c *Client) claimTask(parent context.Context, repoID string) (syncTask, con
 		return syncTask{}, nil, false
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	c.attempts[repoID] = &attempt{bind: r.bind, cancel: cancel, done: make(chan struct{})}
+	c.attempts[repoID] = &attempt{seq: task.AttemptSeq, bind: r.bind, cancel: cancel, done: make(chan struct{})}
 	return task, ctx, true
 }
 
-// endAttemptLocked removes repoID's attempt, releases its context, and reports whether its credential
-// was superseded while it ran. c.mu must be held.
-func (c *Client) endAttemptLocked(repoID string) (superseded bool) {
+// endAttemptLocked ends the attempt a finishing task claimed: it removes the registration, releases
+// its context, and reports whether its credential was superseded while it ran. stale is true, and
+// nothing is touched, when the registered attempt is not the task's (a newer one has been
+// registered since): the finisher must then leave the repository's state alone, because it now
+// belongs to the newer attempt. No registration at all is not stale. c.mu must be held.
+func (c *Client) endAttemptLocked(repoID string, seq uint64) (superseded, stale bool) {
 	att := c.attempts[repoID]
 	if att == nil {
-		return false
+		return false, false
+	}
+	if att.seq != seq {
+		return false, true
 	}
 	delete(c.attempts, repoID)
 	att.cancel(nil)
 	close(att.done)
-	return att.superseded
+	return att.superseded, false
 }

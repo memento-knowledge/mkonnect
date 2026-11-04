@@ -200,7 +200,8 @@ type Client struct {
 	providerEpoch uint64
 	// attempts registers the sync attempt running for each repository (claimTask), so a replaced
 	// credential can cancel the ones that use it.
-	attempts map[string]*attempt
+	attempts   map[string]*attempt
+	attemptSeq uint64
 	// runs is what is remembered of each repository's attempts (see runRecord), by repo_id. It is
 	// loaded from runStore at startup and written back after every change. It is guarded by mu, like
 	// repos, so a status is built from one consistent view of both.
@@ -529,7 +530,12 @@ func (c *Client) startAttempt(repoID string, t syncTask, at time.Time) {
 // is logged by the store and never affects the sync.
 func (c *Client) finishSync(repoID string, t syncTask, res syncResult) bool {
 	c.mu.Lock()
-	superseded := c.endAttemptLocked(repoID)
+	superseded, stale := c.endAttemptLocked(repoID, t.AttemptSeq)
+	if stale {
+		c.mu.Unlock()
+		slog.Warn("ignored the end of a sync that was no longer the repository's current attempt", "repo_id", repoID)
+		return false
+	}
 	r, ok := c.repos[repoID]
 	if !ok || !targetMatches(r, t) {
 		c.mu.Unlock()

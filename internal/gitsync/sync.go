@@ -94,6 +94,8 @@ type syncTask struct {
 	// Bind is the provider, and generation of its credential, Origin was taken from; the result of
 	// the attempt is kept only while the repository is still bound to it.
 	Bind binding
+	// AttemptSeq identifies the registration claimTask made for this task; see attempt.seq.
+	AttemptSeq uint64
 }
 
 // syncDeps are the seams a sync needs. Zero timeouts use the defaults.

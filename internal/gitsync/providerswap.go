@@ -75,6 +75,11 @@ func (c *Client) setProviders(next *Store) {
 
 	// The schedule follows the repositories that can now be synced; a repository that became
 	// syncable is first synced now rather than after its interval, as when the platform configures it.
+	//
+	// The resyncs are started before the wait below, and that is safe even if a cancelled runner
+	// outlives it: the manager runs one sync per repository at a time, so the rerun claims only after
+	// the cancelled one has returned, and a finisher is tied to its own registration anyway (see
+	// endAttemptLocked).
 	c.sched.reconcile()
 	if runCtx != nil {
 		c.startSyncs(runCtx, resync)
