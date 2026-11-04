@@ -20,51 +20,93 @@ type Store struct {
 	mu   sync.RWMutex
 	path string
 	data map[string]LocalEntry
+	// digest identifies the bytes data was built from (see contentDigest); zero for a store that was
+	// not loaded from a file.
+	digest digest
 }
 
 // New loads the provider config from path. A missing file yields an empty store and no error. A
 // present file is tightened to owner-only, decoded strictly (unknown fields rejected), and every
 // entry validated; a duplicate host (two providers that resolve to the same scheme+host+port) is
 // rejected so credential selection can never be ambiguous. No error includes a credential value.
+//
+// The store remembers where it was loaded from and a digest of exactly the bytes it was built from,
+// which is what the live reload compares against (see reloader).
 func New(path string) (*Store, error) {
-	s := &Store{path: path, data: map[string]LocalEntry{}}
 	data, err := readSecureFile(path, "git-sync config", maxConfigFileSize)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return s, nil
+			return &Store{path: path, data: map[string]LocalEntry{}, digest: missingDigest()}, nil
 		}
 		return nil, err
 	}
+	return parseProviders(path, data)
+}
+
+// Error categories for a configuration that could not be loaded. They are fixed strings, safe to log
+// on every reload: unlike the loader's own errors (which name keys of the file), they carry nothing
+// taken from it.
+const (
+	loadInvalidJSON   = "invalid_json"
+	loadInvalidConfig = "invalid_configuration"
+	loadUnreadable    = "unreadable"
+)
+
+// loadError is a load failure together with its fixed category.
+type loadError struct {
+	category string
+	err      error
+}
+
+func (e *loadError) Error() string { return e.err.Error() }
+func (e *loadError) Unwrap() error { return e.err }
+
+func invalidConfig(format string, args ...any) error {
+	return &loadError{category: loadInvalidConfig, err: fmt.Errorf(format, args...)}
+}
+
+// loadCategory returns the fixed category of a load failure.
+func loadCategory(err error) string {
+	var le *loadError
+	if errors.As(err, &le) {
+		return le.category
+	}
+	return loadUnreadable
+}
+
+// parseProviders builds a Store from the bytes of a provider config read from path.
+func parseProviders(path string, data []byte) (*Store, error) {
+	s := &Store{path: path, data: map[string]LocalEntry{}, digest: contentDigest(data)}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var dc map[string]diskEntry
 	if err := dec.Decode(&dc); err != nil {
 		var syntaxErr *json.SyntaxError
 		if errors.As(err, &syntaxErr) {
-			return nil, fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset)
+			return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset)}
 		}
-		return nil, fmt.Errorf("git-sync config %s is not valid: %w", path, err)
+		return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s is not valid: %w", path, err)}
 	}
 	// Reject anything after the first JSON value (a second value or trailing garbage), so a
 	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path)
+		return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path)}
 	}
 	hostKeys := make(map[string]string, len(dc))
 	for name, de := range dc {
 		if err := validateProviderName(name); err != nil {
-			return nil, fmt.Errorf("git-sync config %s: %w", path, err)
+			return nil, invalidConfig("git-sync config %s: %w", path, err)
 		}
 		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token)}
 		if err := e.Validate(); err != nil {
-			return nil, fmt.Errorf("provider %q is invalid: %w", name, err)
+			return nil, invalidConfig("provider %q is invalid: %w", name, err)
 		}
 		hk, err := canonicalHostKey(e.BaseURL)
 		if err != nil {
-			return nil, fmt.Errorf("provider %q is invalid: base_url %w", name, err)
+			return nil, invalidConfig("provider %q is invalid: base_url %w", name, err)
 		}
 		if other, ok := hostKeys[hk]; ok {
-			return nil, fmt.Errorf("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name)
+			return nil, invalidConfig("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name)
 		}
 		hostKeys[hk] = name
 		s.data[name] = e

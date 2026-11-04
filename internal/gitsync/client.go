@@ -85,6 +85,9 @@ type clientOptions struct {
 	drainTimeout    time.Duration
 	statusInterval  time.Duration
 	replicaHost     string // raw pin value; canonicalised by NewClient
+	// reloadSource, when set, replaces the provider file as what the live reload watches (tests).
+	reloadSource configSource
+	reloadFrom   digest
 }
 
 // defaultStatusInterval is the minimum spacing between statuses sent because syncs finished. Each
@@ -220,6 +223,9 @@ type Client struct {
 	connGen uint64
 	// probeCancel stops the origin probe now running, if any; see maybeProbe.
 	probeCancel context.CancelFunc
+	// reload watches the provider file for changes; nil when the providers were not loaded from a file.
+	reload        *reloader
+	reloadRunning atomic.Bool
 	// runCtx is the process-lifetime context Run was given, which bounds the syncs a reload starts.
 	runCtx context.Context
 
@@ -266,6 +272,15 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		replicaHost:    replicaHost,
 	}
 	c.providers = buildProviderSet(local, emptyProviders(), c.nextProviderGen)
+	switch {
+	case o.reloadSource != nil:
+		c.reload = newReloader(o.reloadSource, o.reloadFrom, c.setProviders)
+	case local != nil && local.path != "":
+		// What is in force is what was read from the file at startup, so the first poll finds nothing
+		// to do unless the file has changed since. A store that did not come from a file (and a nil
+		// one) has nothing to watch.
+		c.reload = newReloader(fileSource{local.path}, local.digest, c.setProviders)
+	}
 	defaults := DefaultLimits()
 	c.limits.Store(&defaults)
 	c.runs = c.runStore.load()
@@ -323,8 +338,39 @@ func (c *Client) Run(ctx context.Context) {
 	c.rememberRunCtx(ctx)
 	stop := c.sched.start(ctx)
 	defer stop()
+	defer c.startReload(ctx)()
 	c.startMirrorGC(ctx)
 	c.gw.Run(ctx)
+}
+
+// startReload starts the live reload of the provider configuration, if there is a file to watch and
+// it is not already running, and returns the function that stops it and waits for it to end. ctx is
+// the process-lifetime context: it is what the syncs a reload starts are bound to, as for the
+// scheduler's.
+func (c *Client) startReload(ctx context.Context) (stop func()) {
+	if c.reload == nil || !c.reloadRunning.CompareAndSwap(false, true) {
+		return func() {}
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.reload.run(loopCtx)
+	}()
+	return func() {
+		cancel()
+		<-done
+		c.reloadRunning.Store(false)
+	}
+}
+
+// Reload asks the connector to re-read the provider configuration now, without the settle delay a
+// change noticed by polling waits out. The daemon calls it on SIGHUP. It never blocks; the reload
+// happens on the watcher's goroutine, so it does nothing before Run or without a file to watch.
+func (c *Client) Reload() {
+	if c.reload != nil {
+		c.reload.requestReload()
+	}
 }
 
 // rememberRunCtx records the process-lifetime context (Run's, and the one the gateway hands

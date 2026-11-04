@@ -401,17 +401,59 @@ Each entry has `base_url` (required), `auth` (`bearer`, `basic`, or omitted for 
 outside the data volume, so `connector config set` cannot modify it: change it by updating the
 Secret. The mirrors stay on the data volume under `/data/mirrors`.
 
-**Changes need a restart.** git-sync reads its provider configuration once, at startup; there is
-no reload signal. After any change, including rotating or revoking a credential:
+### Reloading the provider configuration
 
-```bash
-docker restart mkonnect-gitsync                           # Docker
-kubectl rollout restart deployment/mkonnect-gitsync       # Kubernetes
-```
+git-sync watches the provider configuration while it runs, so adding a provider, rotating a
+credential, or revoking one takes effect within a few seconds without a restart.
 
-A restart also re-runs the check that the configured git servers are reachable. `connector status`
-lists the configured providers and the replica host the process sees in its environment; the state
-of enrollment and of each repository is shown in the Memento portal.
+- **How it notices.** Every 5 seconds git-sync reads the provider file and compares it with what it
+  loaded. A change is applied only after it has been seen twice, one second apart, so a file that is
+  still being written, or that is saved in several steps, is not applied half-way, and a file that
+  changes and changes back is not applied at all. On Kubernetes this covers a Secret mounted as a
+  volume, which the kubelet updates in place.
+- **Apply it now.** Send `SIGHUP` to the process to skip the wait:
+
+  ```bash
+  docker kill --signal=HUP mkonnect-gitsync                 # Docker
+  kubectl exec deploy/mkonnect-gitsync -- kill -HUP 1       # Kubernetes
+  ```
+
+  `SIGHUP` used to end the process; it now means "reload". The log says what happened either way.
+- **A provider is removed, or its credential changes.** A sync that is using it is stopped at
+  once (its git processes are killed) and what it had done is discarded: its result is never
+  reported or remembered, and nothing it fetched is pushed afterwards. If the credential changed,
+  the repository is synced again straight away with the new one. Syncs that use other providers
+  are not touched, and a change that leaves a provider as it was does nothing. A rotation that
+  happens more often than your longest sync takes starves that sync, because every rotation
+  restarts it.
+- **A provider is added.** Repositories that were reported as `origin_access_denied` with
+  `host not configured locally` start syncing; you do not need Memento to resend anything.
+  Repositories whose provider was removed report `origin_access_denied` with that same detail.
+- **The file cannot be used** (it is not valid, a value is rejected, it is unreadable or has an
+  unsafe mode). git-sync keeps using the last configuration that worked, for as long as it takes
+  you to fix the file, and logs one line saying that the file cannot be used and why, in a fixed
+  category (`invalid_json`, `invalid_configuration`, `unreadable`), once for each different
+  content. It never logs anything taken from the file. This is not reported to Memento; check the
+  log after an edit you expect to take effect.
+- **The file is deleted.** After the same short wait git-sync treats the configuration as empty:
+  every provider credential is revoked, running syncs are stopped, and every repository reports
+  `origin_access_denied` until the file is back. The log says so as an error. A mount that briefly
+  removes the file while it is replaced is covered by the wait.
+- **Only the provider configuration is reloaded.** The replica host pin (`GIT_SYNC_REPLICA_HOST`),
+  the registration token file, the signing key file and every other setting are read once at
+  startup, and changing them needs a restart:
+
+  ```bash
+  docker restart mkonnect-gitsync                           # Docker
+  kubectl rollout restart deployment/mkonnect-gitsync       # Kubernetes
+  ```
+
+While syncing is suspended for a critical update, a rotation still stops the syncs that use the old
+credential, but the repository is next synced when the suspension ends and its schedule falls due.
+
+Each reload that changes something re-runs the check that the configured git servers are reachable.
+`connector status` lists the configured providers and the replica host the process sees in its
+environment; the state of enrollment and of each repository is shown in the Memento portal.
 
 ## Verify
 
@@ -512,7 +554,7 @@ The platform sends no timer, so git-sync re-syncs every repository on its own sc
 - **Only repositories that can be synced are scheduled.** A repository whose host has no
   provider on your side (`origin_access_denied` with `host not configured locally`), or whose
   replica configuration is unusable, is reported but not synced at all until that changes (for
-  the first, add the provider and restart git-sync; for the second, the platform has to send a
+  the first, add the provider (git-sync picks it up without a restart); for the second, the platform has to send a
   corrected configuration).
 
 ### Concurrency
@@ -552,8 +594,10 @@ that attempt's result counts as usual. The backoff is held in memory only: resta
 resets it, and after a restart repositories are synced when the platform next sends the
 configuration. A sync cut short by shutdown counts as neither a success nor a failure.
 
-To retry sooner after you fix a cause, restart git-sync (a changed provider configuration needs
-that anyway) or ask Memento for an immediate sync.
+To retry sooner after you fix a cause, ask Memento for an immediate sync or restart git-sync. A
+credential you change in the provider configuration needs neither: git-sync syncs the repositories
+that use it again as soon as it has loaded the change (see
+[Reloading the provider configuration](#reloading-the-provider-configuration)).
 
 ### While syncing is suspended
 
@@ -794,13 +838,14 @@ your own logs and network for those.
 A failed sync is retried automatically, with a growing delay (see
 [Failures and backoff](#failures-and-backoff)); you do not need to restart git-sync to make it try
 again. The exceptions are the two kinds of repository that are never scheduled: one whose host is
-not configured locally, and one with an unusable replica configuration. After you fix a cause, an immediate sync from Memento, or a restart (once the platform has
+not configured locally (adding the provider is picked up without a restart and syncs it at once), and
+one with an unusable replica configuration. After you fix a cause, an immediate sync from Memento, or a restart (once the platform has
 sent the configuration again), retries at once instead of waiting out the delay. A later success
 clears the error.
 
 | Symptom or error type | Likely cause and fix |
 |---|---|
-| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry, then restart git-sync if you changed the provider configuration. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider and restart. |
+| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit. Test from the host that runs git-sync. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. |
 | `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
@@ -825,7 +870,7 @@ clears the error.
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |
 | A credential change did not take effect | The provider configuration is read at startup. Restart git-sync; see [Configure your git server credential](#configure-your-git-server-credential). |
-| `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret and restart, or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
+| `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret (git-sync reloads it without a restart), or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
 | Log warns that syncing needs git 2.31 or newer | The image does not contain a usable git. Use an official image for your release ID. |
 
 ### Rejected configuration (`config_error`)

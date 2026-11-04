@@ -35,7 +35,7 @@ func TestConfigSetPersistsAndListMasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if !strings.Contains(out, `Provider "origin" saved.`) || !strings.Contains(out, "restart it to apply") {
+	if !strings.Contains(out, `Provider "origin" saved.`) || !strings.Contains(out, "within a few seconds") {
 		t.Errorf("set output unexpected: %q", out)
 	}
 

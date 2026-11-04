@@ -147,3 +147,16 @@ func (c *Client) SetBeforeConfigInstallForTest(fn func()) {
 	c.beforeConfigInstall = fn
 	c.mu.Unlock()
 }
+
+// StartReloadForTest starts the live reload on its own, without a gateway connection, and returns the
+// function that stops it.
+func (c *Client) StartReloadForTest(ctx context.Context) (stop func()) {
+	c.rememberRunCtx(ctx)
+	return c.startReload(ctx)
+}
+
+// SetReloadTimingForTest changes the reload's poll and settle intervals; call it before the reload
+// starts.
+func (c *Client) SetReloadTimingForTest(poll, settle time.Duration) {
+	c.reload.poll, c.reload.settle = poll, settle
+}

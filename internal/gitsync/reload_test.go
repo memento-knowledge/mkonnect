@@ -197,6 +197,14 @@ func waitProcessGone(t *testing.T, what string, pid int) {
 // newReloadClient builds a client that runs the real git runner against whatever git is first on PATH.
 func newReloadClient(t *testing.T, providers string, p gitsync.OriginProber, opts ...gitsync.Option) *gitsync.Client {
 	t.Helper()
+	c, _ := newFileClient(t, providers, p, opts...)
+	return c
+}
+
+// newFileClient is newReloadClient that also returns the path of the provider file the client was
+// started from, which the live reload watches.
+func newFileClient(t *testing.T, providers string, p gitsync.OriginProber, opts ...gitsync.Option) (*gitsync.Client, string) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "git-sync.json")
 	if providers != "" {
 		if err := os.WriteFile(path, []byte(providers), 0o600); err != nil {
@@ -215,7 +223,7 @@ func newReloadClient(t *testing.T, providers string, p gitsync.OriginProber, opt
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
 	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, fixedNow, "boot-test", append(defaults, opts...)...)
 	t.Cleanup(func() { waitForSyncsToStop(t, c) })
-	return c
+	return c, path
 }
 
 func configureRepo(c *gitsync.Client, s *stubSender, id, origin string) {
@@ -622,5 +630,53 @@ func TestReloadBetweenValidatingAndInstallingAConfigLeavesNoStaleBinding(t *test
 	time.Sleep(50 * time.Millisecond)
 	if n := g.count("fetch"); n != 0 {
 		t.Errorf("%d fetches for a repository whose provider no longer exists", n)
+	}
+}
+
+// What the last attempt reported was said about a credential that is no longer in force: after a
+// rotation the repository starts over (pending) instead of showing the old failure, even when nothing
+// can sync it yet.
+func TestRotationResetsTheOutcomeOfTheOldCredential(t *testing.T) {
+	g := &scriptedGit{fail: map[string][]byte{"fetch": []byte("fatal: unable to access 'https://git.example.com/x/': The requested URL returned error: 403")}}
+	c := newTestClientOpts(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}),
+		&fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	s := &stubSender{}
+	configureRepo(c, s, "repo-a", "https://git.example.com/team/a.git")
+	waitFor(t, func() bool {
+		_ = c.OnHeartbeat(context.Background(), s)
+		return repoStatusNow(t, s, "repo-a").ErrorType == gitsync.ErrOriginAccessDenied
+	})
+	waitForSyncsToStop(t, c)
+
+	c.SetCriticalPatchForTest(true) // the rotation's own sync is held back
+	c.SetProvidersForTest(storeOf(t, providersJSON([3]string{"origin", "git.example.com", tokenTwo})))
+	_ = c.OnHeartbeat(context.Background(), s)
+	if st := repoStatusNow(t, s, "repo-a"); st.State != gitsync.StatePending || st.ErrorType != "" {
+		t.Errorf("status = %+v, want pending: the failure belongs to the credential that was replaced", st)
+	}
+}
+
+// A change that leaves every credential as it was (here, the path of a base URL) cancels and reruns
+// nothing, but the origin is checked again because the check dials that URL.
+func TestBaseURLPathChangeReprobesButCancelsNothing(t *testing.T) {
+	g := &scriptedGit{gate: make(chan struct{})}
+	p := &fakeProber{result: gitsync.OriginReachable}
+	c := newTestClientOpts(t, providersJSON([3]string{"origin", "git.example.com", tokenOne}), p, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	waitFor(t, func() bool { return latestOriginCheck(s.messages()) != nil })
+	waitFor(t, func() bool { return !c.ProbeInFlightForTest() })
+	configureRepo(c, s, "repo-a", "https://git.example.com/team/a.git")
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
+
+	c.SetProvidersForTest(storeOf(t, `{"origin":{"base_url":"https://git.example.com/team/","auth":"bearer","token":"`+tokenOne+`"}}`))
+
+	waitFor(t, func() bool { return p.calls.Load() == 2 })
+	if n := c.AttemptsForTest(); n != 1 {
+		t.Errorf("%d attempts, want the running sync left alone", n)
+	}
+	if n := g.count("fetch"); n != 1 {
+		t.Errorf("%d fetches, want 1", n)
 	}
 }

@@ -4,7 +4,7 @@
 // internal/gateway, which this package drives — exactly as the API connector in internal/ws does.
 //
 // The local credential surface here is intentionally minimal — full credential hardening (at-rest
-// protection, live reload) is future work.
+// protection) is future work. The provider configuration is reloaded while the daemon runs; see reload.go.
 package gitsync
 
 import (

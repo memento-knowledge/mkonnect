@@ -235,13 +235,12 @@ func maskedAuth(e gitsync.LocalEntry) string {
 	return "(none)"
 }
 
-// printReloadReminder tells the operator how to apply a change. The git-sync daemon reads its
-// configuration at startup (there is no SIGHUP reload), so a change is applied by restarting.
+// printReloadReminder tells the operator how a change is applied. The running daemon watches the
+// file, so no restart is needed; SIGHUP skips the few seconds it takes to notice.
 func printReloadReminder(w io.Writer) {
 	fmt.Fprint(w, `
-The git-sync connector reads its configuration at startup; restart it to apply this change:
-  Docker:      docker restart <container>
-  Kubernetes:  kubectl rollout restart deployment/mkonnect-gitsync
-A restart also re-runs the origin reachability check.
+A running git-sync connector picks up this change within a few seconds; it needs no restart. To apply it at once:
+  Docker:      docker kill --signal=HUP <container>
+  Kubernetes:  kubectl exec deploy/mkonnect-gitsync -- kill -HUP 1
 `)
 }
