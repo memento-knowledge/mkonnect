@@ -73,9 +73,11 @@ func New(path string) (*Store, error) {
 	// should watch (including one that does not exist yet).
 	usesTokenFile := false
 	for _, name := range names {
-		if tf := dc[name].TokenFile; tf != "" {
+		// Any token_file key counts, even an empty one: that config is rejected below, and until then it
+		// must be held to the stricter owner rule.
+		if de := dc[name]; de.TokenFile != nil {
 			usesTokenFile = true
-			if validateTokenFilePath(tf) == nil {
+			if tf := *de.TokenFile; validateTokenFilePath(tf) == nil {
 				sources.add(Source{Path: tf})
 			}
 		}
@@ -97,8 +99,8 @@ func New(path string) (*Store, error) {
 		if err := validateProviderName(name); err != nil {
 			return fail(fmt.Errorf("git-sync config %s: %w", path, err))
 		}
-		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token), TokenFile: de.TokenFile}
-		if err := validateCredentialSource(e); err != nil {
+		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(strVal(de.Token)), TokenFile: strVal(de.TokenFile)}
+		if err := validateCredentialSource(de); err != nil {
 			return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
 		}
 		if err := e.validateSettings(); err != nil {
@@ -155,16 +157,20 @@ func New(path string) (*Store, error) {
 
 // validateCredentialSource checks, on a provider as written in the config file, that its credential
 // comes from exactly one place: with an authentication mode, one of token and token_file (never
-// both). It also checks the token_file path, which is printed in messages.
-func validateCredentialSource(e LocalEntry) error {
-	hasToken, hasFile := e.Token.Reveal() != "", e.TokenFile != ""
+// both). It goes by which keys are present, not by whether they hold a value, so that an explicitly
+// empty token_file is an error and cannot pass as an absent one. It also checks the token_file path,
+// which is printed in messages.
+func validateCredentialSource(de diskEntry) error {
+	hasToken, hasFile := de.Token != nil, de.TokenFile != nil
 	switch {
 	case hasToken && hasFile:
 		return errors.New("set only one of token and token_file")
-	case e.Auth != "" && !hasToken && !hasFile:
-		return errors.New("an authentication mode requires a token or a token_file")
+	case hasFile && *de.TokenFile == "":
+		return errors.New("token_file must not be empty")
 	case hasFile:
-		return validateTokenFilePath(e.TokenFile)
+		return validateTokenFilePath(*de.TokenFile)
+	case de.Auth != "" && !hasToken:
+		return errors.New("an authentication mode requires a token or a token_file")
 	}
 	return nil
 }
@@ -295,9 +301,9 @@ func (s *Store) save(data map[string]LocalEntry) error {
 	for name, e := range data {
 		de := diskEntry{BaseURL: e.BaseURL, Auth: e.Auth, Username: e.Username}
 		if e.TokenFile != "" {
-			de.TokenFile = e.TokenFile
+			de.TokenFile = strPtr(e.TokenFile)
 		} else {
-			de.Token = e.Token.Reveal()
+			de.Token = strPtr(e.Token.Reveal())
 		}
 		dc[name] = de
 	}

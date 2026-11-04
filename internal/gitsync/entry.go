@@ -103,10 +103,30 @@ func (e LocalEntry) validateToken() error {
 // diskEntry is the on-disk JSON shape. Token is a plain string here (written via Secret.Reveal),
 // so the file holds the real value; the in-memory LocalEntry keeps the self-redacting Secret. Never
 // format a diskEntry: it holds the plain token.
+//
+// Token and TokenFile are pointers so that a key written with an empty value ("token_file": "") is
+// distinguishable from an absent key: an explicit empty value must be rejected, not read as "no
+// credential". A JSON null reads as absent. When writing, a field is set only if it has a value.
 type diskEntry struct {
-	BaseURL   string `json:"base_url"`
-	Auth      string `json:"auth,omitempty"`
-	Username  string `json:"username,omitempty"`
-	Token     string `json:"token,omitempty"`
-	TokenFile string `json:"token_file,omitempty"`
+	BaseURL   string  `json:"base_url"`
+	Auth      string  `json:"auth,omitempty"`
+	Username  string  `json:"username,omitempty"`
+	Token     *string `json:"token,omitempty"`
+	TokenFile *string `json:"token_file,omitempty"`
+}
+
+// strVal returns the string a presence-tracking field holds, or "" when the key was absent.
+func strVal(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// strPtr returns a pointer to s, or nil for "" so that an empty field is omitted when written.
+func strPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

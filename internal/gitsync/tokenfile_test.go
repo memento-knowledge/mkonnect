@@ -327,6 +327,14 @@ func TestNewTokenFileSettingErrors(t *testing.T) {
 		{"both token and token_file", entry(`"auth": "bearer", "token": "` + tokenSentinel + `-inline", "token_file": "` + good + `"`), "only one of token and token_file", ""},
 		{"neither with an auth mode", entry(`"auth": "bearer"`), "requires a token or a token_file", ""},
 		{"token_file without an auth mode", entry(`"token_file": "` + good + `"`), "credentials require an authentication mode", ""},
+		// A key that is present counts as present, whatever it holds: an explicitly empty value must
+		// not be read as an absent one.
+		{"empty token_file without an auth mode", entry(`"token_file": ""`), "token_file must not be empty", ""},
+		{"empty token_file with an auth mode", entry(`"auth": "bearer", "token_file": ""`), "token_file must not be empty", ""},
+		{"empty token_file next to an inline token", entry(`"auth": "bearer", "token": "` + tokenSentinel + `-inline", "token_file": ""`), "only one of token and token_file", ""},
+		{"empty token next to a token_file", entry(`"auth": "bearer", "token": "", "token_file": "` + good + `"`), "only one of token and token_file", ""},
+		{"empty token_file next to an empty token", entry(`"auth": "bearer", "token": "", "token_file": ""`), "only one of token and token_file", ""},
+		{"null token_file is absent, so an auth mode has no credential", entry(`"auth": "bearer", "token_file": null`), "requires a token or a token_file", ""},
 		{"relative path", entry(`"auth": "bearer", "token_file": "secrets/token"`), "must be an absolute path", ""},
 		{"path with a control character", entry(`"auth": "bearer", "token_file": "/run/x\ny"`), "control or invisible", ""},
 		{"path with an invisible character", entry(`"auth": "bearer", "token_file": "/run/x\u200by"`), "control or invisible", ""},
@@ -692,5 +700,25 @@ func TestSourcesAfterWritesDropUnreferencedTokenFiles(t *testing.T) {
 		if src.Path == tfA || src.Path == tfB {
 			t.Errorf("%v is no longer referenced but is still listed", src)
 		}
+	}
+}
+
+// A JSON null reads as an absent key, so it is accepted exactly where leaving the key out is.
+func TestNewNullTokenFileIsAbsent(t *testing.T) {
+	s, err := gitsync.New(writeConfig(t, `{"p": {"base_url": "https://git.example.test/", "token_file": null, "token": null}}`))
+	if err != nil {
+		t.Fatalf("null credentials on an unauthenticated provider: %v", err)
+	}
+	if e, ok := s.Get("p"); !ok || e.TokenFile != "" || e.Token.Reveal() != "" {
+		t.Errorf("entry = %+v", e)
+	}
+}
+
+// A config that carries a token_file key, even an empty one, is held to the stricter owner rule.
+func TestNewEmptyTokenFileInAForeignOwnedConfigIsRejectedForItsOwner(t *testing.T) {
+	defer gitsync.SetOwnerForTest(func(string) (int, bool) { return 1001, true }, 4242)()
+	_, err := gitsync.New(writeConfig(t, `{"p": {"base_url": "https://git.example.test/", "token_file": ""}}`))
+	if err == nil || !strings.Contains(err.Error(), "owned by another user") {
+		t.Fatalf("got %v", err)
 	}
 }
