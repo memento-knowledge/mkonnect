@@ -194,6 +194,8 @@ grep -q "registration-token: \"$(printf %s s3cret-value | base64)\"" <<<"$sec" |
 out=$(render "${enabled[@]}" --set gitSync.config.registrationToken=s3cret-value \
   --set gitSync.config.registrationTokenSecret.name=my-token --set gitSync.config.registrationTokenSecret.key=tok)
 grep -q 'secretName: "my-token"' <<<"$out" || fail "referenced token Secret not mounted"
+vol=$(awk '/^        - name: registration-token$/{f=1} f{print} f&&/path:/{exit}' <<<"$out")
+grep -q 'defaultMode: 0440' <<<"$vol" || fail "referenced token Secret defaultMode is not 0440"
 grep -q 'value: "/etc/mkonnect-gitsync/registration-token/tok"' <<<"$out" || fail "token file path ignores registrationTokenSecret.key"
 if grep -q 't-mkonnect-gitsync-registration' <<<"$out"; then fail "chart-managed token Secret created alongside a referenced one"; fi
 

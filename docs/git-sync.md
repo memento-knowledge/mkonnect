@@ -84,8 +84,12 @@ Run git-sync as a second container, with its **own** volumes. Do not reuse the A
 volume. The container is started read-only with no Linux capabilities, and with a separate
 disk-backed volume for scratch space at `/tmp`.
 
-Keep the one-time registration token in a file inside an owner-only directory outside your
-checkout rather than in your shell history. Run this snippet from Bash or Zsh:
+The one-time registration token is kept in a small Docker volume, `gitsync-secrets`, instead of on
+the host file system or in an environment variable. git-sync reads it from a file and refuses a
+token file that others can access, so the file must be owned by the container user (uid 65532)
+with owner-only permissions. The steps below create it that way without needing root on the host:
+a one-off container writes the token from standard input, so it never appears on a command line
+or in your shell history. Run this snippet from Bash or Zsh:
 
 ```bash
 umask 077
@@ -103,14 +107,17 @@ EOF
 # Used only for the first start; removed once the portal shows the connector as connected.
 printf 'REGISTRATION_TOKEN_FILE=/run/secrets/registration-token\n' > "$gitsync_dir/registration.env"
 
+# Store the token in a volume, as a file owned by uid 65532 with mode 0600. The first container
+# makes the (empty) volume writable for that user; the second writes the token as that user.
+docker volume create gitsync-secrets
+docker run --rm -v gitsync-secrets:/secrets alpine \
+  sh -c 'chown 65532:65532 /secrets && chmod 700 /secrets'
 printf 'Paste registration token: ' >&2
 IFS= read -r -s GITSYNC_TOKEN
 printf '\n' >&2
-printf %s "$GITSYNC_TOKEN" > "$gitsync_dir/registration.token"
+printf %s "$GITSYNC_TOKEN" | docker run --rm -i --user 65532:65532 -v gitsync-secrets:/secrets alpine \
+  sh -c 'umask 077; cat > /secrets/registration-token'
 unset GITSYNC_TOKEN
-# The container runs as uid 65532 and must be able to read the file. The directory above is
-# owner-only (0700), so other users on the host cannot reach it.
-chmod 644 "$gitsync_dir/registration.token"
 
 docker volume create gitsync-data
 docker volume create gitsync-tmp
@@ -119,7 +126,7 @@ docker run -d --name mkonnect-gitsync --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   -v gitsync-data:/data \
   -v gitsync-tmp:/tmp \
-  --mount "type=bind,source=$gitsync_dir/registration.token,target=/run/secrets/registration-token,readonly" \
+  -v gitsync-secrets:/run/secrets:ro \
   --env-file "$gitsync_dir/gitsync.env" \
   --env-file "$gitsync_dir/registration.env" \
   public.ecr.aws/h2a8k0r3/memento-gitsync:<release-id>
@@ -131,7 +138,10 @@ Notes:
   (`/data/git-sync.json`), and the mirrors (`/data/mirrors`) live. Removing it deletes all three.
 - `gitsync-tmp` is scratch space only and can be recreated at any time. Docker does not cap the
   size of a volume, so make sure the host has room for it.
-- Keep `gitsync-data` and `gitsync-tmp` separate from the API connector's `mkonnect-data` volume.
+- Keep `gitsync-data`, `gitsync-tmp`, and `gitsync-secrets` separate from the API connector's
+  `mkonnect-data` volume.
+- `gitsync-secrets` is mounted read-only (`:ro`). The one-off `alpine` containers only prepare it;
+  any small image with a shell works.
 - If your git server is on the Docker host or a sibling container, the same networking rules as for
   the API connector apply; see [Reaching a tool from Docker](setup.md#reaching-a-tool-from-docker).
 - To go through an HTTP proxy, add `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` to `gitsync.env`;
@@ -337,14 +347,17 @@ If a repository shows an error, see [Troubleshooting](#troubleshooting).
 ## Remove the registration token
 
 Only remove the registration token after the portal shows the connector as **connected**. Until
-then keep the owner-only file so a failed first start can be retried.
+then keep the token (the `gitsync-secrets` volume, or the Kubernetes Secret) so a failed first
+start can be retried.
 
-**Docker:** recreate the container without the token file and without `registration.env`. The key
-is on `gitsync-data`, so the new container reconnects without registering again:
+**Docker:** recreate the container without the token volume and without `registration.env`, then
+delete the volume. The two go together: if `REGISTRATION_TOKEN_FILE` is set, the file must exist
+and be readable only by its owner and group, so either keep both or remove both. The key is on
+`gitsync-data`, so the new container reconnects without registering again:
 
 ```bash
 gitsync_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"
-rm "$gitsync_dir/registration.env" "$gitsync_dir/registration.token"
+rm "$gitsync_dir/registration.env"
 docker rm -f mkonnect-gitsync
 docker run -d --name mkonnect-gitsync --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
@@ -352,6 +365,7 @@ docker run -d --name mkonnect-gitsync --restart unless-stopped \
   -v gitsync-tmp:/tmp \
   --env-file "$gitsync_dir/gitsync.env" \
   public.ecr.aws/h2a8k0r3/memento-gitsync:<release-id>
+docker volume rm gitsync-secrets
 ```
 
 **Kubernetes:** stop mounting it and delete the Secret:
