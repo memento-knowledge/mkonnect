@@ -51,7 +51,7 @@ Open the Memento portal, go to **Integrations → On-Prem Connector**, and note:
 |---|---|---|
 | Gateway URL | `GATEWAY_URL` | Copy it **exactly** from the portal; do not construct it from an example URL. |
 | Connector ID | `CONNECTOR_ID` | a UUID identifying this connector |
-| Registration token | `REGISTRATION_TOKEN` | **one-time**, expires in 24h — used only on first start |
+| Registration token | `REGISTRATION_TOKEN` (or `REGISTRATION_TOKEN_FILE`, a path to a file holding it) | **one-time**, expires in 24h — used only on first start |
 | Release ID / chart version | image tag / `--version` | pin an explicit version; never a moving tag |
 
 The registration token is a one-time secret. It is consumed on first startup; after that the

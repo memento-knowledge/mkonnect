@@ -99,6 +99,7 @@ Runtime configuration comes from environment variables (internal-tool credential
 | `GATEWAY_URL` | yes | Secure WebSocket URL of the Bridge Gateway. Copy it exactly from the Memento portal; it must use `wss://`. |
 | `CONNECTOR_ID` | yes | Stable UUID identifying this connector instance. |
 | `REGISTRATION_TOKEN` | first run only | One-time token used to register a new connector. Not needed after the private key has been issued and persisted. |
+| `REGISTRATION_TOKEN_FILE` | no | Absolute path to a file containing the registration token, as an alternative to `REGISTRATION_TOKEN` (for example a mounted Kubernetes `Secret`). When set, the file is used and `REGISTRATION_TOKEN` is ignored; if the file cannot be read the connector exits with an error instead of falling back. The file must be a regular file of at most 4 KiB, not accessible by "other" and not writable by group (group read is allowed); a single trailing newline is removed. |
 | `KEY_FILE` | no | Path to the ML-DSA-65 private key file. Defaults to `~/.mkonnect/key`. |
 | `PROTOCOL_VERSION` | no | Wire protocol version to negotiate. Defaults to `v1`. |
 | `CREDS_FILE` | no | Path to the local credential store written by `connector config set`. Defaults to `/data/credentials.json`. |
