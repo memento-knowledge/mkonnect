@@ -24,8 +24,12 @@ type schedHarness struct {
 	busy      map[string]bool // repos the manager would report as already syncing
 	refuse    map[string]bool // repos the manager would not start (not resolvable)
 	enqueued  []string
+	ctxs      []context.Context // the context each dispatch was given
 	suspended bool
-	limits    Limits
+	// enqueueGate, when set, makes enqueue block until it is closed, after signalling entered.
+	enqueueGate chan struct{}
+	entered     chan struct{}
+	limits      Limits
 }
 
 func newSchedHarness(t *testing.T) *schedHarness {
@@ -48,13 +52,21 @@ func newSchedHarness(t *testing.T) *schedHarness {
 			}
 			return out
 		},
-		enqueue: func(_ context.Context, id string) bool {
+		enqueue: func(ctx context.Context, id string) bool {
+			h.mu.Lock()
+			gate, entered := h.enqueueGate, h.entered
+			h.mu.Unlock()
+			if gate != nil {
+				entered <- struct{}{}
+				<-gate
+			}
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			if h.busy[id] || h.refuse[id] {
 				return false
 			}
 			h.enqueued = append(h.enqueued, id)
+			h.ctxs = append(h.ctxs, ctx)
 			return true
 		},
 		suspended: func() bool { h.mu.Lock(); defer h.mu.Unlock(); return h.suspended },
@@ -135,7 +147,7 @@ func (h *schedHarness) due(id string) time.Time {
 	return d
 }
 
-// since returns how long after the current time id is next due.
+// dueIn returns how long after the current time id is next due.
 func (h *schedHarness) dueIn(id string) time.Duration {
 	h.t.Helper()
 	return h.due(id).Sub(h.currentTime())
@@ -257,7 +269,7 @@ func TestSchedulerFirstSuccessKeepsTheStagger(t *testing.T) {
 	h.setRand(justBelowOne)
 	h.complete("repo-a", okResult())
 	got := h.dueIn("repo-a")
-	if got < 15*time.Minute || got >= 17*time.Minute || got < 16*time.Minute+59*time.Second {
+	if got < 16*time.Minute+59*time.Second || got >= 17*time.Minute {
 		t.Errorf("next due in %v after the first success, want the top of [15m, 17m)", got)
 	}
 }
@@ -485,6 +497,7 @@ func TestSchedulerIgnoresResultsThatAreNotForTheCurrentTarget(t *testing.T) {
 	h.setRand(0)
 	h.configure("repo-a")
 	due := h.due("repo-a")
+	h.advance(time.Minute) // a result wrongly counted would move the due time off its original value
 
 	h.complete("repo-a", syncResult{State: StatePending}) // cancelled: nothing happened
 	h.s.completed("repo-a", syncTask{RepoID: "repo-a", CanonicalURL: key("repo-a").canonicalURL, ReplicaURL: "https://replica.example.com/stale.git"}, failResult(ErrOriginAccessDenied))
@@ -528,6 +541,10 @@ func TestSchedulerSpreadsOverdueRepositoriesAfterSuspension(t *testing.T) {
 	h.setRand(0)
 	ids := []string{"repo-a", "repo-b", "repo-c", "repo-d"}
 	h.configure(ids...)
+	// repo-e is configured so that it falls due 30s after the gate lifts: not overdue, so it must
+	// keep its own due time rather than be held back with the others.
+	h.setNow(schedT0.Add(48*time.Hour - 14*time.Minute - 30*time.Second))
+	h.configure(append(ids, "repo-e")...)
 	h.setSuspended(true)
 	h.setNow(schedT0.Add(48 * time.Hour))
 	h.poll()
@@ -536,7 +553,7 @@ func TestSchedulerSpreadsOverdueRepositoriesAfterSuspension(t *testing.T) {
 	// A different draw per repository, as production would give; the overdue repositories are
 	// restaggered, in repo_id order, before any is dispatched.
 	i := 0
-	draws := []float64{0, 0.25, 0.5, justBelowOne}
+	draws := []float64{0, 0.25, 0.5, justBelowOne, justBelowOne}
 	h.s.hooks.rand = func() float64 { v := draws[i%len(draws)]; i++; return v }
 	h.poll()
 
@@ -551,10 +568,15 @@ func TestSchedulerSpreadsOverdueRepositoriesAfterSuspension(t *testing.T) {
 	if got := h.dueIn("repo-d"); got < 119*time.Second || got >= 2*time.Minute {
 		t.Errorf("repo-d is due in %v after resume, want just under 2m", got)
 	}
+	h.advance(30 * time.Second)
+	h.poll()
+	if got := h.dispatched(); !slices.Equal(got, []string{"repo-a", "repo-b", "repo-e"}) {
+		t.Errorf("30s after resume dispatched %v, want repo-b (its spread offset) and repo-e (its own due time) too", got)
+	}
 	h.advance(2 * time.Minute)
 	h.poll()
-	if got := h.dispatched(); len(got) != len(ids) {
-		t.Errorf("after the spread window dispatched %v, want all %d repositories", got, len(ids))
+	if got := h.dispatched(); len(got) != 5 {
+		t.Errorf("after the spread window dispatched %v, want all 5 repositories", got)
 	}
 }
 
@@ -641,7 +663,7 @@ func TestSchedulerDispatchesInRepoIDOrder(t *testing.T) {
 	}
 }
 
-func TestSchedulerStopWaitsForTheLoopAndIsIdempotent(t *testing.T) {
+func TestSchedulerStopIsIdempotentAndEndsDispatching(t *testing.T) {
 	h := newSchedHarness(t)
 	h.setRand(0)
 	h.configure("repo-a")
@@ -658,6 +680,57 @@ func TestSchedulerStopWaitsForTheLoopAndIsIdempotent(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if got := len(h.dispatched()); got != n {
 		t.Errorf("the scheduler kept dispatching after stop: %d -> %d", n, got)
+	}
+}
+
+// stop must not return while a tick is still running: Run relies on that to guarantee that nothing
+// the scheduler does outlives it.
+func TestSchedulerStopWaitsForARunningTick(t *testing.T) {
+	h := newSchedHarness(t)
+	h.setRand(0)
+	h.configure("repo-a")
+	h.setNow(schedT0.Add(time.Hour))
+	h.s.tick = time.Millisecond
+	h.mu.Lock()
+	h.enqueueGate, h.entered = make(chan struct{}), make(chan struct{}, 1)
+	gate, entered := h.enqueueGate, h.entered
+	h.mu.Unlock()
+
+	stop := h.s.start(context.Background())
+	<-entered // a tick is inside enqueue
+	stopped := make(chan struct{})
+	go func() { stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatal("stop returned while a tick was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gate)
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stop did not return once the tick finished")
+	}
+}
+
+// The syncs the scheduler starts are bounded by the process-lifetime context it was started with,
+// like the ones a configuration starts: stopping the loop must not cancel them (nor a config rerun
+// folded into them).
+func TestSchedulerStoppingTheLoopDoesNotCancelTheSyncsItStarted(t *testing.T) {
+	h := newSchedHarness(t)
+	h.setRand(0)
+	h.configure("repo-a")
+	h.setNow(schedT0.Add(time.Hour))
+	h.s.tick = time.Millisecond
+
+	stop := h.s.start(context.Background())
+	eventually(t, func() bool { return len(h.dispatched()) == 1 })
+	stop()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.ctxs[0].Err(); err != nil {
+		t.Errorf("the context of a scheduled sync is done after stop: %v", err)
 	}
 }
 

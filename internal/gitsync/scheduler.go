@@ -21,7 +21,7 @@ const (
 	maxStagger = 2 * time.Minute
 
 	// backoffCap is how far consecutive failures stretch the delay: it doubles per failure up to this,
-	// and never drops below the interval.
+	// and never drops below the interval. The jitter added on top (see delay) can lengthen it by 20%.
 	backoffCap = time.Hour
 )
 
@@ -108,7 +108,8 @@ func newScheduler(h schedHooks) *scheduler {
 
 // start runs the scheduling loop until ctx is cancelled or the returned stop is called. stop waits
 // for the loop to exit and is safe to call more than once. ctx is the process-lifetime context: it
-// also bounds the syncs the scheduler starts, exactly as for the ones a configuration starts.
+// also bounds the syncs the scheduler starts, exactly as for the ones a configuration starts, so
+// stopping the loop does not cancel a sync already running.
 func (s *scheduler) start(ctx context.Context) (stop func()) {
 	loopCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -121,7 +122,7 @@ func (s *scheduler) start(ctx context.Context) (stop func()) {
 			case <-loopCtx.Done():
 				return
 			case <-t.C:
-				s.poll(loopCtx)
+				s.poll(ctx)
 			}
 		}
 	}()

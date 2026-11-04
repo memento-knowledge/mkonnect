@@ -215,10 +215,17 @@ func TestClientScheduledSyncRunsWhenDueAndNotWhileSuspended(t *testing.T) {
 		t.Fatalf("a sync started while a critical update is required (fetches=%d)", e.fetches.Load())
 	}
 
+	// Start the scheduled sync and hold it in flight.
+	gate := e.holdSyncs()
 	e.c.criticalPatchRequired.Store(false)
 	e.c.sched.poll(e.ctx)
-	e.c.sched.poll(e.ctx) // the repository is syncing now: this tick must not queue a rerun
 	eventually(t, func() bool { return e.fetches.Load() == 2 })
+
+	// While it runs the repository falls due again; the scheduler must skip it, leaving no rerun.
+	e.clock.advance(4 * time.Hour)
+	e.c.sched.poll(e.ctx)
+	close(gate)
+	e.gate.Store(nil)
 	e.settle(t)
 	time.Sleep(20 * time.Millisecond)
 	if n := e.fetches.Load(); n != 2 {
