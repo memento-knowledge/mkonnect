@@ -80,7 +80,9 @@ func TestResolveLimitsAppliesEveryField(t *testing.T) {
 }
 
 // TestResolveLimitsPartialKeepsOtherDefaults pins that supplying one field leaves the rest at their
-// defaults, and that an explicit zero is applied rather than treated as absent.
+// defaults, and that explicit zeros (valid for several fields) are accepted rather than rejected. The
+// absent-versus-zero distinction itself is pinned at the wire level in the proto tests, because every
+// zero-allowed field also defaults to 0.
 func TestResolveLimitsPartialKeepsOtherDefaults(t *testing.T) {
 	got, err := ResolveLimits(nil, &proto.GitSyncLimits{MaxConcurrency: intp(8)})
 	if err != nil {

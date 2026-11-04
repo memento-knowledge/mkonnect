@@ -81,7 +81,8 @@ type GitSyncSchedule struct {
 // every name below is the connector's guess. Each field is a pointer so that nil (absent) can mean
 // "use the built-in default", which is distinct from an explicit 0 where 0 is itself meaningful
 // (for example "unbatched" or "no ceiling"). The connector rejects the whole configuration, rather
-// than clamping, if any supplied value is out of range.
+// than clamping, if any supplied value is out of range. The accepted ranges quoted below are
+// enforced, and defined authoritatively, by gitsync.ResolveLimits.
 type GitSyncLimits struct {
 	// MaxConcurrency is how many repositories sync at once; accepted 1 through 32.
 	MaxConcurrency *int `json:"max_concurrency,omitempty"`
@@ -170,11 +171,13 @@ const (
 	GitSyncConfigErrInvalidRepoID = "invalid_repo_id"
 	// GitSyncConfigErrDuplicateRepoID: two entries carried the same repo_id.
 	GitSyncConfigErrDuplicateRepoID = "duplicate_repo_id"
-	// GitSyncConfigErrInvalidConfigVersion: config_version was absent or not a JSON scalar.
+	// GitSyncConfigErrInvalidConfigVersion: config_version was not a JSON scalar or exceeded the
+	// connector's size cap.
 	GitSyncConfigErrInvalidConfigVersion = "invalid_config_version"
 	// GitSyncConfigErrLimitsOutOfRange: a schedule or limits value was outside its accepted range.
 	GitSyncConfigErrLimitsOutOfRange = "limits_out_of_range"
-	// GitSyncConfigErrMalformedMessage: the message could not be decoded at all.
+	// GitSyncConfigErrMalformedMessage: the message could not be decoded, or a required field was
+	// missing or of the wrong type.
 	GitSyncConfigErrMalformedMessage = "malformed_message"
 )
 
@@ -215,14 +218,16 @@ type GitSyncRepoStatus struct {
 	// until the first success (deliberately not omitempty, so the platform can tell "never
 	// succeeded" from "field not supported"). INFERRED.
 	LastSuccessAt *string `json:"last_success_at"`
-	// DurationMS is how long the most recent attempt took, in milliseconds; omitted until an attempt
-	// has finished. INFERRED.
+	// DurationMS is how long the most recently FINISHED attempt took, in milliseconds; omitted until
+	// an attempt has finished. While a re-sync is in flight, LastAttemptAt names that attempt but
+	// this and the two fields below still describe the previous finished one. INFERRED.
 	DurationMS *int64 `json:"duration_ms,omitempty"`
-	// RefsPushed is how many refs the most recent attempt pushed; omitted until an attempt has
-	// finished. Zero is a valid value (nothing changed), which is why this is a pointer. INFERRED.
+	// RefsPushed is how many refs the most recently finished attempt pushed; omitted until an
+	// attempt has finished. Zero is a valid value (nothing changed), which is why this is a pointer.
+	// INFERRED.
 	RefsPushed *int `json:"refs_pushed,omitempty"`
-	// NewestOriginCommitAt is the committer time of the newest commit seen at the origin on the
-	// most recent attempt (RFC3339 UTC); omitted while unknown. INFERRED.
+	// NewestOriginCommitAt is the committer time of the newest commit seen at the origin by the
+	// most recently finished attempt (RFC3339 UTC); omitted while unknown. INFERRED.
 	NewestOriginCommitAt *string `json:"newest_origin_commit_at,omitempty"`
 	// ErrorType is a typed failure code when State is "error"; omitted otherwise.
 	ErrorType string `json:"error_type,omitempty"`
