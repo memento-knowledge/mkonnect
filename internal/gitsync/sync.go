@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	// defaultFetchTimeout and defaultPushTimeout bound a single clone/fetch and a single push, so a
-	// wedged connection cannot hold a sync slot forever. They are generous because the first clone
+	// defaultFetchTimeout and defaultPushTimeout bound a single fetch and a single push, so a
+	// wedged connection cannot hold a sync slot forever. They are generous because the first fetch
 	// of a large repository is legitimately slow. They are not yet configurable per deployment.
 	defaultFetchTimeout = 30 * time.Minute
 	defaultPushTimeout  = 30 * time.Minute
@@ -22,16 +22,20 @@ const (
 	replicaAuth = "bearer"
 )
 
-// fetchRefspec updates every ref from the origin (what `clone --mirror` fetched), pruning refs the
-// origin has deleted. pushRefspecs sends only branches and tags to the replica: other namespaces an
-// origin may carry (for example refs/pull/*) are hidden refs that forges refuse, and the contract
-// is "all branches and tags".
-const fetchRefspec = "+refs/*:refs/*"
+// mirrorRefspecs are the only refs the local mirror holds, and the only ones pushed to the replica:
+// the contract is "all branches and tags". Other namespaces an origin may carry (a forge's refs/pull/*
+// and the like) are hidden refs that the replica refuses, so mirroring them would only cost disk and
+// bandwidth. The same refspecs fetch from the origin (with --prune, which only ever removes refs
+// inside these namespaces) and push to the replica.
+var mirrorRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
 
-var pushRefspecs = []string{"+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"}
+// mirrorInitialBranch names the unborn branch HEAD points at in a new mirror. It is explicit so the
+// result does not depend on the git version or on a configured init.defaultBranch; nothing reads it,
+// because only refs/heads/* and refs/tags/* are ever fetched or pushed.
+const mirrorInitialBranch = "main"
 
 // corruptMirrorMarkers identify a mirror directory that is not a usable repository (for example
-// left behind by a crash), which is repaired by recloning rather than reported as an origin fault.
+// left behind by a crash), which is repaired by rebuilding it rather than reported as an origin fault.
 var corruptMirrorMarkers = []string{"not a git repository", "corrupt", "bad object"}
 
 // runFunc runs git with the given argv and environment in dir and returns its (capped) stderr.
@@ -65,8 +69,8 @@ type syncDeps struct {
 	pushTimeout  time.Duration
 }
 
-// syncRepo mirrors one repository: clone-or-fetch every ref from the origin into the local bare
-// mirror, then push its branches and tags to the replica. The origin credential is attached only to
+// syncRepo mirrors one repository: fetch the origin's branches and tags into the local bare mirror
+// (creating it on the first run), then push them to the replica. The origin credential is attached only to
 // the origin invocation and the push token only to the push, each scoped to its own URL. Failures
 // are classified into typed error codes; a cancelled context (shutdown) is not a failure and leaves
 // the repository pending.
@@ -74,7 +78,7 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 	if ctx.Err() != nil {
 		return syncResult{State: StatePending}
 	}
-	// A token already past its expiry cannot push; say so before spending a clone on it.
+	// A token already past its expiry cannot push; say so before spending a fetch on it.
 	if d.tokenExpired(t) {
 		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
 	}
@@ -88,7 +92,7 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 	}
 	defer cleanup()
 
-	if stderr, err := d.fetchOrClone(ctx, home, t); err != nil {
+	if stderr, err := d.updateMirror(ctx, home, t); err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
 		}
@@ -98,7 +102,8 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 
 	// Never prune the replica from a mirror with nothing to send: an origin that advertises no
 	// branches or tags (an empty repository, or a transient bad advertisement) leaves the mirror
-	// with no refs, and `push --prune` would then delete every branch and tag on the replica.
+	// with no refs, and `push --prune` would then delete every branch and tag on the replica. This
+	// also covers a mirror that was initialised but never fetched into (for example after a crash).
 	if stderr, err := d.hasPushableRefs(ctx, home, t); err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
@@ -110,7 +115,7 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
-	// The clone or fetch can outlive the token. Re-check immediately before using it: a token the
+	// The fetch can outlive the token. Re-check immediately before using it: a token the
 	// platform has declared expired is not used, whether or not the replica would still accept it.
 	// (A token that expires while the push itself is running is the replica's to judge; it is not
 	// cut short by the connector's clock, which may be skewed.)
@@ -118,14 +123,14 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
 	}
 
-	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--prune", "--force", "--", t.ReplicaURL}, pushRefspecs...)
+	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--prune", "--force", "--", t.ReplicaURL}, mirrorRefspecs...)
 	pushEnv := gitConfigEnv(gitBaseEnv(home), credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken))
 	stderr, err := d.runBounded(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home)
 	if err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
 		}
-		// Re-evaluated now: a long clone can outlive the token, and a 401 then means "expired".
+		// Re-evaluated now: a long fetch can outlive the token, and a 401 then means "expired".
 		typ, detail := classifyGitFailure(replicaSide, err, stderr, d.tokenExpired(t))
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
@@ -154,14 +159,20 @@ func (d syncDeps) hasPushableRefs(ctx context.Context, home string, t syncTask) 
 	return stderr, err
 }
 
-// fetchOrClone brings the local mirror up to date with the origin: a fetch when a mirror exists, a
-// clone otherwise. A mirror directory that is not a usable repository is removed and recloned once.
-func (d syncDeps) fetchOrClone(ctx context.Context, home string, t syncTask) ([]byte, error) {
+// updateMirror brings the local mirror up to date with the origin's branches and tags. A mirror that
+// exists is fetched into; otherwise it is created with `git init --bare` and fetched into. A mirror
+// directory that is not a usable repository is removed and rebuilt once.
+//
+// Mirrors created before the mirror was narrowed were made by `git clone --mirror` and hold every
+// namespace the origin has. The fetch below works on them unchanged and neither rewrites nor deletes
+// those extra refs (--prune only touches refs inside the fetched namespaces), so they keep occupying
+// disk until the mirror is rebuilt; nothing here reclaims that space.
+func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask) ([]byte, error) {
 	dir := d.mirrors.Dir(t.RepoID)
 	env := gitConfigEnv(gitBaseEnv(home), credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token))
+	fetchArgv := append([]string{"git", "--git-dir=" + dir, "fetch", "--prune", "--force", "--", t.CanonicalURL}, mirrorRefspecs...)
 
 	if d.mirrors.Exists(t.RepoID) {
-		fetchArgv := []string{"git", "--git-dir=" + dir, "fetch", "--prune", "--force", "--", t.CanonicalURL, fetchRefspec}
 		stderr, err := d.runBounded(ctx, d.fetchTimeoutOrDefault(), "fetch", fetchArgv, env, home)
 		if err == nil {
 			return nil, nil
@@ -174,11 +185,15 @@ func (d syncDeps) fetchOrClone(ctx context.Context, home string, t syncTask) ([]
 		}
 	}
 
-	cloneArgv := []string{"git", "clone", "--mirror", "--", t.CanonicalURL, dir}
-	stderr, err := d.runBounded(ctx, d.fetchTimeoutOrDefault(), "clone", cloneArgv, env, home)
+	// git init talks to no remote, so it gets no credential.
+	initArgv := []string{"git", "init", "--bare", "--initial-branch=" + mirrorInitialBranch, "--", dir}
+	stderr, err := d.runBounded(ctx, d.fetchTimeoutOrDefault(), "init", initArgv, gitBaseEnv(home), home)
+	if err == nil {
+		stderr, err = d.runBounded(ctx, d.fetchTimeoutOrDefault(), "fetch", fetchArgv, env, home)
+	}
 	if err != nil {
-		// A failed clone can leave a partial directory that the next attempt would mistake for a
-		// mirror; remove it.
+		// A failed init or first fetch leaves a partial or empty repository that the next attempt would
+		// mistake for a mirror; remove it.
 		_ = os.RemoveAll(dir)
 	}
 	return stderr, err
