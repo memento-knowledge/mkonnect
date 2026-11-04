@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"time"
@@ -20,6 +22,16 @@ const (
 	// contract names the token but not the scheme; Bearer is the connector's assumption, to be
 	// confirmed (see the design's open items).
 	replicaAuth = "bearer"
+
+	// newestCommitTimeout bounds reading the newest commit time from the local mirror, which visits
+	// every branch and tag tip. defaultBranchTimeout bounds the one extra origin request a sync makes
+	// to learn the default branch. Both are informational, so a slow one gives up rather than hold a
+	// sync slot.
+	newestCommitTimeout  = 5 * time.Minute
+	defaultBranchTimeout = 30 * time.Second
+
+	// maxCommitClockSkew is how far past now a committer date may be and still be believed.
+	maxCommitClockSkew = 24 * time.Hour
 )
 
 // mirrorRefspecs are the only refs the local mirror holds, and the only ones pushed to the replica:
@@ -47,6 +59,23 @@ type syncResult struct {
 	ErrorType   string
 	ErrorDetail string
 	Warnings    []string
+	Stats       syncStats
+}
+
+// syncStats is what one attempt measured. StartedAt and Duration are stamped by whoever runs the
+// attempt (the manager, which knows when it began); the rest is learned by syncRepo, and only when
+// the standard-output seam (syncDeps.runOut) is present. Zero values mean "not learned this time".
+type syncStats struct {
+	StartedAt time.Time
+	Duration  time.Duration
+	// RefsPushed is how many refs the push created, updated or deleted on the replica: 0 when the
+	// attempt ended before pushing or found nothing new, nil when it was not measured.
+	RefsPushed *int
+	// NewestCommitAt is the newest commit time across the origin's branches and tags, from the mirror
+	// just fetched; zero when the attempt did not get that far.
+	NewestCommitAt time.Time
+	// DefaultBranch is the origin's default branch; empty when it could not be resolved.
+	DefaultBranch string
 }
 
 // syncTask is everything one repository sync needs. CanonicalURL is the validated, re-serialized
@@ -62,8 +91,12 @@ type syncTask struct {
 
 // syncDeps are the seams a sync needs. Zero timeouts use the defaults.
 type syncDeps struct {
-	mirrors      Mirrors
-	run          runFunc
+	mirrors Mirrors
+	run     runFunc
+	// runOut runs git with its standard output streamed, which statistics need (the push's porcelain
+	// report, the newest commit, the origin's default branch). When nil no statistics are collected
+	// and git runs through run alone, exactly as before.
+	runOut       outRunFunc
 	now          func() time.Time
 	fetchTimeout time.Duration
 	pushTimeout  time.Duration
@@ -75,6 +108,18 @@ type syncDeps struct {
 // are classified into typed error codes; a cancelled context (shutdown) is not a failure and leaves
 // the repository pending.
 func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
+	var stats syncStats
+	if d.runOut != nil {
+		// Measured, and so far nothing was pushed: an attempt that ends early reports 0, not unknown.
+		stats.RefsPushed = new(int)
+	}
+	res := d.syncAttempt(ctx, t, &stats)
+	res.Stats = stats
+	return res
+}
+
+// syncAttempt is syncRepo's body; it records what it measures in stats as it goes.
+func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats) syncResult {
 	if ctx.Err() != nil {
 		return syncResult{State: StatePending}
 	}
@@ -115,6 +160,15 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
+	if d.runOut != nil {
+		// The mirror was just fetched, so this is the origin's newest commit as of this attempt. A
+		// failure to read it costs the statistic, not the sync.
+		stats.NewestCommitAt = d.newestCommit(ctx, home, t)
+		if ctx.Err() != nil {
+			return syncResult{State: StatePending}
+		}
+	}
+
 	// The fetch can outlive the token. Re-check immediately before using it: a token the
 	// platform has declared expired is not used, whether or not the replica would still accept it.
 	// (A token that expires while the push itself is running is the replica's to judge; it is not
@@ -123,17 +177,33 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
 	}
 
-	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--prune", "--force", "--", t.ReplicaURL}, mirrorRefspecs...)
+	// --porcelain is always used, so there is one push path whether or not statistics are collected.
+	// It moves git's per-ref report (including each rejection's reason) from stderr to stdout, which
+	// pushCounter reads and hands back to the classifier in the shape it expects.
+	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--porcelain", "--prune", "--force", "--", t.ReplicaURL}, mirrorRefspecs...)
 	pushEnv := gitConfigEnv(gitBaseEnv(home), credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken))
-	stderr, err := d.runBounded(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home)
+	var counter pushCounter
+	stderr, err := d.runBoundedOut(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home, &counter)
+	if d.runOut != nil {
+		stats.RefsPushed = new(int)
+		*stats.RefsPushed = counter.Refs()
+	}
+	if err == nil && counter.Rejected() > 0 {
+		// A rejected ref means the replica is not current, whatever the exit status says.
+		err = errPushRejected
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
 		}
+		stderr = append(append([]byte(nil), stderr...), counter.RejectionText()...)
 		// Re-evaluated now: a long fetch can outlive the token, and a 401 then means "expired".
 		typ, detail := classifyGitFailure(replicaSide, err, stderr, d.tokenExpired(t))
-		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
+		res := syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
+		d.learnDefaultBranch(ctx, home, t, stats)
+		return res
 	}
+	d.learnDefaultBranch(ctx, home, t, stats)
 	return syncResult{State: StateOK}
 }
 
@@ -141,7 +211,48 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 // replica is left exactly as it was.
 const errOriginEmpty = "origin has no branches or tags; replica left unchanged"
 
-var errNoRefs = errors.New("mirror has no branches or tags")
+var (
+	errNoRefs       = errors.New("mirror has no branches or tags")
+	errPushRejected = errors.New("push reported rejected refs")
+)
+
+// newestCommit reads the newest commit time across the mirror's branches and tags, or the zero time
+// when it cannot (git failed, or no ref has a usable commit date).
+func (d syncDeps) newestCommit(ctx context.Context, home string, t syncTask) time.Time {
+	newest := newestTracker{ceiling: d.now().Add(maxCommitClockSkew).Unix()}
+	argv := []string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "for-each-ref", "--format=" + newestFormat, "refs/heads", "refs/tags"}
+	if _, err := d.runBoundedOut(ctx, newestCommitTimeout, "newest commit", argv, gitBaseEnv(home), home, &newest); err != nil {
+		return time.Time{}
+	}
+	at, _ := newest.Newest()
+	return at
+}
+
+// learnDefaultBranch asks the origin which branch its HEAD names and records it in stats. It is one
+// extra origin request per sync, made after the push so it can never delay it, and only once a fetch
+// has already reached the origin. The mirror's own HEAD says nothing about the origin's (it holds only
+// branches and tags), hence the request. Failing to resolve it is not a sync failure: the field is
+// simply left unknown, and nothing git said is logged.
+func (d syncDeps) learnDefaultBranch(ctx context.Context, home string, t syncTask, stats *syncStats) {
+	if d.runOut == nil || ctx.Err() != nil {
+		return
+	}
+	out := &limitedBuffer{max: maxSymrefOutput}
+	argv := []string{"git", "ls-remote", "--symref", "--", t.CanonicalURL, "HEAD"}
+	if _, err := d.runBoundedOut(ctx, defaultBranchTimeout, "default branch", argv, d.originEnv(home, t), home, out); err != nil {
+		slog.Debug("origin default branch not resolved", "repo_id", t.RepoID)
+		return
+	}
+	if name, ok := parseSymrefHead(out.Bytes()); ok {
+		stats.DefaultBranch = name
+	}
+}
+
+// originEnv is the environment for a git invocation that talks to the origin: the locked-down base
+// plus the origin credential scoped to the canonical URL.
+func (d syncDeps) originEnv(home string, t syncTask) []string {
+	return gitConfigEnv(gitBaseEnv(home), credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token))
+}
 
 // hasPushableRefs reports, as a nil error, that the mirror holds at least one branch or tag.
 // `git show-ref --quiet` exits 1 when nothing matches, which is returned as errNoRefs; any other
@@ -169,7 +280,7 @@ func (d syncDeps) hasPushableRefs(ctx context.Context, home string, t syncTask) 
 // disk until the mirror is rebuilt; nothing here reclaims that space.
 func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask) ([]byte, error) {
 	dir := d.mirrors.Dir(t.RepoID)
-	env := gitConfigEnv(gitBaseEnv(home), credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token))
+	env := d.originEnv(home, t)
 	fetchArgv := append([]string{"git", "--git-dir=" + dir, "fetch", "--prune", "--force", "--", t.CanonicalURL}, mirrorRefspecs...)
 
 	if d.mirrors.Exists(t.RepoID) {
@@ -203,9 +314,21 @@ func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask) ([]
 // "signal: killed"; it is re-wrapped around context.DeadlineExceeded so the classifier attributes it
 // to the timeout rather than to an out-of-memory kill.
 func (d syncDeps) runBounded(ctx context.Context, timeout time.Duration, what string, argv, env []string, dir string) ([]byte, error) {
+	return d.runBoundedOut(ctx, timeout, what, argv, env, dir, io.Discard)
+}
+
+// runBoundedOut is runBounded with git's standard output streamed to stdout. Without the output seam
+// it runs through run and the output is discarded.
+func (d syncDeps) runBoundedOut(ctx context.Context, timeout time.Duration, what string, argv, env []string, dir string, stdout io.Writer) ([]byte, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	stderr, err := d.run(cctx, argv, env, dir)
+	var stderr []byte
+	var err error
+	if d.runOut != nil {
+		stderr, err = d.runOut(cctx, argv, env, dir, stdout)
+	} else {
+		stderr, err = d.run(cctx, argv, env, dir)
+	}
 	if err != nil && errors.Is(cctx.Err(), context.DeadlineExceeded) {
 		err = fmt.Errorf("%s timed out: %w", what, context.DeadlineExceeded)
 	}

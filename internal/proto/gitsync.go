@@ -231,20 +231,20 @@ type GitSyncRepoStatus struct {
 	RepoID string `json:"repo_id"`
 	// State is the coarse lifecycle state: "pending" | "syncing" | "ok" | "error".
 	State string `json:"state"`
-	// OriginDefaultBranch is the repository's default branch at the origin, omitted while unknown.
+	// OriginDefaultBranch is the repository's default branch at the origin, as last resolved by an
+	// attempt that could; omitted while unknown.
 	OriginDefaultBranch string `json:"origin_default_branch,omitempty"`
 	// LastAttemptAt is when the most recent sync attempt started (RFC3339 UTC); omitted when the
 	// repository has never been attempted. INFERRED.
 	LastAttemptAt *string `json:"last_attempt_at,omitempty"`
-	// LastSuccessAt is when the most recent successful sync finished (RFC3339 UTC). INFERRED.
+	// LastSuccessAt is when the most recent successful sync finished (RFC3339 UTC). A run that found
+	// nothing new is a success. It is carried unchanged across failed attempts and survives a
+	// connector restart. INFERRED.
 	//
-	// The intended wire form is present as null until the first success, so the platform can tell
-	// "never succeeded" from "field not supported", the same convention as ConfigVersion. It is
-	// omitempty for now only because the connector does not yet record success times: emitting null
-	// would wrongly tell the platform that healthy repositories have never succeeded. The change
-	// that starts populating it must drop omitempty here and update the status goldens and
-	// TestGitSyncNewStatusFieldPresence.
-	LastSuccessAt *string `json:"last_success_at,omitempty"`
+	// It is present as null until the first success (deliberately not omitempty, the same
+	// convention as ConfigVersion), so the platform can tell "never succeeded" from "field not
+	// supported".
+	LastSuccessAt *string `json:"last_success_at"`
 	// DurationMS is how long the most recently FINISHED attempt took, in milliseconds; omitted until
 	// an attempt has finished. While a re-sync is in flight, LastAttemptAt names that attempt but
 	// this and the two fields below still describe the previous finished one. INFERRED.
@@ -253,8 +253,9 @@ type GitSyncRepoStatus struct {
 	// attempt has finished. Zero is a valid value (nothing changed), which is why this is a pointer.
 	// INFERRED.
 	RefsPushed *int `json:"refs_pushed,omitempty"`
-	// NewestOriginCommitAt is the committer time of the newest commit seen at the origin by the
-	// most recently finished attempt (RFC3339 UTC); omitted while unknown. INFERRED.
+	// NewestOriginCommitAt is the committer time of the newest commit across the origin's branches
+	// and tags (an annotated tag counts as the commit it names, not its own date), as last seen by
+	// an attempt that got far enough to see it (RFC3339 UTC); omitted while unknown. INFERRED.
 	NewestOriginCommitAt *string `json:"newest_origin_commit_at,omitempty"`
 	// ErrorType is a typed failure code when State is "error"; omitted otherwise.
 	ErrorType string `json:"error_type,omitempty"`

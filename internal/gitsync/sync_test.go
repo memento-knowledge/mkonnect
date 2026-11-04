@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +34,7 @@ type gitCall struct {
 func (c gitCall) sub() string {
 	for _, a := range c.argv {
 		switch a {
-		case "init", "fetch", "push", "show-ref":
+		case "init", "fetch", "push", "show-ref", "for-each-ref", "ls-remote":
 			return a
 		}
 	}
@@ -61,6 +62,9 @@ func (c gitCall) envHas(sub string) bool {
 type fakeGit struct {
 	calls  []gitCall
 	script func(c gitCall) ([]byte, error)
+	// stdout, when set, supplies what a call writes to standard output; only invocations made
+	// through runOut (see newStatsDeps) have any.
+	stdout func(c gitCall) string
 }
 
 func (f *fakeGit) run(_ context.Context, argv, env []string, dir string) ([]byte, error) {
@@ -70,6 +74,16 @@ func (f *fakeGit) run(_ context.Context, argv, env []string, dir string) ([]byte
 		return nil, nil
 	}
 	return f.script(c)
+}
+
+// runOut is run with standard output: the call is recorded and scripted exactly as run's, and what
+// stdout returns for it is written to w, even when the call fails (as git does).
+func (f *fakeGit) runOut(ctx context.Context, argv, env []string, dir string, w io.Writer) ([]byte, error) {
+	stderr, err := f.run(ctx, argv, env, dir)
+	if f.stdout != nil {
+		_, _ = io.WriteString(w, f.stdout(f.calls[len(f.calls)-1]))
+	}
+	return stderr, err
 }
 
 func (f *fakeGit) subs() []string {
