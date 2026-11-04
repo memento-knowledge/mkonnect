@@ -23,7 +23,8 @@ type Config struct {
 	ConnectorID string
 
 	// RegistrationToken is used only on first run to register with the gateway.
-	// After registration it is no longer needed.
+	// After registration it is no longer needed. It comes from REGISTRATION_TOKEN, or
+	// from the file named by REGISTRATION_TOKEN_FILE, which takes precedence.
 	RegistrationToken string
 
 	// KeyFile is the path to the ML-DSA key store file.
@@ -46,12 +47,11 @@ type Config struct {
 // It returns an error if required variables are missing.
 func Load() (*Config, error) {
 	cfg := &Config{
-		GatewayURL:        os.Getenv("GATEWAY_URL"),
-		ConnectorID:       os.Getenv("CONNECTOR_ID"),
-		RegistrationToken: os.Getenv("REGISTRATION_TOKEN"),
-		KeyFile:           os.Getenv("KEY_FILE"),
-		ProtocolVersion:   os.Getenv("PROTOCOL_VERSION"),
-		CABundle:          os.Getenv("CA_BUNDLE"),
+		GatewayURL:      os.Getenv("GATEWAY_URL"),
+		ConnectorID:     os.Getenv("CONNECTOR_ID"),
+		KeyFile:         os.Getenv("KEY_FILE"),
+		ProtocolVersion: os.Getenv("PROTOCOL_VERSION"),
+		CABundle:        os.Getenv("CA_BUNDLE"),
 	}
 
 	if cfg.GatewayURL == "" {
@@ -93,6 +93,11 @@ func Load() (*Config, error) {
 	// to match. The file itself is read (and failures surfaced) at request time.
 	if cfg.CABundle != "" && !filepath.IsAbs(cfg.CABundle) {
 		return nil, fmt.Errorf("CA_BUNDLE must be an absolute path")
+	}
+
+	cfg.RegistrationToken, err = registrationToken()
+	if err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
