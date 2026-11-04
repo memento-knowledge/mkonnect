@@ -1,6 +1,8 @@
 package gitsync
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -19,8 +21,10 @@ import (
 // The comparison covers the bytes the loader actually read, through the same vetted descriptor that
 // produced the configuration, so a file replaced after that read always compares as changed; a
 // fingerprint taken by re-reading the path later would race with the load and could hide it. The
-// fingerprint is a SHA-256 of the raw file bytes, kept in memory only: it is not exported, and
-// String omits it, so formatting or logging a Source cannot disclose anything about a credential.
+// fingerprint is an HMAC-SHA256 of the raw file bytes under a random per-process key, kept in memory
+// only: it is not exported, and String and GoString omit it, so formatting or logging a Source (with
+// %v, %+v or %#v) cannot disclose anything about a credential, and fingerprints from different
+// processes are not comparable.
 type Source struct {
 	// Path is the path as configured (not resolved through symlinks).
 	Path string
@@ -30,8 +34,23 @@ type Source struct {
 	digest [sha256.Size]byte
 }
 
+// digestKey keys the fingerprints with a per-process random value, so one is only meaningful inside
+// this process and, even if a reflection-based dumper prints it, cannot be tested against guesses
+// of a credential offline.
+var digestKey = func() []byte {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("gitsync: no randomness for source fingerprints: " + err.Error())
+	}
+	return k
+}()
+
 func newSource(path string, content []byte) Source {
-	return Source{Path: path, Read: true, digest: sha256.Sum256(content)}
+	mac := hmac.New(sha256.New, digestKey)
+	mac.Write(content)
+	s := Source{Path: path, Read: true}
+	copy(s.digest[:], mac.Sum(nil))
+	return s
 }
 
 // String describes the source without its fingerprint.
@@ -41,6 +60,10 @@ func (s Source) String() string {
 	}
 	return s.Path + " (not read)"
 }
+
+// GoString keeps the fingerprint out of %#v output too (which would otherwise print every field,
+// and which a *LoadError or []Source also reaches).
+func (s Source) GoString() string { return "gitsync.Source{" + s.String() + "}" }
 
 // LoadError is returned by New for any failure after the config file was located. It wraps the
 // cause unchanged (so Error and errors.Is behave as without it) and carries the files the loader

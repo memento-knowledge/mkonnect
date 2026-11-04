@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -38,14 +37,14 @@ type Store struct {
 // Any failure after the file was located is a *LoadError (use errors.As) carrying the files involved.
 // The files of a successful load are available from Sources.
 func New(path string) (*Store, error) {
-	s := &Store{path: path, data: map[string]LocalEntry{}, sources: sourceSet{}}
+	s := &Store{path: path, data: map[string]LocalEntry{}}
 	sources := sourceSet{}
 	fail := func(err error) (*Store, error) { return nil, &LoadError{Sources: sources.sorted(), err: err} }
 
 	cfg, err := readProviderConfig(path, maxConfigFileSize, rejectForeignConfigOwner)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			s.sources.add(Source{Path: path})
+			s.sources = sourceSet{path: {Path: path}}
 			return s, nil
 		}
 		sources.add(Source{Path: path})
@@ -84,11 +83,10 @@ func New(path string) (*Store, error) {
 	// A config that names token files decides which local file is sent to which host, so it must not
 	// be editable by anyone else. This is checked on the descriptor the config was read from, before
 	// any token file is opened. A config with only inline tokens is judged by rejectForeignConfigOwner.
-	if cfg.foreignOwner {
-		if usesTokenFile {
-			return fail(fmt.Errorf("git-sync config %s uses token_file but is owned by another user; it must be owned by the user running the connector or by root", path))
-		}
-		slog.Warn("credential file is owned by another user; restrict it to the user running the connector (a future release will refuse to start)", "file", "git-sync config", "path", path)
+	warnWhile(cfg.foreignOwner && !usesTokenFile, "owner", path,
+		"credential file is owned by another user; restrict it to the user running the connector (a future release will refuse to start)", "file", "git-sync config", "path", path)
+	if cfg.foreignOwner && usesTokenFile {
+		return fail(fmt.Errorf("git-sync config %s uses token_file but is owned by another user; it must be owned by the user running the connector or by root", path))
 	}
 
 	// First pass: everything that does not need a credential.
@@ -133,7 +131,7 @@ func New(path string) (*Store, error) {
 		what := fmt.Sprintf("provider %q token_file", name)
 		raw, ok := contents[e.TokenFile]
 		if !ok {
-			raw, err = readTokenFile(e.TokenFile, what)
+			raw, err = tokenFileReader(e.TokenFile, what)
 			if err != nil {
 				return fail(err)
 			}
@@ -336,7 +334,17 @@ func (s *Store) save(data map[string]LocalEntry) error {
 		_ = d.Sync()
 		_ = d.Close()
 	}
-	// The config now on disk is what this store holds, so Sources must describe it.
-	s.sources.add(newSource(s.path, b))
+	// The config now on disk is what this store holds, so Sources must describe it: the new config,
+	// plus the token files that the entries now saved still name (a replaced or removed token-file
+	// provider no longer contributes one). Their fingerprints are those of the load that read them.
+	next := sourceSet{s.path: newSource(s.path, b)}
+	for _, e := range data {
+		if e.TokenFile != "" {
+			if src, ok := s.sources[e.TokenFile]; ok {
+				next[e.TokenFile] = src
+			}
+		}
+	}
+	s.sources = next
 	return nil
 }

@@ -45,6 +45,9 @@ var (
 	}
 )
 
+// tokenFileReader is how New reads a token file; a test replaces it to count reads.
+var tokenFileReader = readTokenFile
+
 // readVetted reads a credential-bearing file whose location or content decides where secrets are
 // sent. The file is opened once and every check (type, size, and whatever vet adds) and the read
 // itself go through that one descriptor, so the file that is vetted is exactly the file that is
@@ -104,7 +107,8 @@ type providerConfigFile struct {
 // API connector's credential store so the two behave alike.
 //
 // The owner rule: with rejectForeign the owner must be the running user or root, checked before the
-// mode is touched; otherwise the owner is only reported for the caller to judge.
+// mode is touched; otherwise the owner is only reported for the caller to judge, and a file owned
+// by someone else is never chmod-ed (it is accepted only if its mode is already safe).
 //
 // Advisory only (a warning, never a rejection): the directory lets other users rename entries
 // within it.
@@ -116,7 +120,14 @@ func readProviderConfig(path string, maxSize int64, rejectForeign bool) (provide
 		if out.foreignOwner && rejectForeign {
 			return fmt.Errorf("%s %s is owned by another user; it must be owned by the user running the connector or by root", what, path)
 		}
-		if err := fchmod(f, 0o600); err != nil && !readOnlyModeAcceptable(info.Mode()) {
+		if out.foreignOwner {
+			// Never tighten a file that belongs to someone else (as root, chmod would succeed and change
+			// another user's file, then the caller might still refuse it); accept it only if its mode is
+			// already safe.
+			if !readOnlyModeAcceptable(info.Mode()) {
+				return fmt.Errorf("%s %s is owned by another user and has unsafe permissions; it must be owned by the user running the connector or by root, with at most group read (e.g. 0600 or 0640)", what, path)
+			}
+		} else if err := fchmod(f, 0o600); err != nil && !readOnlyModeAcceptable(info.Mode()) {
 			return fmt.Errorf("%s %s has unsafe permissions and chmod failed; restrict it to the owner, allowing at most group read (e.g. 0600 or 0640)", what, path)
 		}
 		warnWorldWritableDir(path, what)
@@ -145,19 +156,18 @@ func readTokenFile(path, what string) ([]byte, error) {
 		if foreignOwner(info) {
 			return fmt.Errorf("%s %s is owned by another user; it must be owned by the user running the connector or by root", what, path)
 		}
-		if mode&0o044 != 0 {
-			warnReadableByOthers(path, what)
-		} else {
-			readableWarned.Delete(path)
-		}
+		warnWhile(mode&0o044 != 0, "read", path,
+			"credential file is readable by group or other users; restrict it to the user running the connector where the platform allows (a read-only secret mount may not)", "file", what, "path", path)
 		warnWorldWritableDir(path, what)
 		return nil
 	})
 	var pe *fs.PathError
 	if errors.As(err, &pe) && pe.Op == "open" {
-		// The open error repeats the path; report it once, in the same words as the other errors,
-		// keeping the cause so errors.Is(err, fs.ErrNotExist) still works.
-		return nil, fmt.Errorf("%s %s could not be opened: %w", what, path, pe.Err)
+		// The open error repeats the path; report it once, in the same words as the other errors.
+		// The cause is deliberately not wrapped: New treats errors.Is(err, fs.ErrNotExist) from the
+		// config file as "no config yet, empty store", and a missing token file must never be mistaken
+		// for that by a caller that copies the idiom.
+		return nil, fmt.Errorf("%s %s could not be opened: %v", what, path, pe.Err)
 	}
 	return data, err
 }
@@ -187,21 +197,28 @@ func dirLetsOthersRename(mode os.FileMode) bool {
 }
 
 // warnWorldWritableDir logs, without rejecting, that another local user could replace the file by
-// renaming something over it. It is a warning because existing deployments may legitimately have it
-// and rejecting would turn an upgrade into an outage.
+// renaming something over it (or by swapping it for a symlink to another file the connector can
+// read). It is a warning because existing deployments may legitimately have it and rejecting would
+// turn an upgrade into an outage. Logged once per file while the condition holds.
 func warnWorldWritableDir(path, what string) {
-	if d, err := os.Stat(filepath.Dir(path)); err == nil && dirLetsOthersRename(d.Mode()) {
-		slog.Warn("credential file's directory is writable by other users; restrict it", "file", what, "path", path)
-	}
+	d, err := os.Stat(filepath.Dir(path))
+	warnWhile(err == nil && dirLetsOthersRename(d.Mode()), "dir", path,
+		"credential file's directory is writable by other users; restrict it", "file", what, "path", path)
 }
 
-// readableWarned records which token files already produced the group/other-read warning, so a
-// process that loads the config repeatedly logs it once per file. An entry is cleared when the file
-// is seen without the condition, so loosening it again later warns again.
-var readableWarned sync.Map
+// warned records which (condition, file) pairs already produced their warning, so a process that
+// loads the config repeatedly (a reload loop) logs each once. An entry is cleared when the file is
+// seen without the condition, so the condition returning later warns again.
+var warned sync.Map
 
-func warnReadableByOthers(path, what string) {
-	if _, seen := readableWarned.LoadOrStore(path, struct{}{}); !seen {
-		slog.Warn("credential file is readable by group or other users; restrict it to the user running the connector where the platform allows (a read-only secret mount may not)", "file", what, "path", path)
+// warnWhile logs msg once per kind and path while cond holds, and forgets the pair once it does not.
+func warnWhile(cond bool, kind, path, msg string, attrs ...any) {
+	key := kind + "\x00" + path
+	if !cond {
+		warned.Delete(key)
+		return
+	}
+	if _, seen := warned.LoadOrStore(key, struct{}{}); !seen {
+		slog.Warn(msg, attrs...)
 	}
 }

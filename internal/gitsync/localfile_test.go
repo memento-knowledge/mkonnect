@@ -213,12 +213,17 @@ func TestReadProviderConfigOwnerPolicy(t *testing.T) {
 		{"own file", 1000, 1000, true, false, false},
 		{"root-owned", 0, 1000, true, false, false},
 		{"foreign, reported only", 1001, 1000, false, false, true},
+		{"foreign with an unsafe mode, not chmod-ed and not accepted", 1001, 1000, false, true, true},
 		{"foreign, rejected", 1001, 1000, true, true, true},
 		{"foreign while running as root", 1001, 0, true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			withOwner(t, tc.uid, tc.euid)
-			p := writeFile(t, t.TempDir(), "f", "SECRET", 0o644)
+			mode := os.FileMode(0o644)
+			if tc.name == "foreign, reported only" {
+				mode = 0o640
+			}
+			p := writeFile(t, t.TempDir(), "f", "SECRET", mode)
 			cfg, err := readProviderConfig(p, 1024, tc.rejectForeign)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
@@ -233,10 +238,12 @@ func TestReadProviderConfigOwnerPolicy(t *testing.T) {
 			if statErr != nil {
 				t.Fatal(statErr)
 			}
-			if tc.wantErr && info.Mode().Perm() != 0o644 {
+			switch {
+			case tc.wantErr && info.Mode().Perm() != mode:
 				t.Errorf("a rejected config must not be chmod-ed first; mode = %o", info.Mode().Perm())
-			}
-			if !tc.wantErr && info.Mode().Perm() != 0o600 {
+			case !tc.wantErr && tc.wantForeign && info.Mode().Perm() != mode:
+				t.Errorf("a foreign-owned config is never chmod-ed; mode = %o", info.Mode().Perm())
+			case !tc.wantErr && !tc.wantForeign && info.Mode().Perm() != 0o600:
 				t.Errorf("an accepted config is tightened to 0600; mode = %o", info.Mode().Perm())
 			}
 		})
@@ -285,5 +292,50 @@ func TestReadTokenFileSizeBoundary(t *testing.T) {
 	_, err := readTokenFile(over, "test token_file")
 	if err == nil || !strings.Contains(err.Error(), "limit") || strings.Contains(err.Error(), "SECRET") {
 		t.Errorf("an oversized file should be rejected without its content, got %v", err)
+	}
+}
+
+// Every advisory warning is logged once per file while its condition holds, so a loop that reloads
+// the config does not repeat it, and again when the condition returns after being fixed.
+func TestWarnWhileLogsOncePerConditionAndFile(t *testing.T) {
+	logs := captureLogs(t)
+	count := func() int { return strings.Count(logs.String(), "msg=hello") }
+	// The state is process-wide, so use paths that are unique to this run (-count=N reruns it).
+	pa, pb := filepath.Join(t.TempDir(), "a"), filepath.Join(t.TempDir(), "b")
+	warnWhile(true, "k", pa, "hello")
+	warnWhile(true, "k", pa, "hello")
+	warnWhile(true, "k", pb, "hello")  // another file
+	warnWhile(true, "k2", pa, "hello") // another condition
+	if n := count(); n != 3 {
+		t.Fatalf("got %d warnings, want 3 (one per kind and path): %q", n, logs.String())
+	}
+	warnWhile(false, "k", pa, "hello")
+	warnWhile(true, "k", pa, "hello")
+	if n := count(); n != 4 {
+		t.Errorf("a condition that returns after being cleared should warn again: %d", n)
+	}
+}
+
+// A token file shared by several providers is opened and read once per load, so every provider sees
+// the same bytes.
+func TestNewReadsASharedTokenFileOnce(t *testing.T) {
+	var reads int
+	prev := tokenFileReader
+	tokenFileReader = func(path, what string) ([]byte, error) { reads++; return prev(path, what) }
+	t.Cleanup(func() { tokenFileReader = prev })
+
+	dir := t.TempDir()
+	tf := writeFile(t, dir, "token", "shared-token-0123456789\n", 0o600)
+	other := writeFile(t, dir, "other", "other-token-0123456789\n", 0o600)
+	cfg := writeFile(t, dir, "git-sync.json", `{
+		"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": "`+tf+`"},
+		"b": {"base_url": "https://git-b.example.test/", "auth": "bearer", "token_file": "`+tf+`"},
+		"c": {"base_url": "https://git-c.example.test/", "auth": "bearer", "token_file": "`+other+`"}
+	}`, 0o600)
+	if _, err := New(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 2 {
+		t.Errorf("token files read %d times for 2 distinct files", reads)
 	}
 }

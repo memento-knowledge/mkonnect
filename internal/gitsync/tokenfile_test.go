@@ -230,8 +230,11 @@ func TestNewTokenFileFileKinds(t *testing.T) {
 		if err == nil {
 			t.Fatalf("load succeeded with %v providers; a missing token file must fail", s.Names())
 		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			t.Errorf("the cause should stay recognisable as not-exist, got %v", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("a missing token file must not look like a missing config (errors.Is not-exist): %v", err)
+		}
+		if !strings.Contains(err.Error(), "no such file") {
+			t.Errorf("the cause should still be stated: %v", err)
 		}
 		if !strings.Contains(err.Error(), `provider "p"`) || !strings.Contains(err.Error(), "could not be opened") {
 			t.Errorf("error should name the provider and say the file could not be opened: %v", err)
@@ -252,19 +255,27 @@ func TestNewTokenFileOwner(t *testing.T) {
 	}
 	tests := []struct {
 		name    string
+		euid    int // 0 means euid above
 		owners  map[string]int
 		wantErr string // "" = loads
 	}{
-		{"everything owned by the running user", map[string]int{"git-sync.json": euid, "token": euid}, ""},
-		{"token file owned by root", map[string]int{"git-sync.json": euid, "token": 0}, ""},
-		{"token file owned by another user", map[string]int{"git-sync.json": euid, "token": 1001}, "token_file"},
-		{"owner of the token file cannot be determined", map[string]int{"git-sync.json": euid}, "token_file"},
-		{"config owned by root", map[string]int{"git-sync.json": 0, "token": euid}, ""},
-		{"config owned by another user and naming a token file", map[string]int{"git-sync.json": 1001, "token": euid}, "uses token_file"},
+		{"everything owned by the running user", 0, map[string]int{"git-sync.json": euid, "token": euid}, ""},
+		{"token file owned by root", 0, map[string]int{"git-sync.json": euid, "token": 0}, ""},
+		{"token file owned by another user", 0, map[string]int{"git-sync.json": euid, "token": 1001}, "token_file"},
+		{"owner of the token file cannot be determined", 0, map[string]int{"git-sync.json": euid}, "token_file"},
+		{"config owned by root", 0, map[string]int{"git-sync.json": 0, "token": euid}, ""},
+		{"config owned by another user and naming a token file", 0, map[string]int{"git-sync.json": 1001, "token": euid}, "uses token_file"},
+		// A `docker exec -u 0` session: everything the image's user (65532) owns is foreign to root.
+		{"running as root, token file owned by the image user", -1, map[string]int{"git-sync.json": 0, "token": 65532}, "token_file"},
+		{"running as root, config owned by the image user and naming a token file", -1, map[string]int{"git-sync.json": 65532, "token": 0}, "uses token_file"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defer gitsync.SetOwnerForTest(owners(tt.owners), euid)()
+			e := euid
+			if tt.euid == -1 {
+				e = 0
+			}
+			defer gitsync.SetOwnerForTest(owners(tt.owners), e)()
 			tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-owner", 0o600)
 			_, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "p", tf)))
 			switch {
@@ -436,6 +447,13 @@ func TestSources(t *testing.T) {
 			for _, rendered := range []string{fmt.Sprint(src), fmt.Sprintf("%v", src), fmt.Sprintf("%+v", src), src.String()} {
 				if strings.ContainsAny(rendered, "[]") || len(rendered) > len(src.Path)+len(" (not read)") {
 					t.Errorf("formatted Source %q has more than the path", rendered)
+				}
+			}
+			// %#v of the value, of a slice, and of a *LoadError must not print the fingerprint either.
+			le := &gitsync.LoadError{Sources: s.Sources()}
+			for _, rendered := range []string{fmt.Sprintf("%#v", src), fmt.Sprintf("%#v", s.Sources()), fmt.Sprintf("%#v", le), fmt.Sprintf("%+v", le)} {
+				if strings.Contains(rendered, "digest") || strings.Contains(rendered, "uint8") {
+					t.Errorf("a %%#v rendering exposes the fingerprint: %s", rendered)
 				}
 			}
 		}
@@ -635,5 +653,44 @@ func TestNewTokenFileDirectoryWarning(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "directory is writable by other users") {
 		t.Errorf("expected a directory warning, got %q", logs)
+	}
+}
+
+// After Remove or Set of a token-file provider, Sources lists only what a fresh load would: a token
+// file nobody references any more is gone, and one still referenced keeps its fingerprint.
+func TestSourcesAfterWritesDropUnreferencedTokenFiles(t *testing.T) {
+	dir := t.TempDir()
+	tfA := writeFile(t, dir, "a-token", tokenSentinel+"-a", 0o600)
+	tfB := writeFile(t, dir, "b-token", tokenSentinel+"-b", 0o600)
+	path := writeConfig(t, fmt.Sprintf(`{
+		"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": %q},
+		"b": {"base_url": "https://git-b.example.test/", "auth": "bearer", "token_file": %q}
+	}`, tfA, tfB))
+	s, err := gitsync.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := func(step string) {
+		t.Helper()
+		reloaded, err := gitsync.New(path)
+		if err != nil {
+			t.Fatalf("%s: reload: %v", step, err)
+		}
+		if !sourcesEqual(s.Sources(), reloaded.Sources()) {
+			t.Errorf("%s: Sources = %v, a fresh load has %v", step, s.Sources(), reloaded.Sources())
+		}
+	}
+	if err := s.Remove("a"); err != nil {
+		t.Fatal(err)
+	}
+	same("after Remove")
+	if err := s.Set("b", gitsync.LocalEntry{BaseURL: "https://git-b.example.test/", Auth: "bearer", Token: "inline-token-0123456789"}); err != nil {
+		t.Fatal(err)
+	}
+	same("after Set with an inline token")
+	for _, src := range s.Sources() {
+		if src.Path == tfA || src.Path == tfB {
+			t.Errorf("%v is no longer referenced but is still listed", src)
+		}
 	}
 }
