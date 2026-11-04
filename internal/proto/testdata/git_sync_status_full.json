@@ -1,0 +1,38 @@
+{
+  "type": "git_sync_status",
+  "config_version": "2026-01-02.1",
+  "earliest_push_token_expires_at": "2026-01-01T00:00:00Z",
+  "sent_at": "2026-01-02T03:04:05.000000000Z",
+  "sequence": 4,
+  "boot_id": "boot-synthetic-0001",
+  "repositories": [
+    {
+      "repo_id": "repo-a",
+      "state": "ok",
+      "origin_default_branch": "main",
+      "last_attempt_at": "2026-01-02T03:00:00Z",
+      "last_success_at": "2026-01-02T03:00:00Z",
+      "duration_ms": 8250,
+      "refs_pushed": 0,
+      "newest_origin_commit_at": "2026-01-01T22:15:30Z"
+    },
+    {
+      "repo_id": "repo-b",
+      "state": "error",
+      "last_attempt_at": "2026-01-02T03:01:00Z",
+      "last_success_at": null,
+      "duration_ms": 120,
+      "error_type": "origin_unreachable"
+    },
+    {
+      "repo_id": "repo-c",
+      "state": "pending",
+      "last_success_at": null
+    }
+  ],
+  "config_error": {
+    "config_version": 8,
+    "reason": "limits_out_of_range"
+  },
+  "suspended": "critical_update_required"
+}
