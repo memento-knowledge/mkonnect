@@ -10,6 +10,7 @@ Administrator guides live in [`docs/`](docs/):
 
 - **[Installation guide](docs/installation.md)** — [system requirements](docs/installation.md#system-requirements), deploy with Docker or Helm, verify the connection, upgrade, and uninstall.
 - **[Setup guide](docs/setup.md)** — make your internal tools reachable and attach credentials safely.
+- **[git-sync guide](docs/git-sync.md)** and **[git-sync security and data handling](docs/git-sync-security.md)** — the optional add-on that mirrors selected internal git repositories to Memento, with a separate image, connector ID, and volume.
 
 The rest of this README is a conceptual overview and configuration reference.
 
