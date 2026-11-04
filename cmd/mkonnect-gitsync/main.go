@@ -71,6 +71,20 @@ func main() {
 		log.Printf("mkonnect-gitsync: WARNING: %s; syncing and the origin reachability check need git >= 2.31", detail)
 	}
 
+	// Resolve (and create) the temp root now so a bad GIT_SYNC_TMP_DIR fails at startup rather than
+	// on the first sync, then clear temp homes a previous crash left behind. Best effort.
+	tmpRoot, err := gitsync.TempRoot()
+	if err != nil {
+		log.Fatalf("mkonnect-gitsync: %v", err)
+	}
+	n, err := gitsync.SweepStaleTempHomes(tmpRoot, staleTempHomeAge)
+	if n > 0 {
+		log.Printf("mkonnect-gitsync: removed %d stale temp directories from %s", n, tmpRoot)
+	}
+	if err != nil {
+		log.Printf("mkonnect-gitsync: WARNING: could not fully clean stale temp directories in %s: %v", tmpRoot, err)
+	}
+
 	bootID, err := randomBootID()
 	if err != nil {
 		log.Fatalf("mkonnect-gitsync: could not generate a boot id: %v", err)
@@ -97,6 +111,9 @@ func main() {
 
 // shutdownWait bounds how long the daemon waits, after cancellation, for syncs to stop.
 const shutdownWait = 10 * time.Second
+
+// staleTempHomeAge is how old a leftover temp home must be before the startup sweep removes it.
+const staleTempHomeAge = time.Minute
 
 // randomBootID returns a random per-process identifier so the platform can tell a status stream
 // apart from the one before a restart (a sequence number alone restarts at a lower value).
