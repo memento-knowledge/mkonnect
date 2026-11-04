@@ -60,7 +60,15 @@ func TestAttributesScanner(t *testing.T) {
 		{"an ignored last line", lfsRule[:0] + long(3000), false},
 		{"a negative pattern", "!*.psd filter=lfs\n", false},
 		{"a non-ascii space does not separate fields", "*.psd\u00a0filter=lfs\n", false},
-		{"a vertical tab separates fields", "*.psd\vfilter=lfs\n", true},
+		{"a vertical tab does not separate fields", "*.psd\vfilter=lfs\n", false},
+		{"a quoted negative pattern", "\"!x\" filter=lfs\n", false},
+		{"filter=lfs inside a quoted pattern", "\"a filter=lfs b\" -text\n", false},
+		{"an escaped quote inside a quoted pattern", "\"a\\\"b\" filter=lfs\n", true},
+		{"an unterminated quoted pattern", "\"a b filter=lfs\n", false},
+		{"one invalid attribute name voids the line", "*.bin filter=lfs bad^name\n", false},
+		{"an attribute name starting with a dash after the prefix", "*.bin filter=lfs --x\n", false},
+		{"unset and unspecified attributes are valid names", "*.bin -text !diff filter=lfs\n", true},
+		{"an attribute value may hold anything", "*.bin filter=lfs eol=l^f\n", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -297,7 +305,7 @@ func TestSyncRepoLFSDetectionFailureNeverFailsTheSync(t *testing.T) {
 	}
 }
 
-func TestSyncRepoLFSDetectionTimeoutIsNotAFailure(t *testing.T) {
+func TestUsesLFSGivesUpWhenItsContextExpires(t *testing.T) {
 	d := newStatsDeps(t, lfsGit("", ""))
 	// The lookup waits for its context, as a wedged git would.
 	d.runOut = func(ctx context.Context, argv, env []string, dir string, w io.Writer) ([]byte, error) {
@@ -494,7 +502,7 @@ func TestSyncRepoDetectsLFSAgainstRealGit(t *testing.T) {
 			name: "a .gitattributes that is a symlink is not read, as git does not read it",
 			setup: func(o *lfsOrigin) {
 				if err := os.Symlink("elsewhere", filepath.Join(o.work, ".gitattributes")); err != nil {
-					t.Skipf("symlinks unavailable: %v", err)
+					o.t.Skipf("symlinks unavailable: %v", err)
 				}
 				o.commit(map[string]string{"elsewhere": lfsRule})
 				o.push("main")
@@ -504,7 +512,7 @@ func TestSyncRepoDetectsLFSAgainstRealGit(t *testing.T) {
 			name: "a rule only on another branch is not examined",
 			setup: func(o *lfsOrigin) {
 				o.commit(map[string]string{"a.txt": "a"})
-				git(t, o.work, "checkout", "-b", "feature")
+				git(o.t, o.work, "checkout", "-b", "feature")
 				o.commit(map[string]string{".gitattributes": lfsRule})
 				o.push("main", "feature")
 			},
@@ -513,10 +521,10 @@ func TestSyncRepoDetectsLFSAgainstRealGit(t *testing.T) {
 			name: "the default branch is the one examined, whatever its name",
 			setup: func(o *lfsOrigin) {
 				o.commit(map[string]string{"a.txt": "a"})
-				git(t, o.work, "checkout", "-b", "develop")
+				git(o.t, o.work, "checkout", "-b", "develop")
 				o.commit(map[string]string{".gitattributes": lfsRule})
 				o.push("main", "develop")
-				git(t, "", "--git-dir="+o.bare, "symbolic-ref", "HEAD", "refs/heads/develop")
+				git(o.t, "", "--git-dir="+o.bare, "symbolic-ref", "HEAD", "refs/heads/develop")
 			},
 			want: []string{WarnLFSNotReplicated},
 		},
@@ -526,8 +534,8 @@ func TestSyncRepoDetectsLFSAgainstRealGit(t *testing.T) {
 			o := newLFSOrigin(t, "main")
 			tt.setup(o)
 			got := o.sync()
-			if !slices.Equal(got.Warnings, tt.want) {
-				t.Errorf("Warnings = %v, want %v", got.Warnings, tt.want)
+			if !slices.Equal(got.Warnings, tt.want) || got.WarningsUndecided {
+				t.Errorf("Warnings = %v undecided = %v, want %v decided", got.Warnings, got.WarningsUndecided, tt.want)
 			}
 		})
 	}
@@ -567,8 +575,8 @@ func TestSyncRepoOversizeAttributesAreNotRead(t *testing.T) {
 	o := newLFSOrigin(t, "main")
 	o.commit(map[string]string{".gitattributes": strings.Repeat("# padding\n", maxAttributesBytes/len("# padding\n")+10) + lfsRule})
 	o.push("main")
-	if got := o.sync(); got.Warnings != nil {
-		t.Errorf("Warnings = %v, want none for a file over the bound", got.Warnings)
+	if got := o.sync(); got.Warnings != nil || !got.WarningsUndecided {
+		t.Errorf("Warnings = %v undecided = %v, want none and undecided for a file over the bound", got.Warnings, got.WarningsUndecided)
 	}
 }
 

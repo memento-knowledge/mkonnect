@@ -76,8 +76,8 @@ func TestLFSWarningLifecycleInStatus(t *testing.T) {
 	}
 }
 
-// An undecided first sync has nothing to keep, and a pending repository carries no warning after a
-// restart until a sync has run.
+// A repository carries no warning after a restart until a sync has finished: the status then has no
+// result at all.
 func TestLFSWarningAbsentWhenNeverDecided(t *testing.T) {
 	h := newHarness(t)
 	h.git.set(func() {
@@ -95,5 +95,38 @@ func TestLFSWarningAbsentWhenNeverDecided(t *testing.T) {
 	waitFor(t, func() bool { return h2.git.count("fetch") == 1 })
 	if r := h2.status("repo-a"); r.State != gitsync.StateSyncing || len(r.Warnings) != 0 {
 		t.Errorf("status after a restart = %+v, want no warning before the first sync has finished", r)
+	}
+}
+
+// A first sync that cannot tell has no earlier warning to keep, and a warning from before a failure
+// is not resurrected by a later sync that cannot tell either.
+func TestLFSUndecidedSyncKeepsNothingItNeverHad(t *testing.T) {
+	h := newHarness(t)
+	h.git.set(func() { h.git.fail["ls-tree"] = []byte("fatal: bad object") })
+	h.configA()
+	if r := h.settle(); r.State != gitsync.StateOK || len(r.Warnings) != 0 {
+		t.Fatalf("first undecided sync = %+v, want ok with no warnings", r)
+	}
+
+	h.git.set(func() {
+		delete(h.git.fail, "ls-tree")
+		h.git.stdout["ls-tree"] = lfsClientEntry
+		h.git.stdout["cat-file"] = lfsClientRule
+	})
+	h.syncNow()
+	if r := h.settle(); len(r.Warnings) != 1 {
+		t.Fatalf("decided sync = %+v, want the warning", r)
+	}
+	h.git.set(func() {
+		h.git.fail["fetch"] = []byte("fatal: unable to access 'https://git.example.com/team/a.git/': The requested URL returned error: 403")
+	})
+	h.syncNow()
+	if r := h.settle(); r.State != gitsync.StateError {
+		t.Fatalf("failed sync = %+v, want error", r)
+	}
+	h.git.set(func() { delete(h.git.fail, "fetch"); h.git.fail["ls-tree"] = []byte("fatal: bad object") })
+	h.syncNow()
+	if r := h.settle(); r.State != gitsync.StateOK || len(r.Warnings) != 0 {
+		t.Errorf("undecided sync after a failure = %+v, want ok with no warnings: the earlier warning predates the failure", r)
 	}
 }

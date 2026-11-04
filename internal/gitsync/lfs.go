@@ -27,7 +27,13 @@ import (
 //     nothing uses, still flags the repository (a false positive).
 //   - The ref is looked up by its full name, but git still falls back to other namespaces (a tag
 //     literally named refs/heads/<branch>) when the branch is missing from the mirror. That can only
-//     misreport a repository whose origin chose to confuse it, and it bounds nothing.
+//     misreport a repository whose origin chose to confuse it; it costs nothing extra to do so.
+//   - The line parser follows git's rules for what makes a line count (see assignsLFSFilter) but is
+//     not a reimplementation of git's attribute machinery; where it differs it errs towards
+//     reporting.
+//   - A warning is only ever cleared by a sync that decides. If detection becomes permanently
+//     undecided (the origin stops advertising its HEAD, or the file grows past the size read), the
+//     last warning stays until it does, and the only trace is a debug log line.
 //   - It distinguishes "no" from "cannot tell" (the default branch was not learned in this sync, git
 //     failed or timed out, or the file is larger than it will read). Only "no" clears a warning the
 //     repository already carried: finishSync keeps the previous warnings across an undecided sync, so
@@ -58,6 +64,9 @@ const (
 	// lfsFilterAttribute is the attribute assignment `git lfs track` writes, as a whole field.
 	lfsFilterAttribute = "filter=lfs"
 	utf8BOM            = "\xef\xbb\xbf"
+	// attributeBlanks are the characters git treats as blank in a .gitattributes line (newline having
+	// already ended it).
+	attributeBlanks = " \t\r"
 )
 
 // Reasons detection did not reach a verdict, logged as-is. They are fixed words: nothing from git or
@@ -273,21 +282,80 @@ func (s *attributesScanner) Found() bool {
 	return s.found
 }
 
-// assignsLFSFilter reports whether one .gitattributes line, without its newline, sets filter=lfs.
+// assignsLFSFilter reports whether one .gitattributes line, without its newline, sets filter=lfs, with
+// the rules of git's own parser that decide whether a line counts at all: the blank characters are
+// space, tab and carriage return; a comment line, a negative pattern (also when quoted) and a line
+// whose quoting is unterminated are ignored; the pattern may be a C-quoted string, so what follows a
+// quoted pattern is the attributes; and one invalid attribute name makes git ignore the whole line.
 func assignsLFSFilter(line []byte, first bool) bool {
 	text := string(line)
 	if first {
 		text = strings.TrimPrefix(text, utf8BOM)
 	}
-	// git splits on ASCII whitespace only, and ignores a comment and a negative pattern.
-	fields := strings.FieldsFunc(text, func(r rune) bool { return strings.ContainsRune(" \t\r\v\f", r) })
-	if len(fields) == 0 || fields[0][0] == '#' || fields[0][0] == '!' {
+	text = strings.TrimLeft(text, attributeBlanks)
+	if text == "" || text[0] == '#' {
 		return false
 	}
-	for _, attr := range fields[1:] {
+	var pattern, rest string
+	if text[0] == '"' {
+		end := closingQuote(text)
+		if end < 0 {
+			return false
+		}
+		pattern, rest = text[1:end], text[end+1:]
+	} else {
+		end := strings.IndexAny(text, attributeBlanks)
+		if end < 0 {
+			return false
+		}
+		pattern, rest = text[:end], text[end:]
+	}
+	if strings.HasPrefix(pattern, "!") {
+		return false
+	}
+	found := false
+	for attr := range strings.FieldsFuncSeq(rest, func(r rune) bool { return strings.ContainsRune(attributeBlanks, r) }) {
+		var name string
+		if attr[0] == '-' || attr[0] == '!' {
+			name = attr[1:]
+		} else {
+			name, _, _ = strings.Cut(attr, "=")
+		}
+		if !validAttributeName(name) {
+			return false
+		}
 		if attr == lfsFilterAttribute {
-			return true
+			found = true
 		}
 	}
-	return false
+	return found
+}
+
+// closingQuote returns the index of the quote that closes the string text opens, honouring backslash
+// escapes, or -1 when there is none.
+func closingQuote(text string) int {
+	for i := 1; i < len(text); i++ {
+		switch text[i] {
+		case '\\':
+			i++
+		case '"':
+			return i
+		}
+	}
+	return -1
+}
+
+// validAttributeName is git's attr_name_valid: not empty, not starting with '-', and made of letters,
+// digits, '-', '.' and '_'.
+func validAttributeName(name string) bool {
+	if name == "" || name[0] == '-' {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' && c != '.' && c != '_' {
+			return false
+		}
+	}
+	return true
 }
