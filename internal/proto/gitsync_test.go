@@ -86,6 +86,7 @@ func TestGitSyncConfigMsgGoldenDecode(t *testing.T) {
 func TestGitSyncStatusMsgGolden(t *testing.T) {
 	cv := json.RawMessage("7")
 	exp := "2026-01-01T00:00:00Z"
+	lastSuccess := "2026-01-02T03:00:00Z"
 	msg := proto.GitSyncStatusMsg{
 		Type:                       "git_sync_status",
 		ConfigVersion:              cv,
@@ -97,7 +98,7 @@ func TestGitSyncStatusMsgGolden(t *testing.T) {
 		Repositories: []proto.GitSyncRepoStatus{
 			{RepoID: "repo-a", State: "pending", OriginDefaultBranch: "main"},
 			{RepoID: "repo-b", State: "error", ErrorType: "origin_access_denied", ErrorDetail: "host not configured locally"},
-			{RepoID: "repo-c", State: "ok", Warnings: []string{"lfs_not_replicated"}},
+			{RepoID: "repo-c", State: "ok", LastSuccessAt: &lastSuccess, Warnings: []string{"lfs_not_replicated"}},
 		},
 	}
 	if got := marshalToObject(t, msg); !reflect.DeepEqual(got, readGoldenObject(t, "git_sync_status.json")) {
@@ -111,6 +112,200 @@ func TestGitSyncStatusMsgGolden(t *testing.T) {
 	if decoded.BootID != "boot-synthetic-0001" || decoded.Sequence != 3 || decoded.OriginCheck == nil ||
 		decoded.OriginCheck.Result != "reachable" || decoded.Repositories[0].OriginDefaultBranch != "main" {
 		t.Errorf("status golden decoded unexpectedly: %+v", decoded)
+	}
+}
+
+// The pre-existing config golden carries neither schedule nor limits; it must keep decoding with both
+// nil, which the connector reads as "use the built-in defaults".
+func TestGitSyncConfigWithoutScheduleOrLimits(t *testing.T) {
+	var msg proto.GitSyncConfigMsg
+	if err := json.Unmarshal(readGolden(t, "git_sync_config.json"), &msg); err != nil {
+		t.Fatalf("unmarshal golden: %v", err)
+	}
+	if msg.Schedule != nil || msg.Limits != nil {
+		t.Errorf("schedule/limits = %+v / %+v, want both nil when absent", msg.Schedule, msg.Limits)
+	}
+	if _, ok := marshalToObject(t, proto.GitSyncConfigMsg{Type: "git_sync_config"})["schedule"]; ok {
+		t.Error("nil Schedule must be omitted")
+	}
+	if _, ok := marshalToObject(t, proto.GitSyncConfigMsg{Type: "git_sync_config"})["limits"]; ok {
+		t.Error("nil Limits must be omitted")
+	}
+}
+
+func TestGitSyncConfigScheduleLimitsGoldenDecode(t *testing.T) {
+	var msg proto.GitSyncConfigMsg
+	if err := json.Unmarshal(readGolden(t, "git_sync_config_limits.json"), &msg); err != nil {
+		t.Fatalf("unmarshal golden: %v", err)
+	}
+	if string(msg.ConfigVersion) != `"2026-01-02.1"` || len(msg.Repositories) != 1 {
+		t.Errorf("envelope decoded unexpectedly: version=%s repos=%d", msg.ConfigVersion, len(msg.Repositories))
+	}
+	if msg.Schedule == nil || msg.Schedule.IntervalSeconds == nil || *msg.Schedule.IntervalSeconds != 900 {
+		t.Errorf("schedule = %+v, want interval_seconds 900", msg.Schedule)
+	}
+	if msg.Limits == nil {
+		t.Fatal("limits missing")
+	}
+	got := map[string]*int{
+		"max_concurrency":       msg.Limits.MaxConcurrency,
+		"push_batch_refs":       msg.Limits.PushBatchRefs,
+		"pack_threads":          msg.Limits.PackThreads,
+		"pack_window_memory_mb": msg.Limits.PackWindowMemoryMB,
+		"max_repository_mb":     msg.Limits.MaxRepositoryMB,
+		"push_timeout_seconds":  msg.Limits.PushTimeoutSeconds,
+	}
+	want := map[string]int{
+		"max_concurrency": 2, "push_batch_refs": 5000, "pack_threads": 0,
+		"pack_window_memory_mb": 256, "max_repository_mb": 20480, "push_timeout_seconds": 1800,
+	}
+	for k, w := range want {
+		if got[k] == nil || *got[k] != w {
+			t.Errorf("limits.%s = %v, want %d", k, got[k], w)
+		}
+	}
+}
+
+// TestGitSyncLimitsAbsentVersusZero pins that an absent limit is nil while an explicit 0 survives as a
+// non-nil pointer, because 0 is meaningful for several limits (unbatched, no ceiling, git default).
+func TestGitSyncLimitsAbsentVersusZero(t *testing.T) {
+	var l proto.GitSyncLimits
+	if err := json.Unmarshal([]byte(`{"pack_threads":0,"max_concurrency":3}`), &l); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if l.PackThreads == nil || *l.PackThreads != 0 {
+		t.Errorf("explicit pack_threads 0 = %v, want non-nil 0", l.PackThreads)
+	}
+	if l.MaxConcurrency == nil || *l.MaxConcurrency != 3 {
+		t.Errorf("max_concurrency = %v, want 3", l.MaxConcurrency)
+	}
+	if l.PushBatchRefs != nil || l.PackWindowMemoryMB != nil || l.MaxRepositoryMB != nil || l.PushTimeoutSeconds != nil {
+		t.Errorf("absent limits must stay nil: %+v", l)
+	}
+	if got := marshalToObject(t, l); !reflect.DeepEqual(got, map[string]any{"pack_threads": float64(0), "max_concurrency": float64(3)}) {
+		t.Errorf("marshalled limits = %v, want only the two supplied fields", got)
+	}
+}
+
+func TestGitSyncConfigWrongTypeLimitRejected(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"git_sync_config","limits":{"max_concurrency":"four"}}`,
+		`{"type":"git_sync_config","schedule":{"interval_seconds":1.5}}`,
+		`{"type":"git_sync_config","limits":[]}`,
+	} {
+		var msg proto.GitSyncConfigMsg
+		if err := json.Unmarshal([]byte(raw), &msg); err == nil {
+			t.Errorf("expected unmarshal error for %s, got none: %+v", raw, msg)
+		}
+	}
+}
+
+func TestGitSyncStatusFullGolden(t *testing.T) {
+	ts := func(s string) *string { return &s }
+	i := func(n int) *int { return &n }
+	d := int64(8250)
+	d2 := int64(120)
+	msg := proto.GitSyncStatusMsg{
+		Type:                       "git_sync_status",
+		ConfigVersion:              json.RawMessage(`"2026-01-02.1"`),
+		EarliestPushTokenExpiresAt: ts("2026-01-01T00:00:00Z"),
+		SentAt:                     "2026-01-02T03:04:05.000000000Z",
+		Sequence:                   4,
+		BootID:                     "boot-synthetic-0001",
+		Repositories: []proto.GitSyncRepoStatus{
+			{
+				RepoID: "repo-a", State: "ok", OriginDefaultBranch: "main",
+				LastAttemptAt: ts("2026-01-02T03:00:00Z"), LastSuccessAt: ts("2026-01-02T03:00:00Z"),
+				DurationMS: &d, RefsPushed: i(0), NewestOriginCommitAt: ts("2026-01-01T22:15:30Z"),
+			},
+			{
+				RepoID: "repo-b", State: "error", LastAttemptAt: ts("2026-01-02T03:01:00Z"),
+				DurationMS: &d2, ErrorType: "origin_unreachable",
+			},
+			{RepoID: "repo-c", State: "pending"},
+		},
+		ConfigError: &proto.GitSyncConfigError{ConfigVersion: json.RawMessage("8"), Reason: proto.GitSyncConfigErrLimitsOutOfRange},
+		Suspended:   proto.GitSyncSuspendedCriticalUpdate,
+	}
+	want := readGoldenObject(t, "git_sync_status_full.json")
+	if got := marshalToObject(t, msg); !reflect.DeepEqual(got, want) {
+		t.Errorf("marshalled status does not match golden\n got: %v\nwant: %v", got, want)
+	}
+
+	var decoded proto.GitSyncStatusMsg
+	if err := json.Unmarshal(readGolden(t, "git_sync_status_full.json"), &decoded); err != nil {
+		t.Fatalf("unmarshal golden: %v", err)
+	}
+	a := decoded.Repositories[0]
+	if a.RefsPushed == nil || *a.RefsPushed != 0 || a.DurationMS == nil || *a.DurationMS != 8250 ||
+		a.LastSuccessAt == nil || *a.LastSuccessAt != "2026-01-02T03:00:00Z" ||
+		a.LastAttemptAt == nil || a.NewestOriginCommitAt == nil || *a.NewestOriginCommitAt != "2026-01-01T22:15:30Z" {
+		t.Errorf("repo-a decoded unexpectedly: %+v", a)
+	}
+	if decoded.Repositories[1].LastSuccessAt != nil || decoded.Repositories[2].LastAttemptAt != nil {
+		t.Errorf("null/absent timestamps must decode to nil: %+v", decoded.Repositories)
+	}
+	if decoded.ConfigError == nil || string(decoded.ConfigError.ConfigVersion) != "8" ||
+		decoded.ConfigError.Reason != "limits_out_of_range" || decoded.Suspended != "critical_update_required" {
+		t.Errorf("config_error/suspended decoded unexpectedly: %+v / %q", decoded.ConfigError, decoded.Suspended)
+	}
+}
+
+// TestGitSyncNewStatusFieldPresence pins which of the new status fields are omitted when unset and
+// which are present as null: a config_error without a usable version still carries config_version
+// as null. last_success_at is omitted while unset because the connector does not yet record success
+// times; it is meant to become present-as-null in the change that populates it.
+func TestGitSyncNewStatusFieldPresence(t *testing.T) {
+	repo := marshalToObject(t, proto.GitSyncRepoStatus{RepoID: "r", State: "pending"})
+	for _, k := range []string{"last_attempt_at", "last_success_at", "duration_ms", "refs_pushed", "newest_origin_commit_at"} {
+		if _, ok := repo[k]; ok {
+			t.Errorf("empty GitSyncRepoStatus must omit %q, got %v", k, repo)
+		}
+	}
+	var decoded proto.GitSyncRepoStatus
+	if err := json.Unmarshal([]byte(`{"repo_id":"r","state":"pending","last_success_at":null}`), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.LastSuccessAt != nil {
+		t.Errorf("last_success_at null decoded to %q, want nil", *decoded.LastSuccessAt)
+	}
+
+	msg := marshalToObject(t, proto.GitSyncStatusMsg{Type: "git_sync_status"})
+	for _, k := range []string{"config_error", "suspended"} {
+		if _, ok := msg[k]; ok {
+			t.Errorf("empty GitSyncStatusMsg must omit %q", k)
+		}
+	}
+
+	ce := marshalToObject(t, proto.GitSyncStatusMsg{
+		Type: "git_sync_status", ConfigError: &proto.GitSyncConfigError{Reason: proto.GitSyncConfigErrMalformedMessage},
+	})["config_error"].(map[string]any)
+	if v, ok := ce["config_version"]; !ok || v != nil {
+		t.Errorf("config_error.config_version should be present as null, got %v ok=%v", v, ok)
+	}
+	if ce["reason"] != "malformed_message" {
+		t.Errorf("config_error.reason = %v, want malformed_message", ce["reason"])
+	}
+}
+
+// TestGitSyncConfigErrorWireStringsPinned fails if a config_error reason or the suspended value
+// drifts; these are the strings the platform matches on, so they change only deliberately.
+func TestGitSyncConfigErrorWireStringsPinned(t *testing.T) {
+	got := []string{
+		proto.GitSyncConfigErrTooManyRepositories, proto.GitSyncConfigErrInvalidRepoID,
+		proto.GitSyncConfigErrDuplicateRepoID, proto.GitSyncConfigErrInvalidConfigVersion,
+		proto.GitSyncConfigErrLimitsOutOfRange, proto.GitSyncConfigErrMalformedMessage,
+		proto.GitSyncConfigErrReplicaHostMismatch, proto.GitSyncConfigErrReplicaHostNotPinned,
+	}
+	want := []string{
+		"too_many_repositories", "invalid_repo_id", "duplicate_repo_id", "invalid_config_version",
+		"limits_out_of_range", "malformed_message", "replica_host_mismatch", "replica_host_not_pinned",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("config_error reason wire strings drifted:\n got %v\nwant %v", got, want)
+	}
+	if proto.GitSyncSuspendedCriticalUpdate != "critical_update_required" {
+		t.Errorf("suspended wire string drifted: %q", proto.GitSyncSuspendedCriticalUpdate)
 	}
 }
 
