@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"path/filepath"
 	"slices"
@@ -74,16 +75,28 @@ const defaultDrainTimeout = 5 * time.Second
 type Option func(*clientOptions)
 
 type clientOptions struct {
-	run            runFunc
-	mirrorsRoot    string
-	drainTimeout   time.Duration
-	statusInterval time.Duration
-	replicaHost    string // raw pin value; canonicalised by NewClient
+	run runFunc
+	// runOut is how git is executed when its standard output is needed. Unset, it defaults to the
+	// real git unless run was replaced (see WithGitRunner).
+	runOut          outRunFunc
+	runOverridden   bool
+	runSaveInterval time.Duration
+	mirrorsRoot     string
+	drainTimeout    time.Duration
+	statusInterval  time.Duration
+	replicaHost     string // raw pin value; canonicalised by NewClient
 }
 
 // defaultStatusInterval is the minimum spacing between statuses sent because syncs finished. Each
 // status echoes every repository, so one per completion would cost O(N²) bytes across N repositories.
 const defaultStatusInterval = time.Second
+
+// defaultRunSaveInterval is the minimum spacing between writes of the run state. Each write is the
+// whole file, so one per finished sync would cost O(N²) bytes across N repositories. The first write
+// after a quiet period is immediate and any that follow are folded into one trailing write; a crash
+// can therefore lose at most this much of the most recent attempts' bookkeeping, which the next
+// attempt replaces.
+const defaultRunSaveInterval = 5 * time.Second
 
 // WithStatusInterval sets the minimum spacing between completion-triggered statuses. The first is
 // sent immediately and the last state is always flushed within one interval. The default is one second.
@@ -100,9 +113,12 @@ func WithReplicaHost(host string) Option {
 }
 
 // WithGitRunner replaces how git is executed. The default runs the real git binary in the locked-down
-// environment (see runGit).
+// environment (see runGit). A runner that returns only stderr cannot supply git's standard output,
+// which the sync statistics (refs_pushed, newest_origin_commit_at, origin_default_branch) and a push's
+// per-ref rejection reasons are read from, so replacing it turns those off; the other run-state
+// fields are unaffected.
 func WithGitRunner(run func(ctx context.Context, argv, env []string, dir string) ([]byte, error)) Option {
-	return func(o *clientOptions) { o.run = run }
+	return func(o *clientOptions) { o.run, o.runOverridden = run, true }
 }
 
 // WithMirrorsRoot sets the directory the bare mirrors live under. The default is DefaultMirrorsRoot.
@@ -171,6 +187,19 @@ type Client struct {
 	// a later one is accepted. See rejectConfig.
 	configErr *proto.GitSyncConfigError
 	repos     map[string]repoState // by repo_id
+	// runs is what is remembered of each repository's attempts (see runRecord), by repo_id. It is
+	// loaded from runStore at startup and written back after every change. It is guarded by mu, like
+	// repos, so a status is built from one consistent view of both.
+	runs     map[string]runRecord
+	runStore *runStateStore
+
+	// Writes of runs are coalesced: see markRunsDirty.
+	runSaveEvery  time.Duration
+	saveMu        sync.Mutex
+	runsDirty     bool
+	lastRunSave   time.Time // wall clock, not c.now: it paces real timers
+	saveScheduled bool
+	saveTimer     *time.Timer
 	// connCtx/connSender are the current connection's context and sender, captured in OnConnected.
 	// A probe started from a heartbeat must run under the connection's lifetime, NOT the
 	// per-heartbeat context the gateway cancels as soon as OnHeartbeat returns.
@@ -188,9 +217,12 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	if now == nil {
 		now = time.Now
 	}
-	o := clientOptions{run: runGit, mirrorsRoot: DefaultMirrorsRoot(), drainTimeout: defaultDrainTimeout, statusInterval: defaultStatusInterval}
+	o := clientOptions{run: runGit, mirrorsRoot: DefaultMirrorsRoot(), drainTimeout: defaultDrainTimeout, statusInterval: defaultStatusInterval, runSaveInterval: defaultRunSaveInterval}
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.runOut == nil && !o.runOverridden {
+		o.runOut = runGitOut
 	}
 	// git runs in a temporary directory, so a relative mirrors root would be resolved against that
 	// (and lost with it) by git while Exists resolved it against the daemon's working directory.
@@ -206,16 +238,20 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		now:            now,
 		bootID:         bootID,
 		repos:          map[string]repoState{},
+		runStore:       newRunStateStore(root),
+		runSaveEvery:   o.runSaveInterval,
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
 		gc:             newMirrorGC(),
 		replicaHost:    replicaHost,
 	}
+	c.runs = c.runStore.load()
 	c.mgr = newManager(defaultSyncConcurrency,
-		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, now: now},
+		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, runOut: o.runOut, now: now},
 		syncHooks{
 			resolve:   c.resolveTask,
 			begin:     c.beginSync,
+			started:   c.startAttempt,
 			finish:    c.finishAndReschedule,
 			release:   c.releaseSync,
 			suspended: c.criticalPatchRequired.Load,
@@ -408,6 +444,21 @@ func (c *Client) setSyncing(repoID string, syncing bool) {
 	defer c.mu.Unlock()
 	if r, ok := c.repos[repoID]; ok {
 		r.syncing = syncing
+		if !syncing {
+			r.attemptStartedAt = time.Time{}
+		}
+		c.repos[repoID] = r
+	}
+}
+
+// startAttempt records when the attempt now running for t began, so a status sent while it runs
+// reports it as last_attempt_at. A task whose target no longer matches the repository's current
+// configuration is ignored, as finishSync ignores its result.
+func (c *Client) startAttempt(repoID string, t syncTask, at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.repos[repoID]; ok && targetMatches(r, t) {
+		r.attemptStartedAt = at
 		c.repos[repoID] = r
 	}
 }
@@ -415,19 +466,127 @@ func (c *Client) setSyncing(repoID string, syncing bool) {
 // finishSync records a sync's outcome and clears the syncing mark. A task whose target no longer
 // matches the repository's configuration (the platform reconfigured it mid-sync) is ignored, so a
 // stale result is never attributed to the new target. A pending result means the sync was
-// cancelled; nothing is recorded.
+// cancelled; nothing is recorded. Every other result, a failure as much as a success, is a finished
+// attempt and updates the repository's run record, which is then saved: a failure to save is logged
+// by the store and never affects the sync.
 func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	r, ok := c.repos[repoID]
 	if !ok || !targetMatches(r, t) {
+		c.mu.Unlock()
 		return
 	}
 	r.syncing = false
-	if res.State != StatePending {
+	r.attemptStartedAt = time.Time{}
+	record := res.State != StatePending
+	if record {
 		r.result = res
+		c.runs[repoID] = c.recordAttempt(c.runs[repoID], r.target, res)
 	}
 	c.repos[repoID] = r
+	c.mu.Unlock()
+	if record {
+		c.markRunsDirty()
+	}
+}
+
+// recordAttempt folds a finished attempt into a repository's run record. last_success_at moves only
+// on a success (a run that found nothing new is one) and is otherwise carried; the attempt's own
+// start, duration and push count always replace the previous attempt's; what the origin looked like
+// is replaced only when this attempt learned it.
+func (c *Client) recordAttempt(rec runRecord, target string, res syncResult) runRecord {
+	if rec.Target != "" && rec.Target != target {
+		rec = runRecord{}
+	}
+	rec.Target = target
+	started, took := res.Stats.StartedAt, res.Stats.Duration
+	if started.IsZero() {
+		started = c.now().Add(-took)
+	}
+	rec.LastAttemptAt = utcSeconds(started)
+	ms := took.Milliseconds()
+	rec.DurationMS = &ms
+	rec.RefsPushed = nil
+	if res.Stats.RefsPushed != nil {
+		n := *res.Stats.RefsPushed
+		rec.RefsPushed = &n
+	}
+	if res.State == StateOK {
+		rec.LastSuccessAt = utcSeconds(started.Add(took))
+	}
+	if !res.Stats.NewestCommitAt.IsZero() {
+		rec.NewestOriginCommitAt = utcSeconds(res.Stats.NewestCommitAt)
+	}
+	if res.Stats.DefaultBranch != "" {
+		rec.OriginDefaultBranch = res.Stats.DefaultBranch
+	}
+	return rec
+}
+
+// utcSeconds is t in UTC at the second precision the status reports.
+func utcSeconds(t time.Time) time.Time { return t.UTC().Truncate(time.Second) }
+
+// markRunsDirty notes that the run records changed and schedules their write. The first change after a
+// quiet period is written at once, so an isolated sync survives a crash; changes that follow within
+// the interval are folded into one trailing write, and Wait flushes whatever is still pending. It must
+// be called without c.mu held.
+func (c *Client) markRunsDirty() {
+	c.saveMu.Lock()
+	c.runsDirty = true
+	wait := c.runSaveEvery - time.Since(c.lastRunSave)
+	if wait <= 0 && !c.saveScheduled {
+		c.lastRunSave = time.Now()
+		c.saveMu.Unlock()
+		c.flushRuns()
+		return
+	}
+	if !c.saveScheduled {
+		c.saveScheduled = true
+		c.saveTimer = time.AfterFunc(wait, c.trailingSave)
+	}
+	c.saveMu.Unlock()
+}
+
+func (c *Client) trailingSave() {
+	c.saveMu.Lock()
+	c.saveScheduled = false
+	c.lastRunSave = time.Now()
+	c.saveMu.Unlock()
+	c.flushRuns()
+}
+
+// flushRuns writes the run records if they changed since the last write. A failed write (logged by
+// the store) leaves them marked changed, so the next flush retries it. The snapshot is taken by the
+// store once it holds its write lock, so concurrent flushes can never write an older state last.
+func (c *Client) flushRuns() {
+	c.saveMu.Lock()
+	if !c.runsDirty {
+		c.saveMu.Unlock()
+		return
+	}
+	c.runsDirty = false
+	c.saveMu.Unlock()
+	err := c.runStore.save(func() map[string]runRecord {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return maps.Clone(c.runs)
+	})
+	if err != nil {
+		c.saveMu.Lock()
+		c.runsDirty = true
+		c.saveMu.Unlock()
+	}
+}
+
+// stopRunSaves cancels a pending trailing write and flushes it now.
+func (c *Client) stopRunSaves() {
+	c.saveMu.Lock()
+	if c.saveTimer != nil {
+		c.saveTimer.Stop()
+	}
+	c.saveScheduled = false
+	c.saveMu.Unlock()
+	c.flushRuns()
 }
 
 // finishAndReschedule records a sync's outcome, then lets the scheduler plan the repository's next
@@ -470,14 +629,15 @@ func targetMatches(r repoState, t syncTask) bool {
 	return r.canonicalURL == t.CanonicalURL && r.replicaURL == t.ReplicaURL
 }
 
-// Wait blocks until no sync is in flight or ctx ends. The daemon calls it after cancelling the
-// process-lifetime context, which kills each git, so it can confirm they have stopped before exiting
-// instead of leaving a process that holds a credential behind.
-// It also waits for the mirror cleanup loop, which stops with the same context; a removal already under
-// way finishes first, so the caller bounds the wait with ctx.
+// Wait blocks until no sync is in flight or ctx ends, then writes any run state still pending. The
+// daemon calls it after cancelling the process-lifetime context, which kills each git, so it can
+// confirm they have stopped before exiting instead of leaving a process that holds a credential
+// behind. It also waits for the mirror cleanup loop, which stops with the same context; a removal
+// already under way finishes first, so the caller bounds the wait with ctx.
 func (c *Client) Wait(ctx context.Context) {
 	c.mgr.drain(ctx)
 	c.gc.wait(ctx)
+	c.stopRunSaves()
 }
 
 // handleSyncNow resolves the repositories an immediate-sync request addresses. A request is

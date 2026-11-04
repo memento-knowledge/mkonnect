@@ -239,7 +239,11 @@ func TestSweepNeverTouchesAnythingButMirrorDirectories(t *testing.T) {
 	if err := os.WriteFile(h.path(valid[:60]+"bbbb.git"), []byte("file, not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	names = append(names, "run-state.json", valid[:60]+"bbbb.git")
+	// The run-state writer's temporary file, which sits in the same root.
+	if err := os.WriteFile(h.path(runStateTempPrefix+"12345"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	names = append(names, "run-state.json", runStateTempPrefix+"12345", valid[:60]+"bbbb.git")
 
 	h.sweep()
 
