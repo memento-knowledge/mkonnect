@@ -58,8 +58,10 @@ const gitSyncReadLimit int64 = 1 << 20 // 1 MiB
 
 // defaultDrainTimeout bounds how long OnDraining waits for in-flight syncs. A gateway going_away
 // means a platform restart is coming, so a sync that can finish promptly may report its result over
-// this connection; one that cannot is left running and reports over the next.
-const defaultDrainTimeout = 30 * time.Second
+// this connection; one that cannot is left running and reports over the next. The wait is short
+// because OnDraining blocks the gateway read loop while it waits, and a drain never cancels a sync,
+// so a longer wait buys little.
+const defaultDrainTimeout = 5 * time.Second
 
 // Option customises a Client. The defaults suit production; the options exist so tests (and a
 // packaging layer) can point the connector at a different git, mirror location, or drain bound.
@@ -93,7 +95,7 @@ func WithMirrorsRoot(root string) Option {
 	return func(o *clientOptions) { o.mirrorsRoot = root }
 }
 
-// WithDrainTimeout bounds how long OnDraining waits for in-flight syncs. The default is 30 seconds.
+// WithDrainTimeout bounds how long OnDraining waits for in-flight syncs. The default is 5 seconds.
 func WithDrainTimeout(d time.Duration) Option {
 	return func(o *clientOptions) { o.drainTimeout = d }
 }
