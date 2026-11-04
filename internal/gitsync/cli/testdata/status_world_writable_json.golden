@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "run_state": {
+    "status": "world_writable",
+    "dropped": 0,
+    "repositories": []
+  }
+}

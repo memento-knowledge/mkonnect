@@ -32,7 +32,7 @@ func Run(args []string, stdin io.Reader, w io.Writer) error {
 	case "config":
 		return runConfig(args[1:], stdin, w)
 	case "status":
-		return runStatus(w)
+		return runStatus(args[1:], w)
 	default:
 		return fmt.Errorf("unknown command %q; use config or status", args[0])
 	}
@@ -183,7 +183,9 @@ func runConfigRemove(args []string, w io.Writer) error {
 	return nil
 }
 
-func runStatus(w io.Writer) error {
+// printProviders prints the replica host pin and the configured providers, the part of `status`
+// that needs the provider config to load.
+func printProviders(w io.Writer) error {
 	// The replica host pin comes first and does not depend on the provider config loading: without
 	// it the connector rejects every configuration, which is the first thing an operator must know.
 	printReplicaHostPin(w)
@@ -200,9 +202,6 @@ func runStatus(w io.Writer) error {
 		e, _ := store.Get(name)
 		fmt.Fprintf(w, "  %-20s  %s  [%s]\n", name, e.BaseURL, maskedAuth(e))
 	}
-	// The CLI and the daemon are separate processes and do not share live state, so enrollment and
-	// per-repository sync state are shown in the portal, not here.
-	fmt.Fprintln(w, "\nEnrollment and repository sync status are visible in the Memento portal.")
 	return nil
 }
 

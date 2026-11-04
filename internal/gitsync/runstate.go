@@ -127,6 +127,26 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// RunStateProblem says why a run state file yielded no usable records. The values are logged by the
+// daemon and reported by the operator CLI (including in its JSON), so they are part of the surface:
+// add new ones, never rename.
+type RunStateProblem string
+
+const (
+	// RunStateOK means the file was read; individual entries may still have been dropped.
+	RunStateOK RunStateProblem = ""
+	// RunStateMissing means there is no file: the connector has not recorded an attempt here.
+	RunStateMissing        RunStateProblem = "missing"
+	RunStateEmpty          RunStateProblem = "empty"
+	RunStateCorrupt        RunStateProblem = "corrupt"
+	RunStateUnsupported    RunStateProblem = "unsupported_version"
+	RunStateTooManyEntries RunStateProblem = "too_many_entries"
+	RunStateOversized      RunStateProblem = "oversized"
+	RunStateWorldWritable  RunStateProblem = "world_writable"
+	RunStateNotRegular     RunStateProblem = "not_regular"
+	RunStateUnreadable     RunStateProblem = "unreadable"
+)
+
 // load reads the state file. It never fails: a missing file is empty state, and a file that cannot be
 // trusted (unreadable, not a regular file, writable by anyone, oversized, corrupt, of another
 // version, or holding too many entries) is logged by reason and treated as empty, so the connector
@@ -134,41 +154,62 @@ func syncDir(dir string) error {
 // read from the file is logged. It also removes the temporary files a crashed write left behind.
 func (s *runStateStore) load() map[string]runRecord {
 	s.sweepTemps()
+	records, dropped, problem := s.read()
+	switch problem {
+	case RunStateOK:
+	case RunStateMissing:
+		return map[string]runRecord{}
+	default:
+		return ignoreRunState(string(problem))
+	}
+	if dropped > 0 {
+		slog.Warn("dropped invalid run state entries", "dropped", dropped)
+	}
+	return records
+}
+
+// read is load without its side effects: it neither removes files nor logs, so the operator CLI can
+// use it while the daemon runs. It reports why nothing could be used as a problem, and otherwise the
+// valid records and how many entries were dropped as invalid. Records is never nil.
+func (s *runStateStore) read() (records map[string]runRecord, dropped int, problem RunStateProblem) {
 	// O_NOFOLLOW refuses a symlink and O_NONBLOCK keeps a FIFO from blocking the open; every check is
 	// then made on the open descriptor, so nothing can be swapped in between a check and the read.
 	f, err := os.OpenFile(s.path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return map[string]runRecord{}
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return map[string]runRecord{}, 0, RunStateMissing
+		case errors.Is(err, syscall.ELOOP):
+			return map[string]runRecord{}, 0, RunStateNotRegular
 		}
-		if errors.Is(err, syscall.ELOOP) {
-			return ignoreRunState("not_regular")
-		}
-		return ignoreRunState("unreadable")
+		return map[string]runRecord{}, 0, RunStateUnreadable
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	switch {
 	case err != nil:
-		return ignoreRunState("unreadable")
+		return map[string]runRecord{}, 0, RunStateUnreadable
 	case !info.Mode().IsRegular():
-		return ignoreRunState("not_regular")
+		return map[string]runRecord{}, 0, RunStateNotRegular
 	// Anyone being able to write the file means its content may not be ours. Group-writable is
 	// accepted: a volume mounted with an fsGroup (as Kubernetes does) is, and refusing it would
 	// discard the state at every restart. The content is timestamps and a branch name.
 	case info.Mode().Perm()&0o002 != 0:
-		return ignoreRunState("world_writable")
+		return map[string]runRecord{}, 0, RunStateWorldWritable
 	case info.Size() > maxRunStateBytes:
-		return ignoreRunState("oversized")
+		return map[string]runRecord{}, 0, RunStateOversized
 	}
 	// The size can change between Stat and read, so the read is bounded too.
 	data, err := io.ReadAll(io.LimitReader(f, maxRunStateBytes+1))
 	if err != nil {
-		return ignoreRunState("unreadable")
+		return map[string]runRecord{}, 0, RunStateUnreadable
 	}
 	if len(data) > maxRunStateBytes {
-		return ignoreRunState("oversized")
+		return map[string]runRecord{}, 0, RunStateOversized
+	}
+	if len(data) == 0 {
+		return map[string]runRecord{}, 0, RunStateEmpty
 	}
 
 	var file struct {
@@ -176,28 +217,24 @@ func (s *runStateStore) load() map[string]runRecord {
 		Repositories map[string]json.RawMessage `json:"repositories"`
 	}
 	if err := json.Unmarshal(data, &file); err != nil {
-		return ignoreRunState("corrupt")
+		return map[string]runRecord{}, 0, RunStateCorrupt
 	}
 	if file.Version != runStateVersion {
-		return ignoreRunState("unsupported_version")
+		return map[string]runRecord{}, 0, RunStateUnsupported
 	}
 	if len(file.Repositories) > maxConfigRepos {
-		return ignoreRunState("too_many_entries")
+		return map[string]runRecord{}, 0, RunStateTooManyEntries
 	}
-	out := make(map[string]runRecord, len(file.Repositories))
-	dropped := 0
+	records = make(map[string]runRecord, len(file.Repositories))
 	for id, raw := range file.Repositories {
 		var rec runRecord
 		if !validRepoID(id) || json.Unmarshal(raw, &rec) != nil || !rec.valid() {
 			dropped++
 			continue
 		}
-		out[id] = rec
+		records[id] = rec
 	}
-	if dropped > 0 {
-		slog.Warn("dropped invalid run state entries", "dropped", dropped)
-	}
-	return out
+	return records, dropped, RunStateOK
 }
 
 func ignoreRunState(reason string) map[string]runRecord {

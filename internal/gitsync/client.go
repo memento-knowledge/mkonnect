@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"maps"
 	"math/rand/v2"
-	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -229,10 +228,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	}
 	// git runs in a temporary directory, so a relative mirrors root would be resolved against that
 	// (and lost with it) by git while Exists resolved it against the daemon's working directory.
-	root := o.mirrorsRoot
-	if abs, err := filepath.Abs(root); err == nil {
-		root = abs
-	}
+	root := absRoot(o.mirrorsRoot)
 	replicaHost := pinReplicaHost(o.replicaHost)
 	c := &Client{
 		cfg:            cfg,
