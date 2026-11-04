@@ -197,28 +197,37 @@ func (s *scheduler) poll(ctx context.Context) {
 		return
 	}
 	now, l := s.hooks.now(), s.hooks.limits()
-	ids := slices.Sorted(maps.Keys(s.entries))
+	due := s.dueIDs(now, l)
 	if s.wasSuspended {
 		s.wasSuspended = false
 		spread := min(effectiveInterval(l), maxStagger)
-		for _, id := range ids {
-			if e := s.entries[id]; !now.Before(e.due(l)) {
-				e.notBefore = now.Add(time.Duration(s.draw() * float64(spread)))
-			}
+		for _, id := range due {
+			s.entries[id].notBefore = now.Add(time.Duration(s.draw() * float64(spread)))
 		}
+		due = s.dueIDs(now, l)
 	}
-	for _, id := range ids {
-		e := s.entries[id]
-		if now.Before(e.due(l)) {
-			continue
-		}
+	for _, id := range due {
 		if s.hooks.enqueue(ctx, id) {
 			slog.Debug("scheduled sync started", "repo_id", id)
 			// Measure from the dispatch until the run reports, so a run that never does (it was
 			// released, or cancelled) is not dispatched again on every tick.
+			e := s.entries[id]
 			e.base, e.r, e.notBefore = now, s.draw(), time.Time{}
 		}
 	}
+}
+
+// dueIDs returns, sorted, the repositories whose next run is at or before now. Only those are
+// sorted, so a tick where nothing is due costs one pass over the entries.
+func (s *scheduler) dueIDs(now time.Time, l Limits) []string {
+	var ids []string
+	for id, e := range s.entries {
+		if !now.Before(e.due(l)) {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids
 }
 
 // nextDue reports when repoID is next due, or false when it is not scheduled.

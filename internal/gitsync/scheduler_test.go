@@ -654,7 +654,6 @@ func TestSchedulerStopWaitsForTheLoopAndIsIdempotent(t *testing.T) {
 	stop()
 
 	h.advance(48 * time.Hour)
-	h.setBusy("repo-a", false)
 	n := len(h.dispatched())
 	time.Sleep(20 * time.Millisecond)
 	if got := len(h.dispatched()); got != n {

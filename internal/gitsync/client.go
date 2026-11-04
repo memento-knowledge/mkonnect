@@ -121,7 +121,8 @@ type Client struct {
 	drainTimeout time.Duration
 
 	// limits holds the effective schedule and resource limits. It starts as DefaultLimits and is
-	// replaced as a whole when a configuration is accepted; read it through effectiveLimits.
+	// replaced as a whole by whatever resolves a configuration's limits (ResolveLimits); until that
+	// is wired in, the defaults apply. Read it through effectiveLimits.
 	limits atomic.Pointer[Limits]
 
 	// Completion-triggered statuses are coalesced: see notifyStatus.
