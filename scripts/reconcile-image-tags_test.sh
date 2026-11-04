@@ -21,6 +21,7 @@ mkdir "$tmpdir/bin"
 cat >"$tmpdir/bin/aws" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+ORIGINAL_ARGS="$*"
 repository=
 tag=
 while (($# > 0)); do
@@ -30,6 +31,7 @@ while (($# > 0)); do
     *) shift ;;
   esac
 done
+printf 'aws %s\n' "$ORIGINAL_ARGS" >>"$FAKE_LOG"
 if [[ -n ${FAKE_AWS_DENY-} ]]; then
   printf '%s\n' 'An error occurred (AccessDeniedException) when calling the DescribeImages operation' >&2
   exit 255
@@ -142,6 +144,19 @@ EOF
 chmod +x "$tmpdir/bin/aws" "$tmpdir/bin/docker"
 
 test_count=0
+# Extra reconcile.sh arguments for the current case (for example --version-tag-last).
+extra_args=()
+image="$registry/$repository"
+
+# The exact calls the API connector release has always made, in order. aws_call and the push
+# expectations below pin the original behaviour: version tag first, then the commit tag.
+aws_call() {
+  printf 'aws ecr-public describe-images --region us-east-1 --repository-name %s --image-ids imageTag=%s --output json\n' "$repository" "$1"
+}
+build_call() {
+  printf 'build --file %s/Dockerfile.example --build-arg VERSION=%s --build-arg REVISION=%s --tag %s:%s --tag %s:%s %s\n' \
+    "$case_dir" "$release_id" "$release_commit" "$image" "$version_tag" "$image" "$commit_tag" "$case_dir"
+}
 
 new_case() {
   case_dir="$tmpdir/$1"
@@ -165,7 +180,8 @@ run_reconcile() {
     --release-id "$release_id" \
     --release-commit "$release_commit" \
     --output "$case_dir/out.env" \
-    --context "$case_dir"
+    --context "$case_dir" \
+    ${extra_args[@]+"${extra_args[@]}"}
 }
 
 expect_success() {
@@ -202,8 +218,19 @@ grep -qx "image=$registry/$repository" "$case_dir/out.env"
 grep -qx "image_digest=$(registry_digest "$version_tag")" "$case_dir/out.env"
 test "$(grep -c '^build ' "$case_dir/log")" -eq 1
 log_has "^build --file $case_dir/Dockerfile.example --build-arg VERSION=$release_id --build-arg REVISION=$release_commit "
-# The release tag is pushed last.
-test "$(grep '^push ' "$case_dir/log" | tail -n 1)" = "push $registry/$repository:$version_tag"
+# Default order, identical to the API connector's original behaviour: the release tag is pushed
+# first, then the commit tag, between the lookups before and after. The whole call sequence is
+# compared, not just the pushes.
+{
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+  build_call
+  printf 'push %s:%s\n' "$image" "$version_tag"
+  printf 'push %s:%s\n' "$image" "$commit_tag"
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+} >"$case_dir/expected-calls"
+cmp "$case_dir/expected-calls" "$case_dir/log"
 # The registry only ever contains the two release tags.
 test "$(find "$case_dir/registry/$repository" -type f | wc -l | tr -d ' ')" -eq 2
 
@@ -277,20 +304,119 @@ registry_lacks "$commit_tag"
 log_lacks '^push '
 unset FAKE_BUILD_FAIL
 
-# 9. A failed push of the commit tag leaves no release tag behind.
-new_case commit-push-failure
+# 9. Default order (API connector): the release tag is pushed first, so a failed push of the
+# commit tag leaves a complete release tag behind, and a rerun completes the release from it.
+new_case default-order-commit-push-failure
+FAKE_PUSH_FAIL_TAG=$commit_tag expect_failure
+registry_has "$version_tag"
+registry_lacks "$commit_tag"
+unset FAKE_PUSH_FAIL_TAG
+: >"$case_dir/log"
+expect_success
+registry_has "$commit_tag"
+test "$(registry_digest "$version_tag")" = "$(registry_digest "$commit_tag")"
+log_lacks '^build '
+log_lacks '^push '
+
+new_case default-order-version-push-failure
+FAKE_PUSH_FAIL_TAG=$version_tag expect_failure
+registry_lacks "$version_tag"
+registry_lacks "$commit_tag"
+unset FAKE_PUSH_FAIL_TAG
+
+# 10. --version-tag-last (git-sync image): the commit tag is pushed first and the release tag
+# last, so no push failure can leave a release tag behind.
+extra_args=(--version-tag-last)
+new_case last-order-fresh
+expect_success
+{
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+  build_call
+  printf 'push %s:%s\n' "$image" "$commit_tag"
+  printf 'push %s:%s\n' "$image" "$version_tag"
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+} >"$case_dir/expected-calls"
+cmp "$case_dir/expected-calls" "$case_dir/log"
+grep -qx "image_digest=$(registry_digest "$version_tag")" "$case_dir/out.env"
+
+new_case last-order-commit-push-failure
 FAKE_PUSH_FAIL_TAG=$commit_tag expect_failure
 registry_lacks "$version_tag"
+registry_lacks "$commit_tag"
 log_lacks "^push .*:$version_tag\$"
 unset FAKE_PUSH_FAIL_TAG
 
-# 10. A registry error other than "not found" stops the run before anything is built or pushed.
+new_case last-order-version-push-failure
+FAKE_PUSH_FAIL_TAG=$version_tag expect_failure
+registry_lacks "$version_tag"
+registry_has "$commit_tag"
+unset FAKE_PUSH_FAIL_TAG
+: >"$case_dir/log"
+expect_success
+registry_has "$version_tag"
+test "$(registry_digest "$version_tag")" = "$(registry_digest "$commit_tag")"
+log_lacks '^build '
+log_lacks '^push '
+
+new_case last-order-build-failure
+FAKE_BUILD_FAIL=1 expect_failure
+registry_lacks "$version_tag"
+registry_lacks "$commit_tag"
+log_lacks '^push '
+unset FAKE_BUILD_FAIL
+
+# 11. Recovery from a partial or complete release makes the same calls in either order, and
+# never builds or pushes.
+for mode in default last; do
+  if [ "$mode" = last ]; then extra_args=(--version-tag-last); else extra_args=(); fi
+
+  new_case "recover-version-only-$mode"
+  seed "$version_tag" sha256:aaaa "$release_id" "$release_commit"
+  expect_success
+  {
+    aws_call "$version_tag"
+    aws_call "$commit_tag"
+    printf 'pull %s:%s\n' "$image" "$version_tag"
+    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$version_tag"
+    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$version_tag"
+    printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:aaaa\n' "$image" "$commit_tag" "$image"
+    aws_call "$version_tag"
+    aws_call "$commit_tag"
+  } >"$case_dir/expected-calls"
+  cmp "$case_dir/expected-calls" "$case_dir/log"
+
+  new_case "recover-commit-only-$mode"
+  seed "$commit_tag" sha256:bbbb "$release_id" "$release_commit"
+  expect_success
+  {
+    aws_call "$version_tag"
+    aws_call "$commit_tag"
+    printf 'pull %s:%s\n' "$image" "$commit_tag"
+    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$commit_tag"
+    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$commit_tag"
+    printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:bbbb\n' "$image" "$version_tag" "$image"
+    aws_call "$version_tag"
+    aws_call "$commit_tag"
+  } >"$case_dir/expected-calls"
+  cmp "$case_dir/expected-calls" "$case_dir/log"
+
+  new_case "recover-conflict-$mode"
+  seed "$version_tag" sha256:dddd "$release_id" "$release_commit"
+  seed "$commit_tag" sha256:eeee "$release_id" "$release_commit"
+  expect_failure
+  log_lacks '^(build|push|buildx) '
+done
+extra_args=()
+
+# 12. A registry error other than "not found" stops the run before anything is built or pushed.
 new_case registry-denied
 FAKE_AWS_DENY=1 expect_failure
 log_lacks '^(build|push|buildx|pull) '
 unset FAKE_AWS_DENY
 
-# 11. Usage errors and a missing Dockerfile are rejected.
+# 13. Usage errors and a missing Dockerfile are rejected.
 if bash "$reconcile" --repository "$repository" 2>/dev/null; then
   printf 'incomplete arguments unexpectedly accepted\n' >&2
   exit 1

@@ -171,6 +171,7 @@ jobs:
             --dockerfile Dockerfile.gitsync \
             --release-id "$RELEASE_ID" \
             --release-commit "$RELEASE_COMMIT" \
+            --version-tag-last \
             --output "$result"
           cat "$result" >> "$GITHUB_OUTPUT"
 

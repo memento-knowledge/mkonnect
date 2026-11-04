@@ -51,9 +51,9 @@ The workflows use Helm `v3.18.6` for chart linting, packaging, and publication. 
 
 The Release workflow builds and publishes the git-sync image in its own job, `publish-gitsync`. The job is marked `continue-on-error` and has a 30-minute timeout. The `publish` job waits for it to finish but runs whether it succeeded, failed, or was skipped (it does not run if the workflow was cancelled or verification failed). The git-sync image counts as published only when its job succeeded and reported a `sha256:` digest.
 
-- If the git-sync build or push fails, no git-sync tag is created: the reconcile script pushes tags only after a successful build, and pushes the release-ID tag last. The workflow shows a warning annotation instead of a failed run.
+- If the git-sync build or push fails, no git-sync tag is created: the reconcile script pushes tags only after a successful build, and for this image (`--version-tag-last`) pushes the commit tag first and the release-ID tag last. The API connector image keeps its original order (release-ID tag first). The workflow shows a warning annotation instead of a failed run.
 - The connector image, the Helm chart, and the GitHub Release are published as usual. The release notes state that the git-sync image was not published, and the git-sync fields in `release-metadata.json` are `null`.
-- Both images use the same reconcile rules: an existing tag is accepted only when its version and revision labels match the release and its digest agrees with the other tag. The logic lives in `scripts/reconcile-image-tags.sh` and is tested by `scripts/reconcile-image-tags_test.sh`.
+- Both images use the same reconcile rules, apart from the order of the two tag pushes: an existing tag is accepted only when its version and revision labels match the release and its digest agrees with the other tag. The logic lives in `scripts/reconcile-image-tags.sh` and is tested by `scripts/reconcile-image-tags_test.sh`.
 - A published GitHub Release cannot be re-run. A release published without a git-sync image stays that way; the next release publishes it again. Do not create git-sync tags by hand.
 
 Image signing and provenance attestation are documented separately once available.
