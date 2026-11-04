@@ -53,9 +53,9 @@ const (
 	ErrUnclassified        = "unclassified"
 )
 
-// WarnLFSNotReplicated marks a repository that synced but skipped LFS objects — a warning, not an
-// error, so the repository stays StateOK.
-const WarnLFSNotReplicated = "lfs_not_replicated"
+// WarnLFSNotReplicated marks a repository that synced but appears to use Git LFS, whose objects are
+// not replicated — a warning, not an error, so the repository stays StateOK. See detectLFS.
+const WarnLFSNotReplicated = proto.GitSyncWarnLFSNotReplicated
 
 // gitSyncReadLimit caps a single INBOUND message. git-sync inbound frames (git_sync_config,
 // git_sync_now) are control-sized; repository pack/bundle data flows OUTBOUND, which this does
@@ -480,6 +480,9 @@ func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
 	r.attemptStartedAt = time.Time{}
 	record := res.State != StatePending
 	if record {
+		if res.State == StateOK && res.WarningsUndecided && r.result.State == StateOK {
+			res.Warnings = r.result.Warnings
+		}
 		r.result = res
 		c.runs[repoID] = c.recordAttempt(c.runs[repoID], r.target, res)
 	}

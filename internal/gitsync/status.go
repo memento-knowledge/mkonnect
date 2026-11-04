@@ -94,11 +94,16 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 			st.ErrorDetail = "host not configured locally"
 		case r.syncing:
 			st.State = StateSyncing
+			// A re-sync of a healthy repository does not make its warnings go away and come back;
+			// the sync in flight replaces them when it finishes.
+			if r.result.State == StateOK {
+				st.Warnings = slices.Clone(r.result.Warnings)
+			}
 		case r.result.State != "":
 			st.State = r.result.State
 			st.ErrorType = r.result.ErrorType
 			st.ErrorDetail = r.result.ErrorDetail
-			st.Warnings = r.result.Warnings
+			st.Warnings = slices.Clone(r.result.Warnings)
 		default:
 			st.State = StatePending
 		}

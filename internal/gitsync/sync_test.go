@@ -34,7 +34,7 @@ type gitCall struct {
 func (c gitCall) sub() string {
 	for _, a := range c.argv {
 		switch a {
-		case "init", "fetch", "push", "show-ref", "for-each-ref", "ls-remote":
+		case "init", "fetch", "push", "show-ref", "for-each-ref", "ls-remote", "ls-tree", "cat-file":
 			return a
 		}
 	}

@@ -62,7 +62,8 @@ func TestSyncRepoStatisticsCallsAreScopedAndOrdered(t *testing.T) {
 
 	// The newest-commit read is local and precedes the push; the origin lookup follows the push, so it
 	// never delays the push or the push token's use, and only happens once the origin has been reached.
-	if want := []string{"init", "fetch", "show-ref", "for-each-ref", "push", "ls-remote"}; !slices.Equal(f.subs(), want) {
+	// The LFS lookup reads only the local mirror and comes last, after everything that talks to a remote.
+	if want := []string{"init", "fetch", "show-ref", "for-each-ref", "push", "ls-remote", "ls-tree"}; !slices.Equal(f.subs(), want) {
 		t.Fatalf("git sequence = %v, want %v", f.subs(), want)
 	}
 	dir := d.mirrors.Dir("repo-a")
