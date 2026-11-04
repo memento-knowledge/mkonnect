@@ -22,14 +22,20 @@ const (
 )
 
 // scriptedGit is a thread-safe fake git for client tests. A non-nil gate holds every clone until
-// released; fail makes a subcommand exit non-zero with the given stderr.
+// released; fail makes a subcommand exit non-zero with the given stderr. A test that sets a gate
+// registers t.Cleanup(g.release) right after building its client, so a test that fails early does not
+// leave a sync blocked: that cleanup then runs before the client's, which waits for syncs to stop.
 type scriptedGit struct {
 	mu    sync.Mutex
 	argvs [][]string
 	envs  [][]string
 	gate  chan struct{}
+	once  sync.Once
 	fail  map[string][]byte
 }
+
+// release opens the gate. It is idempotent, so a test may open it itself and again in a cleanup.
+func (g *scriptedGit) release() { g.once.Do(func() { close(g.gate) }) }
 
 func subOf(argv []string) string {
 	for _, a := range argv {
@@ -112,6 +118,7 @@ func repoStatusNow(t *testing.T, s *stubSender, id string) proto.GitSyncRepoStat
 func TestConfigStartsSyncAndStatusReflectsResult(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
 	s := &stubSender{}
 	ctx := context.Background()
 	c.OnConnected(ctx, s) // gives the client the connection it reports a finished sync over
@@ -130,7 +137,7 @@ func TestConfigStartsSyncAndStatusReflectsResult(t *testing.T) {
 		t.Error("the matched provider's credential must be injected, scoped to the repository URL")
 	}
 
-	close(g.gate)
+	g.release()
 	// Completion sends a status over the current connection without waiting for a heartbeat.
 	waitFor(t, func() bool { return repoStatusNow(t, s, "repo-a").State == gitsync.StateOK })
 	_, pushEnv := g.call(t, "push")
@@ -227,6 +234,7 @@ func TestOnDrainingWaitsBrieflyForInFlightSync(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow,
 		gitsync.WithGitRunner(g.run), gitsync.WithDrainTimeout(80*time.Millisecond))
+	t.Cleanup(g.release)
 	s := &stubSender{}
 	ctx := context.Background()
 	c.OnConnected(ctx, s)
@@ -242,7 +250,7 @@ func TestOnDrainingWaitsBrieflyForInFlightSync(t *testing.T) {
 		t.Errorf("state after drain = %q, want the sync left running", got)
 	}
 
-	close(g.gate)
+	g.release()
 	waitFor(t, func() bool { return repoStatusNow(t, s, "repo-a").State == gitsync.StateOK })
 	start = time.Now()
 	c.OnDraining(ctx)
@@ -326,6 +334,7 @@ func TestResultForAReconfiguredTargetIsIgnored(t *testing.T) {
 func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
 	connCtx, closeConn := context.WithCancel(context.Background())
 	conn := &stubSender{}
 	c.OnConnected(connCtx, conn)
@@ -336,7 +345,7 @@ func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
 
 	before := len(conn.messages())
 	closeConn()
-	close(g.gate)
+	g.release()
 	waitFor(t, func() bool { return g.count("push") == 1 })
 	time.Sleep(50 * time.Millisecond)
 	if after := len(conn.messages()); after != before {
@@ -350,6 +359,7 @@ func TestCompletionAfterConnectionClosedSendsNothingOnIt(t *testing.T) {
 func TestSyncAndItsRerunSurviveLosingTheConnection(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
 	process := context.Background() // what the gateway hands HandleMessage
 	connCtx, loseConnection := context.WithCancel(process)
 	s := &stubSender{}
@@ -362,7 +372,7 @@ func TestSyncAndItsRerunSurviveLosingTheConnection(t *testing.T) {
 	loseConnection() // the gateway drains; the connection (and only it) is gone
 	c.HandleMessage(process, &stubSender{}, "git_sync_now", rawJSON(`{"type":"git_sync_now","repo_id":"repo-a"}`))
 
-	close(g.gate)
+	g.release()
 	waitFor(t, func() bool { return g.count("push") == 2 }) // the sync, then its one trailing rerun
 	if got := g.count("clone"); got != 1 {
 		t.Errorf("clones = %d, want 1: the in-flight sync must not have been cancelled and restarted", got)
@@ -386,6 +396,7 @@ func TestMirrorsRootIsMadeAbsolute(t *testing.T) {
 func TestWaitReturnsOnceCancelledSyncsHaveStopped(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
 	c := newTestClientOpts(t, providerWithToken, &fakeProber{result: gitsync.OriginReachable}, fixedNow, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
 	ctx, cancel := context.WithCancel(context.Background())
 	c.HandleMessage(ctx, &stubSender{}, "git_sync_config",
 		configJSON("1", [3]string{"repo-a", "https://git.example.com/team/a.git", ""}))

@@ -103,13 +103,34 @@ func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, 
 	return newTestClientOpts(t, localJSON, p, now)
 }
 
+// syncStopTimeout bounds how long a test's cleanup waits for background syncs to stop.
+const syncStopTimeout = 10 * time.Second
+
+// waitForSyncsToStop blocks until the client has no sync in flight. A sync keeps running after the
+// test body returns, and it may touch the mirrors root (creating it if absent, and a real clone
+// creates the mirror under it), so it must have stopped before the test's temporary directories are
+// removed or that removal races it and fails with "directory not empty". Register it from a
+// t.Cleanup AFTER the last t.TempDir call: cleanups run last-in first-out.
+func waitForSyncsToStop(t *testing.T, c *gitsync.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), syncStopTimeout)
+	defer cancel()
+	c.Wait(ctx)
+	if ctx.Err() != nil {
+		t.Errorf("a sync was still running %v after the test ended", syncStopTimeout)
+	}
+}
+
 // newTestClientOpts builds a client whose git runner, by default, blocks until the test ends: a sync
 // started by a config push stays "syncing" (deterministic for status assertions) and never reaches
-// a real git or the network. Pass gitsync.WithGitRunner to take control of it.
+// a real git or the network. Pass gitsync.WithGitRunner to take control of it; a test that does must
+// let its runner return (release its gate or cancel its context) before it ends.
+//
+// The client's cleanup releases the default runner and waits for every sync to stop, and it runs
+// before the temporary directories the client uses are removed.
 func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time, opts ...gitsync.Option) *gitsync.Client {
 	t.Helper()
 	gate := make(chan struct{})
-	t.Cleanup(func() { close(gate) })
 	defaults := []gitsync.Option{
 		gitsync.WithMirrorsRoot(t.TempDir()),
 		gitsync.WithStatusInterval(10 * time.Millisecond),
@@ -133,7 +154,13 @@ func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, n
 		t.Fatalf("load local config: %v", err)
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
-	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
+	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
+	// Registered after the last t.TempDir above, so it runs before any of them is removed.
+	t.Cleanup(func() {
+		close(gate)
+		waitForSyncsToStop(t, c)
+	})
+	return c
 }
 
 // latestOriginCheck returns the origin_check from the most recent status that carried one.
@@ -779,6 +806,8 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Runs after the deferred cancel, and before the temporary directories above are removed.
+	t.Cleanup(func() { waitForSyncsToStop(t, c) })
 	connectDone := make(chan error, 1)
 	go func() { connectDone <- c.Connect(ctx) }()
 

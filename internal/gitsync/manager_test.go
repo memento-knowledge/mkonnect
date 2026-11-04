@@ -99,6 +99,7 @@ func (h *hookLog) begunIDs() []string {
 // in flight.
 type gatedGit struct {
 	gate    chan struct{}
+	once    sync.Once
 	clones  atomic.Int32
 	running atomic.Int32
 	maxRun  atomic.Int32
@@ -110,7 +111,9 @@ type gatedGit struct {
 
 func newGatedGit() *gatedGit { return &gatedGit{gate: make(chan struct{})} }
 
-func (g *gatedGit) release() { close(g.gate) }
+// release lets every clone, held or future, proceed. It is idempotent, so a test may release the
+// gate itself and newTestManager's cleanup may release it again.
+func (g *gatedGit) release() { g.once.Do(func() { close(g.gate) }) }
 
 func (g *gatedGit) envs() []string {
 	g.mu.Lock()
@@ -145,10 +148,28 @@ func (g *gatedGit) run(ctx context.Context, argv, env []string, _ string) ([]byt
 	return nil, nil
 }
 
+// syncStopTimeout bounds how long a test's cleanup waits for background syncs to stop.
+const syncStopTimeout = 10 * time.Second
+
+// newTestManager builds a manager over a temporary mirrors root. Its cleanup releases g and waits for
+// every sync to stop, and it runs before the root is removed: a sync that outlived its test would
+// otherwise race that removal (EnsureRoot recreates a missing root), failing the test's TempDir
+// cleanup with "directory not empty".
 func newTestManager(t *testing.T, limit int, g *gatedGit, h *hookLog) *manager {
 	t.Helper()
 	deps := syncDeps{mirrors: Mirrors{Root: t.TempDir()}, run: g.run, now: func() time.Time { return syncNow }}
-	return newManager(limit, deps, h.hooks())
+	m := newManager(limit, deps, h.hooks())
+	// Registered after t.TempDir above, so it runs before the root is removed.
+	t.Cleanup(func() {
+		g.release()
+		ctx, cancel := context.WithTimeout(context.Background(), syncStopTimeout)
+		defer cancel()
+		m.drain(ctx)
+		if ctx.Err() != nil {
+			t.Errorf("a sync was still running %v after the test ended", syncStopTimeout)
+		}
+	})
+	return m
 }
 
 func eventually(t *testing.T, cond func() bool) {
@@ -163,7 +184,7 @@ func eventually(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within timeout")
 }
 
-// syncBuffer is a goroutine-safe log sink (syncs from earlier tests may still be logging).
+// syncBuffer is a goroutine-safe log sink (concurrent syncs may log at once).
 type syncBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
