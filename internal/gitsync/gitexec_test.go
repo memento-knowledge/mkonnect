@@ -230,7 +230,53 @@ func TestNewTempHomeLivesUnderConfiguredRoot(t *testing.T) {
 	}
 }
 
-func TestGitBaseEnvForwardsTMPDIRAsParentOfHome(t *testing.T) {
+func TestTempRootRejectsRelativeTMPDIR(t *testing.T) {
+	t.Setenv("GIT_SYNC_TMP_DIR", "")
+	t.Setenv("TMPDIR", "relative/tmp")
+	if _, err := TempRoot(); err == nil || !strings.Contains(err.Error(), "TMPDIR") {
+		t.Fatalf("TempRoot() err = %v, want an error naming TMPDIR", err)
+	}
+	if _, _, err := newTempHome(); err == nil {
+		t.Fatal("newTempHome() accepted a relative TMPDIR")
+	}
+}
+
+func TestTempRootDetectsUnwritableRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks do not apply to root")
+	}
+	root := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(root, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_SYNC_TMP_DIR", root)
+	_, err := TempRoot()
+	if err == nil {
+		t.Fatal("TempRoot() accepted an existing read-only directory")
+	}
+	for _, want := range []string{"GIT_SYNC_TMP_DIR", "TMPDIR", root} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 0 {
+		t.Errorf("probe left entries behind: %v", entries)
+	}
+}
+
+func TestTempRootProbeLeavesNothingBehind(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tmp")
+	t.Setenv("GIT_SYNC_TMP_DIR", root)
+	if _, err := TempRoot(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(root); len(entries) != 0 {
+		t.Errorf("probe left entries behind: %v", entries)
+	}
+}
+
+func TestGitBaseEnvForwardsTMPDIRAsHome(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "tmp")
 	t.Setenv("GIT_SYNC_TMP_DIR", root)
 	t.Setenv("TMPDIR", "/should/not/leak")
@@ -240,11 +286,12 @@ func TestGitBaseEnvForwardsTMPDIRAsParentOfHome(t *testing.T) {
 	}
 	defer cleanup()
 	env := gitBaseEnv(home)
-	if want := "TMPDIR=" + filepath.Dir(home); !slices.Contains(env, want) {
+	if want := "TMPDIR=" + home; !slices.Contains(env, want) {
 		t.Errorf("base env missing %q: %v", want, env)
 	}
-	if want := "TMPDIR=" + root; !slices.Contains(env, want) {
-		t.Errorf("base env missing %q: %v", want, env)
+	fi, err := os.Stat(home)
+	if err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("home must be a private 0700 directory, got %v (err %v)", fi, err)
 	}
 	n := 0
 	for _, kv := range env {
@@ -328,11 +375,56 @@ func TestSweepStaleTempHomesNeverFollowsSymlinks(t *testing.T) {
 	if removed != 0 {
 		t.Errorf("removed = %d, want 0 (a symlink is not a temp home)", removed)
 	}
-	if _, err := os.Stat(keep); err != nil {
-		t.Errorf("symlink target was touched: %v", err)
-	}
 	if _, err := os.Lstat(link); err != nil {
 		t.Errorf("the symlink itself should be left alone: %v", err)
+	}
+	// The target is what an incorrect implementation would have deleted by following the link.
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("file behind the symlink was removed: %v", err)
+	}
+}
+
+func TestSweepStaleTempHomesContinuesPastFailures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission checks do not apply to root")
+	}
+	root := t.TempDir()
+	mk := func(name string) string {
+		p := filepath.Join(root, name)
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p, "f"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	before := mk("gitsync-home-a")
+	stuck := mk("gitsync-home-b")
+	after := mk("gitsync-home-c")
+	// A read-only directory cannot have its entries unlinked, so removing it fails.
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
+	for _, p := range []string{before, stuck, after} {
+		age(t, p, time.Hour)
+	}
+
+	removed, err := SweepStaleTempHomes(root, time.Minute)
+	if err == nil {
+		t.Error("want the first removal error to be returned")
+	}
+	if removed != 2 {
+		t.Errorf("removed = %d, want 2 (failures are not counted)", removed)
+	}
+	for _, p := range []string{before, after} {
+		if _, err := os.Lstat(p); !os.IsNotExist(err) {
+			t.Errorf("%q should have been removed despite the failure on another entry: %v", p, err)
+		}
+	}
+	if _, err := os.Lstat(stuck); err != nil {
+		t.Errorf("the entry that could not be removed should remain: %v", err)
 	}
 }
 
