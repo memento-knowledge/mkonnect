@@ -146,6 +146,9 @@ type Client struct {
 	sched        *scheduler
 	drainTimeout time.Duration
 
+	// gc reclaims the disk of mirrors that left the configuration; see gc.go.
+	gc *mirrorGC
+
 	// replicaHost is the canonical "host:port" the connector may push to ("" = not pinned, in which
 	// case every configuration is rejected). It is written once in NewClient and never changed, so it
 	// is read without a lock.
@@ -239,6 +242,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		runSaveEvery:   o.runSaveInterval,
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
+		gc:             newMirrorGC(),
 		replicaHost:    replicaHost,
 	}
 	c.runs = c.runStore.load()
@@ -291,10 +295,12 @@ func pinReplicaHost(raw string) string {
 }
 
 // Run connects and maintains the connection with backoff until ctx is cancelled. It also runs the
-// periodic resync scheduler for as long as it runs, and returns only after that has stopped.
+// periodic resync scheduler for as long as it runs, and returns only after that has stopped. The
+// mirror cleanup loop runs alongside; Wait confirms it has stopped.
 func (c *Client) Run(ctx context.Context) {
 	stop := c.sched.start(ctx)
 	defer stop()
+	c.startMirrorGC(ctx)
 	c.gw.Run(ctx)
 }
 
@@ -349,7 +355,9 @@ func (c *Client) OnDraining(ctx context.Context) {
 func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string, raw json.RawMessage) {
 	switch typ {
 	case "git_sync_config":
-		if c.applyConfig(raw) {
+		accepted := c.applyConfig(raw)
+		c.noteConfigApplied(accepted)
+		if accepted {
 			// The schedule is brought up to date first, so the outcome of the sync started below,
 			// even a failed one, is recorded against it.
 			c.sched.reconcile()
@@ -624,9 +632,11 @@ func targetMatches(r repoState, t syncTask) bool {
 // Wait blocks until no sync is in flight or ctx ends, then writes any run state still pending. The
 // daemon calls it after cancelling the process-lifetime context, which kills each git, so it can
 // confirm they have stopped before exiting instead of leaving a process that holds a credential
-// behind.
+// behind. It also waits for the mirror cleanup loop, which stops with the same context; a removal
+// already under way finishes first, so the caller bounds the wait with ctx.
 func (c *Client) Wait(ctx context.Context) {
 	c.mgr.drain(ctx)
+	c.gc.wait(ctx)
 	c.stopRunSaves()
 }
 
