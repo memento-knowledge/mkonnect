@@ -121,6 +121,9 @@ func (c *Client) runProbe(ctx context.Context, entries []LocalEntry) (OriginResu
 	worst := OriginReachable
 	any := false
 	for _, e := range entries {
+		if ctx.Err() != nil {
+			return "", false
+		}
 		res, err := c.prober.Probe(ctx, e)
 		if err != nil {
 			if ctx.Err() == nil {

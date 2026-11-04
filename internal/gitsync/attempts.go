@@ -82,12 +82,14 @@ func (c *Client) claimTask(parent context.Context, repoID string) (syncTask, con
 	if c.afterClaimRead != nil {
 		c.afterClaimRead()
 	}
-	ctx, cancel := context.WithCancelCause(parent)
-	if old := c.attempts[repoID]; old != nil {
-		// The manager runs at most one attempt per repository, so this does not happen.
-		old.superseded = true
-		old.cancel(errCredentialSuperseded)
+	if c.attempts[repoID] != nil {
+		// The manager runs at most one attempt per repository, so this does not happen. If it ever
+		// did, replacing the registration would leave the older attempt unreachable by a revocation
+		// and let its finish end the newer one: refuse instead.
+		slog.Error("refusing to sync: an attempt is already running for the repository", "repo_id", repoID)
+		return syncTask{}, nil, false
 	}
+	ctx, cancel := context.WithCancelCause(parent)
 	c.attempts[repoID] = &attempt{bind: r.bind, cancel: cancel, done: make(chan struct{})}
 	return task, ctx, true
 }

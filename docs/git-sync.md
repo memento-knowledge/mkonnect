@@ -426,7 +426,8 @@ changing.
   `SIGHUP` used to end the process; it now means "reload". The log says what happened either way.
 - **A provider is removed, or its credential changes.** A sync that is using it is stopped at
   once (its git processes are killed) and what it had done is discarded: its result is never
-  reported or remembered, and nothing it fetched is pushed afterwards. If the credential changed,
+  reported or remembered, and the cancelled sync pushes nothing. (What it had already fetched stays in
+  the mirror and is pushed by the next sync.) If the credential changed,
   the repository is synced again straight away with the new one. Syncs that use other providers
   are not touched, and a change that leaves a provider as it was does nothing. A rotation that
   happens more often than your longest sync takes starves that sync, because every rotation
@@ -434,11 +435,12 @@ changing.
 - **A provider is added.** Repositories that were reported as `origin_access_denied` with
   `host not configured locally` start syncing; you do not need Memento to resend anything.
   Repositories whose provider was removed report `origin_access_denied` with that same detail.
-- **The file cannot be used** (it is not valid, a value is rejected, it is unreadable or has an
-  unsafe mode). git-sync keeps using the last configuration that worked, for as long as it takes
+- **The file cannot be used** (it is not valid, a value is rejected, it is unreadable, or its mode
+  is too open and cannot be tightened; a mode git-sync can tighten, as at startup, is simply
+  tightened). git-sync keeps using the last configuration that worked, for as long as it takes
   you to fix the file, and logs one line saying that the file cannot be used and why, in a fixed
   category (`invalid_json`, `invalid_configuration`, `unreadable`), once for each different
-  content. It never logs anything taken from the file. This is not reported to Memento; check the
+  content (again if the file goes back to a working one and then to the same bad content). It never logs anything taken from the file. This is not reported to Memento; check the
   log after an edit you expect to take effect.
 - **The file is deleted.** After the same short wait git-sync treats the configuration as empty:
   every provider credential is revoked, running syncs are stopped, and every repository reports
@@ -851,7 +853,7 @@ clears the error.
 | Symptom or error type | Likely cause and fix |
 |---|---|
 | `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
-| `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit. Test from the host that runs git-sync. |
+| `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. |
 | `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |

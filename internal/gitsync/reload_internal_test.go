@@ -3,6 +3,9 @@ package gitsync
 import (
 	"context"
 	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -388,3 +391,81 @@ func (m *modalSource) read(confirm bool) configBundle {
 func (m *modalSource) confirms() int             { m.mu.Lock(); defer m.mu.Unlock(); return m.nConfirm }
 func (m *modalSource) setLook(b configBundle)    { m.mu.Lock(); m.look = b; m.mu.Unlock() }
 func (m *modalSource) setConfirm(b configBundle) { m.mu.Lock(); m.confirm = b; m.mu.Unlock() }
+
+// content X arrives with a loose mode on a mount where chmod fails; the operator then
+// fixes ONLY the mode. Is the (unchanged) content applied by polling?
+func TestModeOnlyFixOfALooseFileIsPickedUp(t *testing.T) {
+	prev := fchmod
+	fchmod = func(*os.File, os.FileMode) error { return errors.New("read-only") }
+	t.Cleanup(func() { fchmod = prev })
+	dir := t.TempDir()
+	path := filepath.Join(dir, "git-sync.json")
+	good := `{"origin":{"base_url":"https://git.example.com/","auth":"bearer","token":"origin-token-two-bbbbbbbb"}}`
+	if err := os.WriteFile(path, []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, got := startReloader(t, fileSource{path}, contentDigest([]byte("old")), 3*time.Millisecond, 3*time.Millisecond)
+	quietly(100 * time.Millisecond)
+	if got.count() != 0 {
+		t.Fatalf("applied a loose-mode file that could not be tightened")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) && got.count() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got.count() != 1 {
+		t.Errorf("mode-only fix: applied %d times, want 1 (the content never changed, only its mode)", got.count())
+	}
+}
+
+// the look sees valid Y, the confirming read sees transient junk Z, then the file is Y
+// again and stays Y. Is Y applied?
+func TestValidContentSeenThenTransientlyBadIsStillApplied(t *testing.T) {
+	src := &scriptedSource{}
+	y := okBundle("y")
+	src.set(y, badBundle("z", loadInvalidJSON), y, y, y, y, y, y)
+	_, got := startReloader(t, src, contentDigest([]byte("a")), 3*time.Millisecond, 3*time.Millisecond)
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && got.count() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got.count() != 1 {
+		t.Errorf("Y held for %d+ reads after a transient Z, applied %d times, want 1", src.readCount(), got.count())
+	}
+}
+
+// the file is unreadable (0000), then replaced by
+// new content at 0644 on a mount where chmod works.
+func TestUnreadableThenLooseModeNewContentIsPickedUp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "git-sync.json")
+	a := `{"origin":{"base_url":"https://git.example.com/","auth":"bearer","token":"origin-token-one-aaaaaaaa"}}`
+	b := `{"origin":{"base_url":"https://git.example.com/","auth":"bearer","token":"origin-token-two-bbbbbbbb"}}`
+	if err := os.WriteFile(path, []byte(a), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	_, got := startReloader(t, fileSource{path}, contentDigest([]byte("old")), 3*time.Millisecond, 3*time.Millisecond)
+	quietly(100 * time.Millisecond)
+	if got.count() != 0 {
+		t.Fatalf("applied an unreadable file")
+	}
+	if err := os.WriteFile(path+".new", []byte(b), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path+".new", 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".new", path); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) && got.count() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got.count() != 1 {
+		t.Errorf("applied %d times, want 1", got.count())
+	}
+}

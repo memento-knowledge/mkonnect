@@ -90,10 +90,11 @@ type fileSource struct{ path string }
 func (f fileSource) read(confirm bool) configBundle {
 	var data []byte
 	var err error
+	var loose os.FileMode
 	if confirm {
 		data, err = readSecureFile(f.path, "git-sync config", maxConfigFileSize)
 	} else {
-		data, err = peekFile(f.path, "git-sync config", maxConfigFileSize)
+		data, loose, err = peekFile(f.path, "git-sync config", maxConfigFileSize)
 	}
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -101,12 +102,24 @@ func (f fileSource) read(confirm bool) configBundle {
 		}
 		return configBundle{kind: bundleInvalid, digest: failureDigest(loadUnreadable), category: loadUnreadable}
 	}
+	// A look at a file whose mode the confirming read would have to tighten is a different
+	// observation from the same bytes at an acceptable mode: the mode is part of what it saw, so a
+	// change to the mode alone is noticed.
+	digest := contentDigest(data)
+	if loose != 0 {
+		digest = looseModeDigest(loose, data)
+	}
 	st, err := parseProviders(f.path, data)
 	if err != nil {
 		c := loadCategory(err)
-		return configBundle{kind: bundleInvalid, digest: contentDigest(data), category: c}
+		return configBundle{kind: bundleInvalid, digest: digest, category: c}
 	}
-	return configBundle{kind: bundleOK, digest: st.digest, store: st}
+	return configBundle{kind: bundleOK, digest: digest, store: st}
+}
+
+// looseModeDigest is the digest a look reports for data at a mode that is not acceptable as-is.
+func looseModeDigest(mode os.FileMode, data []byte) digest {
+	return digestOf(fmt.Sprintf("loose:%04o", mode.Perm()), data)
 }
 
 // peekFile is readSecureFile without its side effects: it applies the same checks through one
@@ -114,30 +127,33 @@ func (f fileSource) read(confirm bool) configBundle {
 // not an error here: whether it can be tightened is for the confirming read to find out, and a look
 // that called it unusable would hide, behind a digest shared by every unreadable file, the fix of
 // whatever made it so.
-func peekFile(path, what string, maxSize int64) ([]byte, error) {
+func peekFile(path, what string, maxSize int64) (data []byte, loose os.FileMode, err error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", what)
+		return nil, 0, fmt.Errorf("%s is not a regular file", what)
 	}
 	if info.Size() > maxSize {
-		return nil, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
+		return nil, 0, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
+	}
+	if !readOnlyModeAcceptable(info.Mode()) {
+		loose = info.Mode()
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if int64(len(b)) > maxSize {
-		return nil, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
+		return nil, 0, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
 	}
-	return b, nil
+	return b, loose, nil
 }
 
 // reloader notices changes to the provider configuration and applies them. One goroutine owns all of
@@ -268,7 +284,7 @@ func (r *reloader) confirm() (rearm bool) {
 	switch {
 	case b.digest == r.applied:
 		return false // it went back
-	case b.kind == bundleInvalid && b.digest != r.pendingSeen:
+	case b.kind == bundleInvalid && b.category == loadUnreadable && b.digest != r.pendingSeen:
 		// The look found content that the confirming read then refused (it could not tighten the
 		// file's mode, or the file went bad): unusable, and the content that was looked at is not
 		// looked at again until it changes.
