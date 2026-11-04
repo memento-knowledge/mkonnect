@@ -333,7 +333,7 @@ func runCanaryScenario(t *testing.T, sc canaryScenario) {
 	mirrors := filepath.Join(r.base, "mirrors")
 	replicaHost := strings.TrimPrefix(r.replica.URL, "https://")
 	cfg := &config.Config{GatewayURL: "wss://gw.example.test", ConnectorID: "gitsync-canary", ProtocolVersion: "v1"}
-	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(r.base, "key")), local, gitsync.NewGitProber(), time.Now, "boot-canary",
+	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(r.base, "key")), local, gitsync.NewGitProberForTest(run), time.Now, "boot-canary",
 		gitsync.WithReplicaHost(replicaHost), gitsync.WithMirrorsRoot(mirrors), gitsync.WithStatusInterval(10*time.Millisecond),
 		gitsync.WithGitRunner(run), gitsync.WithGitOutputRunnerForTest(runOut), gitsync.WithRunSaveIntervalForTest(time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -517,7 +517,9 @@ func (r *canaryRun) assertGitInvocations(t *testing.T, sc canaryScenario) {
 			needles := both
 			switch {
 			case !slices.Contains(networkSubcommands, sub):
-			case key == "http."+r.originURL+"/.extraHeader" && argvHas(inv.argv, r.originURL):
+			case key == "http."+r.originURL+"/.extraHeader" && argvHas(inv.argv, r.originURL),
+				// The reachability probe asks the provider's base URL, and scopes the credential to it.
+				sub == "ls-remote" && key == "http."+r.origin.URL+"/.extraHeader" && argvHas(inv.argv, r.origin.URL):
 				needles = r.pushNeedles // the origin token belongs here
 				seenOrigin = seenOrigin || leak(v, r.originNeedles) != ""
 			case key == "http."+r.replicaURL+"/.extraHeader" && argvHas(inv.argv, r.replicaURL):

@@ -110,3 +110,9 @@ func RealGitRunnersForTest() (
 ) {
 	return runGit, runGitOut
 }
+
+// NewGitProberForTest returns the real origin prober with its git runner replaced, so a test can record
+// what the probe hands to git while still running the real binary.
+func NewGitProberForTest(run func(ctx context.Context, argv, env []string, dir string) ([]byte, error)) OriginProber {
+	return &gitProber{run: run}
+}

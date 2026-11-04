@@ -176,7 +176,7 @@ func decodeConfig(path string, data []byte) (map[string]diskEntry, *ConfigIssue)
 	dec.DisallowUnknownFields()
 	var dc map[string]diskEntry
 	if err := dec.Decode(&dc); err != nil {
-		return nil, decodeIssue(path, err, dec.InputOffset())
+		return nil, decodeIssue(path, err)
 	}
 	// Reject anything after the first JSON value (a second value or trailing garbage), so a
 	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
@@ -191,7 +191,7 @@ func decodeConfig(path string, data []byte) (map[string]diskEntry, *ConfigIssue)
 
 // decodeIssue turns a JSON decoding failure into an issue. The decoder's own text is never used: for
 // an unknown field or a mistyped value it quotes the offending key or value.
-func decodeIssue(path string, err error, offset int64) *ConfigIssue {
+func decodeIssue(path string, err error) *ConfigIssue {
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
 	switch {
@@ -224,7 +224,8 @@ func decodeIssue(path string, err error, offset int64) *ConfigIssue {
 		}
 		return &ConfigIssue{Class: IssueSchema, Field: field, Message: msg, err: fmt.Errorf("git-sync config %s %s", path, msg)}
 	case strings.HasPrefix(err.Error(), "json: unknown field "):
-		msg := fmt.Sprintf("has an unknown field near byte offset %d (a provider may set only %s)", offset, strings.Join(knownConfigFields, ", "))
+		// The decoder's offset after this error is the end of the whole value, not the field, so none is given.
+		msg := fmt.Sprintf("has an unknown field (a provider may set only %s)", strings.Join(knownConfigFields, ", "))
 		return &ConfigIssue{Class: IssueSchema, Message: msg, err: fmt.Errorf("git-sync config %s %s", path, msg)}
 	}
 	return &ConfigIssue{
@@ -284,7 +285,7 @@ func CheckConfig(path string) ConfigReport {
 	// owner is what readSecureFile either tightens or refuses.
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o027 != 0 {
 		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
-			"the file's mode is %04o, wider than the owner-only access the connector expects (group read alone is tolerated, for mounted Secrets). The connector tightens it to 0600 where it is allowed to (loading it just did), and otherwise refuses a file that lets others access it.",
+			"the file's mode is %04o, wider than the owner-only access the connector expects (group read alone is tolerated, for mounted Secrets). The connector tightens it to 0600 where it is allowed to, and otherwise refuses a file that lets others access it.",
 			info.Mode().Perm()))
 	}
 	res := loadConfig(path)

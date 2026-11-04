@@ -7,6 +7,6 @@
   origin  https://git.example.test:443  bearer  inline token
 
 === Warnings ===
-  - the file's mode is 0644, wider than the owner-only access the connector expects (group read alone is tolerated, for mounted Secrets). The connector tightens it to 0600 where it is allowed to (loading it just did), and otherwise refuses a file that lets others access it.
+  - the file's mode is 0644, wider than the owner-only access the connector expects (group read alone is tolerated, for mounted Secrets). The connector tightens it to 0600 where it is allowed to, and otherwise refuses a file that lets others access it.
 
 OK: 1 provider is valid.

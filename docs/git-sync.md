@@ -402,8 +402,10 @@ outside the data volume, so `connector config set` cannot modify it: change it b
 Secret. The mirrors stay on the data volume under `/data/mirrors`.
 
 **Check the file before you restart.** `connector config check` loads the provider configuration
-the way git-sync does at startup and reports every problem in it at once, instead of the first one
-the connector would stop at. It contacts no server and never prints a credential, or any value from
+the way git-sync does at startup and reports every problem with the providers at once, instead of
+the first one the connector would stop at. (A problem with the file as a whole, such as unreadable,
+not JSON, or an unknown field, stops the check just as it stops the connector, so it is reported
+alone.) It contacts no server and never prints a credential, or any value from
 the file: for each valid provider it shows the name, the canonical host key a repository's origin
 URL must resolve to, the authentication mode, and where the credential comes from (today: `inline
 token`, stored in the file).
@@ -428,8 +430,8 @@ provider and the field at fault. A provider name or field that is not valid is d
 position or length, never repeated. The command exits non-zero if the connector would refuse the
 file. It checks the file named by `GIT_SYNC_CONFIG_FILE`, else `/data/git-sync.json` (there is no
 path option, so it cannot read a different file from the one git-sync reads); a missing file at the
-default path is only reported, since git-sync then starts with no providers, but a missing file that
-`GIT_SYNC_CONFIG_FILE` names is an error. Run it as the user git-sync runs as and with the same
+default path (`/data/git-sync.json`) is only reported, since git-sync then starts with no providers,
+but a missing file at any other path is an error. Run it as the user git-sync runs as and with the same
 environment: like git-sync, it tightens the file to owner-only (`0600`) where it is allowed to, and
 it warns when the file was wider than that.
 

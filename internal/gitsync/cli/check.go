@@ -17,7 +17,8 @@ const checkUsage = `usage: mkonnect-gitsync connector config check
 Loads the provider configuration exactly as the connector does at startup and reports every problem
 in it, without contacting any server. It prints each provider's canonical host key, authentication
 mode and where its credential comes from, but never a credential. Exits non-zero if the connector
-would refuse the file. A missing file is not an error (the connector starts with no providers).
+would refuse the file. A missing file is not an error at the default path (the connector starts
+with no providers) but is at any other.
 
 The file is GIT_SYNC_CONFIG_FILE if set, else /data/git-sync.json. Run it as the user the connector
 runs as, with the same environment, so it sees what the connector sees.`
@@ -47,11 +48,11 @@ func runConfigCheck(args []string, w io.Writer) error {
 
 	rep := gitsync.CheckConfig(gitsync.DefaultConfigPath())
 	printConfigReport(w, rep)
-	// A missing file is normal at the default path (the connector starts with no providers), but when
-	// the path was set explicitly it is almost certainly a typo, and exiting 0 would pass a gate that
-	// should fail.
-	if rep.Missing && os.Getenv("GIT_SYNC_CONFIG_FILE") != "" {
-		return errors.New("GIT_SYNC_CONFIG_FILE names a file that does not exist")
+	// A missing file at the default path is normal (the connector starts with no providers, as on a
+	// fresh install). At any other path it is almost certainly a typo, and exiting 0 would pass a gate
+	// that should fail.
+	if rep.Missing && rep.Path != gitsync.DefaultConfigFile {
+		return errors.New("the configuration file does not exist; check GIT_SYNC_CONFIG_FILE")
 	}
 	if n := len(rep.Issues); n > 0 {
 		return fmt.Errorf("config check found %d %s; the connector would refuse this configuration", n, plural(n, "problem", "problems"))

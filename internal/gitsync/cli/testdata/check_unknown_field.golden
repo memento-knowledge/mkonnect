@@ -6,4 +6,4 @@
   (none)
 
 === Errors ===
-  [schema] the config file has an unknown field near byte offset 90 (a provider may set only base_url, auth, username, token)
+  [schema] the config file has an unknown field (a provider may set only base_url, auth, username, token)
