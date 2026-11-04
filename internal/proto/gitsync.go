@@ -180,11 +180,14 @@ const (
 	// missing or of the wrong type.
 	GitSyncConfigErrMalformedMessage = "malformed_message"
 	// GitSyncConfigErrReplicaHostMismatch: a replica_push_url named a host other than the replica host
-	// pinned at install (GIT_SYNC_REPLICA_HOST). The connector pushes only to the pinned host.
+	// pinned at install (GIT_SYNC_REPLICA_HOST). RESERVED: this value is defined here so the wire
+	// contract is complete; it is emitted by the replica-host pinning check, which is implemented
+	// separately. Until that check exists the connector does not enforce the pin.
 	GitSyncConfigErrReplicaHostMismatch = "replica_host_mismatch"
 	// GitSyncConfigErrReplicaHostNotPinned: no replica host is pinned at install (GIT_SYNC_REPLICA_HOST
-	// is absent or empty), so the connector fails closed: it rejects every configuration and never
-	// pushes. Distinct from a mismatch so an operator can tell an incomplete install from a bad URL.
+	// is absent or empty). RESERVED, with the same caveat. The intended behaviour is to fail closed:
+	// reject every configuration and never push. It is a separate value from a mismatch so an
+	// operator can tell an incomplete install from a bad URL.
 	GitSyncConfigErrReplicaHostNotPinned = "replica_host_not_pinned"
 )
 
