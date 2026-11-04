@@ -209,3 +209,40 @@ func TestStatusShowsPinEvenWhenProviderConfigIsBroken(t *testing.T) {
 		t.Errorf("pin line missing when the provider config is broken: %q", out)
 	}
 }
+
+// A provider whose credential lives in a token file is listed as such, without the token or path,
+// and an unrelated `config set` keeps it as a token_file provider.
+func TestConfigListMarksTokenFileProviderAndSetKeepsIt(t *testing.T) {
+	path := withConfig(t)
+	dir := filepath.Dir(path)
+	tokenPath := filepath.Join(dir, "git-token")
+	if err := os.WriteFile(tokenPath, []byte(bearerToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"filed": {"base_url": "https://git.example.test/", "auth": "bearer", "token_file": "` + tokenPath + `"}}`
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	listOut, err := runCLI(t, "", "config", "list")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(listOut, "bearer *** (token_file)") {
+		t.Errorf("list should mark the token_file provider: %q", listOut)
+	}
+	if strings.Contains(listOut, bearerToken) || strings.Contains(listOut, tokenPath) {
+		t.Errorf("list leaked the token or the token file path: %q", listOut)
+	}
+
+	if _, err := runCLI(t, "", "config", "set", "plain", "--base-url", "https://git-plain.example.test/"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), bearerToken) || !strings.Contains(string(raw), tokenPath) {
+		t.Errorf("config set must keep the token_file reference and not inline the token: %s", raw)
+	}
+}

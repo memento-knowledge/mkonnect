@@ -227,9 +227,14 @@ func printReplicaHostPin(w io.Writer) {
 	fmt.Fprintln(w)
 }
 
-// maskedAuth describes the authentication mode without ever printing the token.
+// maskedAuth describes the authentication mode without ever printing the token. A provider whose
+// credential is read from a file says so (the path is not printed); that tells an operator who gets
+// "config set" refused, or whose rotation did nothing, to look at the file.
 func maskedAuth(e gitsync.LocalEntry) string {
 	if e.Auth == "bearer" || e.Auth == "basic" {
+		if e.TokenFile != "" {
+			return e.Auth + " *** (token_file)"
+		}
 		return e.Auth + " ***"
 	}
 	return "(none)"

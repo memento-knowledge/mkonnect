@@ -26,23 +26,39 @@ type Secret = proto.Secret
 // and, optionally, how to authenticate to it. The Token keeps the self-redacting Secret type in
 // memory and is persisted through an explicit on-disk struct (see save/New) rather than being
 // marshalled directly — marshalling a Secret would write "<redacted>" and destroy the token.
+//
+// TokenFile, when set, is the absolute path the credential was read from at load time; Token then
+// holds the value read from it. A provider has either an inline token or a token file, never both
+// (New enforces this on the file as written), and save persists only the path for a token-file
+// provider so rewriting the config never copies the secret into it.
 type LocalEntry struct {
-	BaseURL  string
-	Auth     string // "" (none) | "bearer" | "basic"
-	Username string // required for and only valid with basic auth
-	Token    Secret
+	BaseURL   string
+	Auth      string // "" (none) | "bearer" | "basic"
+	Username  string // required for and only valid with basic auth
+	Token     Secret
+	TokenFile string
 }
 
-// Validate checks one entry without including any credential value in a returned error.
+// Validate checks one entry without including any credential value in a returned error. For a
+// token-file entry it checks the resolved Token, so it is the final check after the file was read.
 func (e LocalEntry) Validate() error {
+	if err := e.validateSettings(); err != nil {
+		return err
+	}
+	return e.validateToken()
+}
+
+// validateSettings checks everything about an entry except the token's value: the URL, the
+// authentication mode and its username rule, and the https requirement. It never needs the
+// credential, so New runs it on every provider before opening any token file.
+func (e LocalEntry) validateSettings() error {
 	u, err := validateRemoteURL(e.BaseURL)
 	if err != nil {
 		return fmt.Errorf("base_url %w", err)
 	}
-	token := e.Token.Reveal()
 	switch e.Auth {
 	case "":
-		if e.Username != "" || token != "" {
+		if e.Username != "" || e.Token.Reveal() != "" || e.TokenFile != "" {
 			return errors.New("credentials require an authentication mode")
 		}
 		return nil
@@ -60,6 +76,18 @@ func (e LocalEntry) Validate() error {
 	default:
 		return errors.New("unsupported authentication mode")
 	}
+	if u.Scheme != "https" {
+		return errors.New("base_url must use https when an authentication mode is set")
+	}
+	return nil
+}
+
+// validateToken checks the credential value when an authentication mode is set.
+func (e LocalEntry) validateToken() error {
+	if e.Auth == "" {
+		return nil
+	}
+	token := e.Token.Reveal()
 	if utf8.RuneCountInString(token) < minTokenLength {
 		return fmt.Errorf("token must be at least %d characters", minTokenLength)
 	}
@@ -69,17 +97,16 @@ func (e LocalEntry) Validate() error {
 	if strings.ContainsFunc(token, func(r rune) bool { return unicode.IsControl(r) }) {
 		return errors.New("token must not contain control characters")
 	}
-	if u.Scheme != "https" {
-		return errors.New("base_url must use https when an authentication mode is set")
-	}
 	return nil
 }
 
 // diskEntry is the on-disk JSON shape. Token is a plain string here (written via Secret.Reveal),
-// so the file holds the real value; the in-memory LocalEntry keeps the self-redacting Secret.
+// so the file holds the real value; the in-memory LocalEntry keeps the self-redacting Secret. Never
+// format a diskEntry: it holds the plain token.
 type diskEntry struct {
-	BaseURL  string `json:"base_url"`
-	Auth     string `json:"auth,omitempty"`
-	Username string `json:"username,omitempty"`
-	Token    string `json:"token,omitempty"`
+	BaseURL   string `json:"base_url"`
+	Auth      string `json:"auth,omitempty"`
+	Username  string `json:"username,omitempty"`
+	Token     string `json:"token,omitempty"`
+	TokenFile string `json:"token_file,omitempty"`
 }

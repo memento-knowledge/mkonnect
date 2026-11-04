@@ -101,3 +101,14 @@ func (c *Client) IdleForTest() bool { return c.mgr.idle() }
 func WithRunSaveIntervalForTest(d time.Duration) Option {
 	return func(o *clientOptions) { o.runSaveInterval = d }
 }
+
+// SetOwnerForTest makes every vetted file appear to be owned by owner(base name), and the running
+// user to be euid, so a test can present a file as foreign-owned or root-owned without chown. owner
+// returns ok=false to simulate an owner that cannot be determined. It returns a function that
+// restores the real lookups.
+func SetOwnerForTest(owner func(name string) (uid int, ok bool), euid int) func() {
+	prevOwner, prevEUID := fileOwnerUID, effectiveUID
+	fileOwnerUID = func(info os.FileInfo) (int, bool) { return owner(info.Name()) }
+	effectiveUID = func() int { return euid }
+	return func() { fileOwnerUID, effectiveUID = prevOwner, prevEUID }
+}

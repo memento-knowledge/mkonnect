@@ -396,13 +396,103 @@ helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
 ```
 
 Each entry has `base_url` (required), `auth` (`bearer`, `basic`, or omitted for none), `username`
-(basic only), and `token`. Unknown fields are rejected. The Secret is mounted read-only at
+(basic only), and the credential: either `token` or `token_file` (see
+[Reading the credential from a file](#reading-the-credential-from-a-file-token_file)). Unknown
+fields are rejected. The Secret is mounted read-only at
 `/etc/mkonnect-gitsync-providers/` (mode `0440`, group-readable through the pod's `fsGroup`),
 outside the data volume, so `connector config set` cannot modify it: change it by updating the
 Secret. The mirrors stay on the data volume under `/data/mirrors`.
 
-**Changes need a restart.** git-sync reads its provider configuration once, at startup; there is
-no reload signal. After any change, including rotating or revoking a credential:
+### Reading the credential from a file (`token_file`)
+
+Instead of an inline `token`, a provider can name a file that holds the credential. Use it where
+the credential is delivered as a file (a Docker volume or secret, a mounted Kubernetes Secret, a
+secrets-manager agent) so it never has to be copied into the provider configuration:
+
+```json
+{
+  "internal-git": {
+    "base_url": "https://git.example.test",
+    "auth": "bearer",
+    "token_file": "/run/secrets/git/git-token"
+  }
+}
+```
+
+- A provider with an authentication mode has **exactly one** of `token` and `token_file`. Setting
+  both, or neither, is an error, as is `token_file` without `auth`. The path must be absolute.
+- The file holds the credential and nothing else. **One trailing newline (`\n`) is removed; nothing
+  else is trimmed.** An empty file, a Windows line ending (`\r\n`), a second line or blank line,
+  leading or trailing spaces, control or invisible characters (including a byte-order mark), and
+  text that is not valid UTF-8 are all refused, rather than quietly changing the credential that is
+  sent. The size limit is 4096 bytes, and the usual token rules (at least 16 characters) apply.
+- The file is read once, when the provider configuration is loaded, so rotating the credential
+  means restarting git-sync. A symbolic link is followed (a Kubernetes Secret volume uses one);
+  the checks below apply to the file it leads to.
+- `connector config list` shows such a provider as `bearer *** (token_file)`, without the path.
+  `connector config set` cannot create one: write the file. Running `config set` for a *different*
+  provider keeps the `token_file` entry as it is. Running it for the same provider replaces the
+  entry with an inline token.
+- No message or log line contains the credential or any of the file's content; errors name the
+  provider and what is wrong with the file.
+
+What git-sync checks on each file before using it:
+
+| Condition | Token file (`token_file`) | Provider configuration file |
+|---|---|---|
+| Not a regular file, or too large | Refused | Refused |
+| Writable by its group or by others | **Refused** | Tightened to `0600`. Refused if that is not possible (a read-only mount) and group or others can write |
+| Readable by its group or by others | **Warning, once per file**: the file is never changed. Docker secrets default to `0444`, and a read-only Kubernetes Secret mount cannot be tightened, so refusing would make `token_file` unusable there | Tightened to `0600`; on a read-only mount accepted when only the group can read |
+| Owner is neither the user running git-sync nor `root` | **Refused** | Refused if the file names a `token_file`. Otherwise only a **warning in this release**; a later release will refuse to start. Make the user running git-sync (uid 65532 in the image) or `root` the owner now |
+| Directory lets other users rename files in it | Warning | Warning |
+
+The provider configuration gets the stricter owner check when it uses `token_file` because it then
+decides which local file is sent to which git server: someone who could edit it could point a
+provider at any file the connector can read.
+
+Where this matters:
+
+- **Docker.** Keep the credential in a volume, as for the registration token, so that the file is
+  owned by uid 65532 and `0600`. A file bind-mounted from the host, including a Compose file-based
+  secret, keeps the host file's owner and is refused unless that owner is `root` or uid 65532.
+  Swarm secrets are `root`-owned and `0444`, so they work and log the read warning.
+- **Kubernetes.** Secret files are `root`-owned and readable by the pod user through `fsGroup`,
+  so the read warning on every start is expected and harmless there. The Helm chart does not yet
+  mount an extra Secret for this, so the ready-made setup is the provider configuration Secret
+  above; use `token_file` with a volume you add to the Deployment yourself.
+
+An example for Docker. It stores the credential in its own volume (not `gitsync-secrets`, which
+you delete after registration), writes a provider configuration that points at it, and mounts the
+volume read-only. Run it from Bash or Zsh, with `$gitsync_image` set as in
+[Option A](#option-a-docker):
+
+```bash
+docker volume create gitsync-git-credential
+printf 'Paste git access token: ' >&2
+IFS= read -r -s GIT_TOKEN
+printf '\n' >&2
+printf %s "$GIT_TOKEN" | docker run --rm -i --entrypoint sh -v gitsync-git-credential:/data "$gitsync_image" \
+  -c 'umask 077; cat > /data/git-token'
+unset GIT_TOKEN
+
+docker run --rm -i --entrypoint sh -v gitsync-data:/data "$gitsync_image" \
+  -c 'umask 077; cat > /data/git-sync.json' <<'JSON'
+{
+  "internal-git": {
+    "base_url": "https://git.example.test",
+    "auth": "bearer",
+    "token_file": "/run/secrets/git/git-token"
+  }
+}
+JSON
+```
+
+Then add `-v gitsync-git-credential:/run/secrets/git:ro` to the `docker run` command that starts
+git-sync and restart it. To rotate, overwrite `/data/git-token` in the volume the same way and
+restart.
+
+**Changes need a restart.** git-sync reads its provider configuration, and any token files it names,
+once, at startup; there is no reload signal. After any change, including rotating or revoking a credential:
 
 ```bash
 docker restart mkonnect-gitsync                           # Docker
@@ -738,6 +828,10 @@ pull if that release has no git-sync image. If you pinned `gitSync.image.tag`, u
 > git-sync Deployment **and its volume with the private key and all mirrors**; you would then have
 > to register the connector again with a new token. See [Uninstalling](#uninstalling).
 
+> **Downgrading:** a release older than the one that introduced `token_file` rejects the field as
+> unknown and will not start. Before you downgrade, replace each `token_file` entry with an inline
+> `token` (for example with `connector config set`) or restore a configuration that has none.
+
 The key, provider configuration, mirrors, and run state are on the volume, so the connector
 reconnects with its existing key and syncs incrementally. A sync that is running when the container
 stops is cancelled; the repository is synced again once the platform sends its configuration to the
@@ -820,7 +914,10 @@ clears the error.
 | Log warns `mirror cleanup skipped: the system clock reads an implausibly early time` | The host clock is before 2025. Fix the clock (NTP); cleanup resumes by itself. |
 | Container exits at start with `configuration error: GATEWAY_URL …` or `CONNECTOR_ID is required` | `GATEWAY_URL` must be an absolute `wss://` URL, and `CONNECTOR_ID` must be set. |
 | Container exits at start with `configuration error: REGISTRATION_TOKEN_FILE: …` | The registration token file could not be used. The message says which: `must be an absolute path`; `opening <path>: …` (the file is missing or unreadable: the volume or Secret is not mounted, or the Secret or key name is wrong); `<path> is not a regular file`; `<path> has unsafe permissions` (accessible by others or writable by group: use mode `0600`, `0640`, `0440`, or `0400`; in Docker re-create it as described in [Option A](#option-a-docker)); `<path> is larger than 4096 bytes` (you pointed it at the wrong file); `<path> is empty`. After registration, either keep the file or remove `REGISTRATION_TOKEN_FILE` together with it. |
-| Start fails with `local config load failed` | The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file readable by others. The message names the cause; it never includes a credential. |
+| Start fails with `local config load failed` | The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file that group or others can write. The message names the cause and, for a token file, the provider; it never includes a credential. For `token_file` problems see the next row. |
+| `local config load failed` mentions a `token_file` | The message names the provider and the problem: `set only one of token and token_file`; `an authentication mode requires a token or a token_file`; `token_file must be an absolute path`; `could not be opened` (the volume or Secret is not mounted, or the path is wrong); `is not a regular file`; `is writable by group or others` (use `0600`, `0640` or `0440`); `is owned by another user` (the owner must be uid 65532, the user running git-sync, or `root`; for a bind mount, `chown` the host file); `is empty`; `ends with a carriage return` (re-save with LF line endings); `has more than one line`; `contains control or invisible characters`; `has leading or trailing whitespace`; `is larger than the 4096-byte limit`. `connector config list`, `set`, `remove` and `status` fail the same way, so fix the file first, even to remove a provider. Run them as the user that runs git-sync: as `root` in a container (`docker exec -u 0`), files owned by uid 65532 count as owned by another user. |
+| Log warns `credential file is readable by group or other users` | Expected for a Docker secret (`0444`) or a Kubernetes Secret. Where you control the mode, tighten it to `0600`; the connector starts either way. |
+| Log warns `credential file is owned by another user` for the provider configuration | The connector starts for now, but a later release will refuse to. Make the user running git-sync (uid 65532 in the image) or `root` own the file. |
 | Start fails with `temp directory … is not writable` | `/tmp` is not writable by uid 65532. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |

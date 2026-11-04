@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,59 +19,164 @@ import (
 // CLI) and read accessors (used by the connector). It mirrors internal/creds/store.go, with the
 // redaction-safe persistence above.
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	data map[string]LocalEntry
+	mu      sync.RWMutex
+	path    string
+	data    map[string]LocalEntry
+	sources sourceSet
 }
 
 // New loads the provider config from path. A missing file yields an empty store and no error. A
-// present file is tightened to owner-only, decoded strictly (unknown fields rejected), and every
-// entry validated; a duplicate host (two providers that resolve to the same scheme+host+port) is
-// rejected so credential selection can never be ambiguous. No error includes a credential value.
+// present file is vetted (see readProviderConfig), tightened to owner-only, decoded strictly
+// (unknown fields rejected), and every entry validated; a duplicate host (two providers that
+// resolve to the same scheme+host+port) is rejected so credential selection can never be ambiguous.
+//
+// A provider's credential is either an inline token or a token_file, the path of a file holding it
+// (see readTokenFile for the checks on that file). Every provider is validated before any token file
+// is opened, so a token file is read only for a configuration that is otherwise acceptable. No error
+// includes a credential value or token-file content; errors name the provider and the problem.
+//
+// Any failure after the file was located is a *LoadError (use errors.As) carrying the files involved.
+// The files of a successful load are available from Sources.
 func New(path string) (*Store, error) {
-	s := &Store{path: path, data: map[string]LocalEntry{}}
-	data, err := readSecureFile(path, "git-sync config", maxConfigFileSize)
+	s := &Store{path: path, data: map[string]LocalEntry{}, sources: sourceSet{}}
+	sources := sourceSet{}
+	fail := func(err error) (*Store, error) { return nil, &LoadError{Sources: sources.sorted(), err: err} }
+
+	cfg, err := readProviderConfig(path, maxConfigFileSize, rejectForeignConfigOwner)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
+			s.sources.add(Source{Path: path})
 			return s, nil
 		}
-		return nil, err
+		sources.add(Source{Path: path})
+		return fail(err)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
+	sources.add(newSource(path, cfg.data))
+
+	dec := json.NewDecoder(bytes.NewReader(cfg.data))
 	dec.DisallowUnknownFields()
 	var dc map[string]diskEntry
 	if err := dec.Decode(&dc); err != nil {
 		var syntaxErr *json.SyntaxError
 		if errors.As(err, &syntaxErr) {
-			return nil, fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset)
+			return fail(fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset))
 		}
-		return nil, fmt.Errorf("git-sync config %s is not valid: %w", path, err)
+		return fail(fmt.Errorf("git-sync config %s is not valid: %w", path, err))
 	}
 	// Reject anything after the first JSON value (a second value or trailing garbage), so a
 	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path)
+		return fail(fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path))
 	}
-	hostKeys := make(map[string]string, len(dc))
-	for name, de := range dc {
-		if err := validateProviderName(name); err != nil {
-			return nil, fmt.Errorf("git-sync config %s: %w", path, err)
+	names := slices.Sorted(maps.Keys(dc))
+
+	// Record every well-formed token file now, so a failed load still reports the files a retry
+	// should watch (including one that does not exist yet).
+	usesTokenFile := false
+	for _, name := range names {
+		if tf := dc[name].TokenFile; tf != "" {
+			usesTokenFile = true
+			if validateTokenFilePath(tf) == nil {
+				sources.add(Source{Path: tf})
+			}
 		}
-		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token)}
-		if err := e.Validate(); err != nil {
-			return nil, fmt.Errorf("provider %q is invalid: %w", name, err)
+	}
+	// A config that names token files decides which local file is sent to which host, so it must not
+	// be editable by anyone else. This is checked on the descriptor the config was read from, before
+	// any token file is opened. A config with only inline tokens is judged by rejectForeignConfigOwner.
+	if cfg.foreignOwner {
+		if usesTokenFile {
+			return fail(fmt.Errorf("git-sync config %s uses token_file but is owned by another user; it must be owned by the user running the connector or by root", path))
+		}
+		slog.Warn("credential file is owned by another user; restrict it to the user running the connector (a future release will refuse to start)", "file", "git-sync config", "path", path)
+	}
+
+	// First pass: everything that does not need a credential.
+	hostKeys := make(map[string]string, len(dc))
+	entries := make(map[string]LocalEntry, len(dc))
+	for _, name := range names {
+		de := dc[name]
+		if err := validateProviderName(name); err != nil {
+			return fail(fmt.Errorf("git-sync config %s: %w", path, err))
+		}
+		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token), TokenFile: de.TokenFile}
+		if err := validateCredentialSource(e); err != nil {
+			return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
+		}
+		if err := e.validateSettings(); err != nil {
+			return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
+		}
+		if e.TokenFile == "" {
+			if err := e.validateToken(); err != nil {
+				return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
+			}
 		}
 		hk, err := canonicalHostKey(e.BaseURL)
 		if err != nil {
-			return nil, fmt.Errorf("provider %q is invalid: base_url %w", name, err)
+			return fail(fmt.Errorf("provider %q is invalid: base_url %w", name, err))
 		}
 		if other, ok := hostKeys[hk]; ok {
-			return nil, fmt.Errorf("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name)
+			return fail(fmt.Errorf("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name))
 		}
 		hostKeys[hk] = name
-		s.data[name] = e
+		entries[name] = e
 	}
+
+	// Second pass: read the token files. A file shared by several providers is read once, so they
+	// all see the same bytes.
+	contents := map[string][]byte{}
+	for _, name := range names {
+		e := entries[name]
+		if e.TokenFile == "" {
+			continue
+		}
+		what := fmt.Sprintf("provider %q token_file", name)
+		raw, ok := contents[e.TokenFile]
+		if !ok {
+			raw, err = readTokenFile(e.TokenFile, what)
+			if err != nil {
+				return fail(err)
+			}
+			contents[e.TokenFile] = raw
+			sources.add(newSource(e.TokenFile, raw))
+		}
+		token, problem := tokenFileValue(raw)
+		if problem != "" {
+			return fail(fmt.Errorf("%s %s %s", what, e.TokenFile, problem))
+		}
+		e.Token = Secret(token)
+		if err := e.validateToken(); err != nil {
+			return fail(fmt.Errorf("%s %s: %w", what, e.TokenFile, err))
+		}
+		entries[name] = e
+	}
+	s.data = entries
+	s.sources = sources
 	return s, nil
+}
+
+// validateCredentialSource checks, on a provider as written in the config file, that its credential
+// comes from exactly one place: with an authentication mode, one of token and token_file (never
+// both). It also checks the token_file path, which is printed in messages.
+func validateCredentialSource(e LocalEntry) error {
+	hasToken, hasFile := e.Token.Reveal() != "", e.TokenFile != ""
+	switch {
+	case hasToken && hasFile:
+		return errors.New("set only one of token and token_file")
+	case e.Auth != "" && !hasToken && !hasFile:
+		return errors.New("an authentication mode requires a token or a token_file")
+	case hasFile:
+		return validateTokenFilePath(e.TokenFile)
+	}
+	return nil
+}
+
+// Sources returns the files the last load read, sorted by path: the config file (listed even when it
+// does not exist, so a reload notices it appearing) and each token file. See Source.
+func (s *Store) Sources() []Source {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sources.sorted()
 }
 
 // Get returns the entry for name, or false if none.
@@ -101,6 +208,9 @@ func (s *Store) Names() []string {
 func (s *Store) Set(name string, e LocalEntry) error {
 	if err := validateProviderName(name); err != nil {
 		return err
+	}
+	if e.TokenFile != "" {
+		return errors.New("a token_file provider is configured by editing the configuration file, not through Set")
 	}
 	if err := e.Validate(); err != nil {
 		return err
@@ -179,11 +289,19 @@ func (s *Store) matchByHostKey(hostKey string) (name string, e LocalEntry, ok bo
 
 // save writes data atomically: a temp file in the same directory, tightened to 0600, synced,
 // then renamed over the target, with the directory synced so the rename is durable. The on-disk
-// form reveals the token (the file must hold the real value), never the Secret's redaction.
+// form reveals an inline token (the file must hold the real value), never the Secret's redaction.
+// A token-file provider is written back as its path alone: the credential belongs to that file and
+// must not be copied into the config.
 func (s *Store) save(data map[string]LocalEntry) error {
 	dc := make(map[string]diskEntry, len(data))
 	for name, e := range data {
-		dc[name] = diskEntry{BaseURL: e.BaseURL, Auth: e.Auth, Username: e.Username, Token: e.Token.Reveal()}
+		de := diskEntry{BaseURL: e.BaseURL, Auth: e.Auth, Username: e.Username}
+		if e.TokenFile != "" {
+			de.TokenFile = e.TokenFile
+		} else {
+			de.Token = e.Token.Reveal()
+		}
+		dc[name] = de
 	}
 	b, err := json.MarshalIndent(dc, "", "  ")
 	if err != nil {
@@ -218,5 +336,7 @@ func (s *Store) save(data map[string]LocalEntry) error {
 		_ = d.Sync()
 		_ = d.Close()
 	}
+	// The config now on disk is what this store holds, so Sources must describe it.
+	s.sources.add(newSource(s.path, b))
 	return nil
 }
