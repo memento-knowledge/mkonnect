@@ -495,3 +495,59 @@ func TestNoProbePileUpBehindASlowOrigin(t *testing.T) {
 	waitFor(t, func() bool { return prober.calls.Load() == 2 })
 	waitProbeDone(t, c)
 }
+
+// A probe that is still running when a newer connection takes over belongs to a connection that is
+// no longer current. Whatever it finds, it must not replace or clear the cached result the new
+// connection serves, nor push a status, and its cadence slot is given back so the new connection
+// probes again.
+func TestProbeOfASupersededConnectionNeitherStoresNorClears(t *testing.T) {
+	for name, finish := range map[string]struct {
+		res gitsync.OriginResult
+		err error
+	}{
+		"result":      {res: gitsync.OriginAccessDenied},
+		"local fault": {err: errors.New("git not found")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+			prober := &scriptedProber{result: gitsync.OriginReachable}
+			c := newTestClientClock(t, oneProvider, prober, clk.now)
+			s1 := &stubSender{}
+			ctx1, cancel1 := context.WithCancel(context.Background())
+			defer cancel1()
+			c.OnConnected(ctx1, s1)
+			waitProbeDone(t, c)
+			cached := latestOriginCheck(s1.messages())
+			c.HandleMessage(ctx1, s1, "git_sync_config", configWithExtras("1"))
+
+			// A refresh is running on the first connection when the second one takes over.
+			block := make(chan struct{})
+			prober.set(finish.res, finish.err, block)
+			clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+			heartbeat(t, c, s1)
+			waitFor(t, func() bool { return prober.calls.Load() == 2 })
+			s2 := &stubSender{}
+			c.OnConnected(context.Background(), s2)
+			sent1, sent2 := len(s1.messages()), len(s2.messages())
+
+			close(block)
+			waitProbeDone(t, c)
+
+			if hb := heartbeat(t, c, s2); hb.OriginCheck == nil || *hb.OriginCheck != *cached {
+				t.Errorf("origin_check on the current connection = %+v, want the cached %+v", hb.OriginCheck, cached)
+			}
+			if n := len(s1.messages()) - sent1; n != 0 {
+				t.Errorf("the superseded connection was sent %d statuses, want none", n)
+			}
+			if n := len(s2.messages()) - sent2; n != 1 {
+				t.Errorf("the current connection was sent %d statuses, want only the heartbeat's", n)
+			}
+
+			// The abandoned attempt did not use up the cadence slot.
+			prober.set(gitsync.OriginUnreachable, nil, nil)
+			heartbeat(t, c, s2)
+			waitFor(t, func() bool { return prober.calls.Load() == 3 })
+			waitProbeDone(t, c)
+		})
+	}
+}

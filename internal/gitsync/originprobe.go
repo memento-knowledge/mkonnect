@@ -22,17 +22,19 @@ const originCheckInterval = 5 * time.Minute
 // (not a per-heartbeat context, which the gateway cancels on return), so a heartbeat-triggered
 // refresh is not killed the instant OnHeartbeat returns. The throttle applies to every attempt —
 // including failed ones — so a persistent local fault (e.g. git missing) does not exec git on every
-// heartbeat. A probe that was cut short because its connection closed is never cached, leaves any
-// earlier result in place, and does not count against the cadence, so the next connection probes
-// at its first opportunity. Cancellation comes from outside this package, so the check that tells
-// the two apart cannot be made atomic with the store that follows it: a probe that ran to
-// completion is a true observation of the origin, and is kept even if the connection closes an
-// instant later. What must never happen is a killed git being read as "unreachable".
+// heartbeat. A probe is committed only while its connection is still the current one and still open
+// (checked together under mu, with the store): one cut short by its connection closing, or
+// overtaken by a newer connection, never caches a result, clears one, or sends a status, and it
+// does not count against the cadence, so the next connection probes at its first opportunity.
+// Cancellation comes from outside this package, so a connection can still close an instant after
+// the check; a probe that ran to completion is a true observation of the origin and may be kept
+// then. What must never happen is a killed git being read as "unreachable".
 func (c *Client) maybeProbe() {
 	c.mu.Lock()
 	accepted := c.configAccepted
 	ctx := c.connCtx
 	s := c.connSender
+	gen := c.connGen
 	c.mu.Unlock()
 	if ctx == nil || s == nil || ctx.Err() != nil {
 		return
@@ -60,20 +62,30 @@ func (c *Client) maybeProbe() {
 	go func() {
 		defer c.probing.Store(false)
 		res, ok := c.runProbe(ctx)
-		if ctx.Err() != nil {
+		// Commit only while this probe's connection is still the current one and still open. A probe
+		// cut short by its connection closing, or one overtaken by a newer connection, changes
+		// nothing and gives its cadence slot back, so the next probe is not held off by it.
+		c.mu.Lock()
+		live := c.connGen == gen && ctx.Err() == nil
+		changed := false
+		if live {
+			if ok {
+				c.originCheck.Store(&proto.OriginCheck{Result: string(res), CheckedAt: c.now().UTC().Format(rfc3339Nano)})
+				changed = true
+			} else {
+				// A local fault says nothing about the origin, so the previous result can no longer
+				// be vouched for: drop it rather than keep reporting it as current.
+				changed = c.originCheck.Swap(nil) != nil
+			}
+		}
+		c.mu.Unlock()
+		if !live {
 			c.lastProbe.CompareAndSwap(start, 0)
 			return
 		}
-		if !ok {
-			// A local fault says nothing about the origin, so the previous result can no longer be
-			// vouched for: drop it rather than keep reporting it as current.
-			if c.originCheck.Swap(nil) != nil {
-				c.emitStatus(ctx, s, dispatchStatusTimeout)
-			}
-			return
+		if changed {
+			c.emitStatus(ctx, s, dispatchStatusTimeout)
 		}
-		c.originCheck.Store(&proto.OriginCheck{Result: string(res), CheckedAt: c.now().UTC().Format(rfc3339Nano)})
-		c.emitStatus(ctx, s, dispatchStatusTimeout)
 	}()
 }
 

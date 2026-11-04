@@ -206,6 +206,8 @@ type Client struct {
 	// per-heartbeat context the gateway cancels as soon as OnHeartbeat returns.
 	connCtx    context.Context
 	connSender gateway.Sender
+	// connGen counts connections, so work started on one can tell it has been superseded.
+	connGen uint64
 
 	// statusMu serialises build-and-send so a heartbeat cannot send a stale snapshot after the read
 	// loop has already sent a newer one, and so the sequence number matches wire order.
@@ -330,6 +332,7 @@ func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
 	c.mu.Lock()
 	c.connCtx = ctx
 	c.connSender = s
+	c.connGen++
 	c.mu.Unlock()
 	c.emitStatus(ctx, s, statusWriteTimeout)
 	c.maybeProbe()
