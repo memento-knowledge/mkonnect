@@ -74,7 +74,8 @@ type repoState struct {
 }
 
 // errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
-// is unusable (missing, or on the pinned host but carrying userinfo, a query or a fragment). It is
+// is unusable (the URL missing, or on the pinned host but carrying userinfo, a query, a fragment or
+// whitespace; or the token empty or containing control characters). It is
 // deliberately generic: the status must never echo the platform-supplied URL.
 const errInvalidReplica = "invalid replica configuration"
 
@@ -162,6 +163,8 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		}
 		replicas[i] = replicaCheck{url: canonical, verdict: verdict}
 	}
+	// Further structural checks (for example schedule and limits ranges) belong after the replica
+	// pass, so a hostile replica URL is never hidden behind them.
 	if msg.ConfigVersion != nil && (len(msg.ConfigVersion) > maxConfigVersionSize || !isScalarJSON(msg.ConfigVersion)) {
 		c.rejectConfig(version, proto.GitSyncConfigErrInvalidConfigVersion)
 		return false

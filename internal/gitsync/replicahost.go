@@ -62,7 +62,11 @@ func ParseReplicaHost(raw string) (string, error) {
 	}
 	u, err := url.Parse("https://" + raw)
 	if err != nil || u.User != nil || u.Path != "" || u.Hostname() == "" {
-		return "", errors.New(ReplicaHostEnv + " is not a valid host or host:port (an IPv6 literal needs brackets)")
+		msg := " is not a valid host or host:port"
+		if strings.Count(raw, ":") > 1 && !strings.HasPrefix(raw, "[") {
+			msg += " (an IPv6 literal needs brackets)"
+		}
+		return "", errors.New(ReplicaHostEnv + msg)
 	}
 	host, err := canonicalASCIIHost(strings.TrimSuffix(u.Hostname(), "."))
 	if err != nil {
@@ -75,8 +79,9 @@ func ParseReplicaHost(raw string) (string, error) {
 	return net.JoinHostPort(host, port), nil
 }
 
-// ReplicaHostFromEnv reads and canonicalises the pin from ReplicaHostEnv. The daemon calls it once at
-// startup; the operator CLI calls it to show the effective value.
+// ReplicaHostFromEnv reads and canonicalises the pin from ReplicaHostEnv. The operator CLI uses it to
+// show the effective value; the daemon reads the same variable once at startup and hands the raw value
+// to WithReplicaHost, which canonicalises it the same way.
 func ReplicaHostFromEnv() (string, error) {
 	return ParseReplicaHost(os.Getenv(ReplicaHostEnv))
 }
@@ -87,11 +92,13 @@ type replicaVerdict int
 const (
 	// replicaOK: the URL is a clean https URL whose canonical host:port is exactly the pin.
 	replicaOK replicaVerdict = iota
-	// replicaInvalid: the URL is missing, names no host, or names the pinned host but is unusable
-	// (userinfo, query, fragment). It fails that one repository, as before the pin existed.
+	// replicaInvalid: the URL is missing, or provably names the pinned host but is unusable there
+	// (userinfo, query, fragment, whitespace, over the length bound). It fails that one repository,
+	// as before the pin existed.
 	replicaInvalid
-	// replicaMismatch: the URL names a host and port other than the pin, or one that cannot be proven
-	// to be the pin. It rejects the whole configuration.
+	// replicaMismatch: every other non-empty value - a URL naming another host, port or scheme, or
+	// one that cannot be proven to name the pin (does not parse, no host, non-ASCII or
+	// percent-encoded host). It rejects the whole configuration.
 	replicaMismatch
 )
 
@@ -103,10 +110,12 @@ const (
 // The match is exact: scheme, host and port must all equal the pin's. There are no wildcards,
 // subdomains or suffix matches. The accepting comparison is made on the output of the strict
 // canonicalRemoteURL, the same value that is later dialled, so the host that was checked is the host
-// that is contacted. A lenient parse is used only to decide how a URL that failed the strict check
-// is classified: one that parses to the pinned host is merely unusable (replicaInvalid), anything
-// else - including a URL that does not parse at all, or whose host is non-ASCII, percent-encoded or
-// otherwise ambiguous - is treated as naming another host, so a hostile value is surfaced loudly
+// that is contacted.
+//
+// Classification of a URL that fails the strict check is deliberately one-sided: only an empty value,
+// or a URL that a lenient parse shows to name exactly the pinned scheme, host and port, is
+// replicaInvalid. Anything else, including a value that names no host at all (git may still read
+// "host:path" as an scp-style remote), is replicaMismatch, so a hostile value is surfaced loudly
 // instead of being quietly skipped.
 func checkReplicaURL(raw, pin string) (string, replicaVerdict) {
 	if raw == "" {
@@ -119,12 +128,10 @@ func checkReplicaURL(raw, pin string) (string, replicaVerdict) {
 		}
 		return "", replicaMismatch
 	}
+	// The strict check failed. The URL is merely unusable only if it provably names the pin.
 	u, err := url.Parse(raw)
-	if err != nil {
+	if err != nil || u.Hostname() == "" {
 		return "", replicaMismatch
-	}
-	if u.Hostname() == "" {
-		return "", replicaInvalid
 	}
 	host, err := canonicalASCIIHost(strings.TrimSuffix(u.Hostname(), "."))
 	if err != nil {

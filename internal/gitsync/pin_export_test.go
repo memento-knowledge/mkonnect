@@ -26,3 +26,6 @@ func (c *Client) ForceReplicaURLForTest(repoID, replicaURL string) {
 		c.repos[repoID] = r
 	}
 }
+
+// MaxConfigReposForTest is the repository cap, so a test does not hard-code it.
+const MaxConfigReposForTest = maxConfigRepos

@@ -114,8 +114,8 @@ type GitSyncRepoConfig struct {
 	// ReplicaPushURL is where the connector pushes the mirror. It must be an https URL on exactly the
 	// host and port the connector was pinned to at install (GIT_SYNC_REPLICA_HOST), because the push
 	// token travels to it: a URL naming any other host rejects the whole configuration, and with no
-	// pin every configuration is rejected. A missing URL, or one on the pinned host carrying userinfo,
-	// a query or a fragment, fails only that repository.
+	// pin every configuration is rejected. A missing URL, or one that names the pinned host but carries
+	// userinfo, a query, a fragment or whitespace, fails only that repository.
 	ReplicaPushURL string `json:"replica_push_url"`
 	// PushToken authenticates the push to the replica, sent as an Authorization Bearer token
 	// (INFERRED: the contract names the token but not the scheme). It is a Secret so it cannot leak
@@ -184,8 +184,8 @@ const (
 	GitSyncConfigErrMalformedMessage = "malformed_message"
 	// GitSyncConfigErrReplicaHostMismatch: a repository's replica_push_url names a host or port other
 	// than the replica host pinned at install (GIT_SYNC_REPLICA_HOST), a scheme other than https, or
-	// a host that cannot be shown to be the pinned one (non-ASCII, percent-encoded, malformed). The
-	// match is exact: no wildcards, subdomains or suffixes. One such repository rejects the whole
+	// any non-empty value that cannot be shown to name the pinned host (does not parse, no host,
+	// non-ASCII or percent-encoded host). The match is exact: no wildcards, subdomains or suffixes. One such repository rejects the whole
 	// configuration, whether or not its origin matches a local provider; the previous configuration
 	// stays in effect and nothing from the rejected one is synced.
 	GitSyncConfigErrReplicaHostMismatch = "replica_host_mismatch"

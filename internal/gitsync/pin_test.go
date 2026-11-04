@@ -79,11 +79,15 @@ func (p *pinTest) status(t *testing.T) proto.GitSyncStatusMsg {
 	return lastStatus(t, p.s.messages())
 }
 
-func (p *pinTest) settle(t *testing.T) {
+func (p *pinTest) settle(t *testing.T) { settleClient(t, p.c) }
+
+// settleClient waits for every started sync to stop, so a "git never ran" assertion made afterwards
+// cannot pass merely because a sync had not reached git yet.
+func settleClient(t *testing.T, c *gitsync.Client) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	p.c.Wait(ctx)
+	c.Wait(ctx)
 }
 
 func goodRepo(id string) string {
@@ -127,12 +131,12 @@ func wantConfigError(t *testing.T, st proto.GitSyncStatusMsg, version, reason st
 	if st.ConfigError.Reason != reason {
 		t.Errorf("config_error.reason = %q, want %q", st.ConfigError.Reason, reason)
 	}
-	got := string(st.ConfigError.ConfigVersion)
-	if version == "null" {
-		version = ""
+	b, err := json.Marshal(st.ConfigError.ConfigVersion)
+	if err != nil {
+		t.Fatalf("marshal config_error.config_version: %v", err)
 	}
-	if got != version {
-		t.Errorf("config_error.config_version = %q, want %q", got, version)
+	if string(b) != version {
+		t.Errorf("config_error.config_version on the wire = %s, want %s", b, version)
 	}
 }
 
@@ -200,6 +204,7 @@ func TestDefaultClientIsNotPinned(t *testing.T) {
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSONRaw("1", goodRepo("repo-a")))
 	wantConfigError(t, lastStatus(t, s.messages()), "1", proto.GitSyncConfigErrReplicaHostNotPinned)
+	settleClient(t, c)
 	if g.total() != 0 {
 		t.Error("git ran on a client with no pin option")
 	}
@@ -216,6 +221,7 @@ func TestInvalidPinBehavesAsNoPinAndLogsNoValue(t *testing.T) {
 		if st.ConfigError == nil || st.ConfigError.Reason != proto.GitSyncConfigErrReplicaHostNotPinned {
 			t.Errorf("pin %q: config_error = %+v, want replica_host_not_pinned", bad, st.ConfigError)
 		}
+		p.settle(t)
 		if p.g.total() != 0 {
 			t.Errorf("pin %q: git ran", bad)
 		}
@@ -350,6 +356,7 @@ func TestMismatchRejectedForUnmatchedOriginRepo(t *testing.T) {
 		goodRepo("repo-a"),
 		repoJSON("repo-b", "https://other.example.com/b.git", "", "https://evil.example/r/b.git", testPushToken))))
 	wantConfigError(t, st, "1", proto.GitSyncConfigErrReplicaHostMismatch)
+	p.settle(t)
 	if p.g.total() != 0 {
 		t.Error("git ran")
 	}
@@ -362,6 +369,10 @@ func TestMismatchRejectedWithoutLocalStore(t *testing.T) {
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSONRaw("1",
 		repoJSON("repo-a", goodOrigin, "", "https://evil.example/r/a.git", testPushToken)))
 	wantConfigError(t, lastStatus(t, s.messages()), "1", proto.GitSyncConfigErrReplicaHostMismatch)
+	settleClient(t, c)
+	if g.total() != 0 {
+		t.Error("git ran")
+	}
 }
 
 // A mismatch outranks the other structural rejections: a hostile URL must not be hidden behind them.
@@ -443,7 +454,7 @@ func TestPreviousConfigKeepsSyncingAfterRejection(t *testing.T) {
 }
 
 func TestEveryRejectionPathReportsItsReason(t *testing.T) {
-	many := make([]string, 4097)
+	many := make([]string, gitsync.MaxConfigReposForTest+1)
 	for i := range many {
 		many[i] = fmt.Sprintf(`{"repo_id":"r%d"}`, i)
 	}
@@ -452,7 +463,7 @@ func TestEveryRejectionPathReportsItsReason(t *testing.T) {
 	}{
 		{"too many", `{"config_version":5,"repositories":[` + strings.Join(many, ",") + `]}`, "5", proto.GitSyncConfigErrTooManyRepositories},
 		{"invalid repo id", string(configJSONRaw("6", repoJSON("a/b", goodOrigin, "", goodReplica, testPushToken))), "6", proto.GitSyncConfigErrInvalidRepoID},
-		{"empty repo id", string(configJSONRaw("6", repoJSON("..", goodOrigin, "", goodReplica, testPushToken))), "6", proto.GitSyncConfigErrInvalidRepoID},
+		{"dot-dot repo id", string(configJSONRaw("6", repoJSON("..", goodOrigin, "", goodReplica, testPushToken))), "6", proto.GitSyncConfigErrInvalidRepoID},
 		{"duplicate", string(configJSONRaw(`"v7"`, goodRepo("x"), goodRepo("x"))), `"v7"`, proto.GitSyncConfigErrDuplicateRepoID},
 		{"object version", `{"config_version":{"a":1},"repositories":[]}`, "null", proto.GitSyncConfigErrInvalidConfigVersion},
 		{"array version", `{"config_version":[1],"repositories":[]}`, "null", proto.GitSyncConfigErrInvalidConfigVersion},
@@ -462,6 +473,8 @@ func TestEveryRejectionPathReportsItsReason(t *testing.T) {
 		{"repositories wrong type", `{"config_version":9,"repositories":"x"}`, "9", proto.GitSyncConfigErrMalformedMessage},
 		{"missing repositories", `{"config_version":10}`, "10", proto.GitSyncConfigErrMalformedMessage},
 		{"null repositories", `{"config_version":11,"repositories":null}`, "11", proto.GitSyncConfigErrMalformedMessage},
+		{"literal null version", `{"config_version":null,"repositories":"x"}`, "null", proto.GitSyncConfigErrMalformedMessage},
+		{"empty repo id", string(configJSONRaw("12", repoJSON("", goodOrigin, "", goodReplica, testPushToken))), "12", proto.GitSyncConfigErrInvalidRepoID},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -471,6 +484,7 @@ func TestEveryRejectionPathReportsItsReason(t *testing.T) {
 			if st.ConfigVersion != nil {
 				t.Errorf("a rejected config set config_version=%s", st.ConfigVersion)
 			}
+			p.settle(t)
 			if p.g.total() != 0 {
 				t.Error("git ran")
 			}
@@ -541,7 +555,12 @@ func TestSyncRefusesAReplicaURLOutsideThePin(t *testing.T) {
 
 func TestRejectedConfigDoesNotDisturbInFlightSyncs(t *testing.T) {
 	g := &scriptedGit{gate: make(chan struct{})}
+	var release sync.Once
+	releaseGate := func() { release.Do(func() { close(g.gate) }) }
 	p := newPinTest(t, gitsync.WithReplicaHost(pinnedHost), gitsync.WithGitRunner(g.run))
+	// Registered after newPinTest's own cleanup so it runs first: a failed wait below must not leave
+	// the gated fetch blocking that cleanup's Wait.
+	t.Cleanup(releaseGate)
 	p.send(t, string(configJSONRaw("1", goodRepo("repo-a"))))
 	waitFor(t, func() bool { return g.count("fetch") == 1 })
 
@@ -549,7 +568,7 @@ func TestRejectedConfigDoesNotDisturbInFlightSyncs(t *testing.T) {
 	if got := repoStatusNow(t, p.s, "repo-a").State; got != gitsync.StateSyncing {
 		t.Errorf("in-flight repo-a = %q after a rejected config, want syncing", got)
 	}
-	close(g.gate)
+	releaseGate()
 	waitFor(t, func() bool { return repoStatusNow(t, p.s, "repo-a").State == gitsync.StateOK })
 	if g.anyCallMentions("evil.example") {
 		t.Error("the rejected host reached git")

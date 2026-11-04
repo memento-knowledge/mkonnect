@@ -159,11 +159,19 @@ func TestCheckReplicaURL(t *testing.T) {
 		{"pk.example.com:443", "https://p\u212a.example.com/r", "mismatch", ""}, // Kelvin sign
 		{"[::ffff:1.2.3.4]:443", "https://1.2.3.4/r", "mismatch", ""},
 		{testPin, "https://replica.example.com:99999/r", "mismatch", ""},
+		// Names no host the connector can prove is the pin: never "just invalid", because git may
+		// still read such a value as a host (scp-like) or a local path.
+		{testPin, "evil.example/x", "mismatch", ""},
+		{testPin, "evil.example:r.git", "mismatch", ""},
+		{testPin, "/just/a/path", "mismatch", ""},
+		{testPin, "not a url", "mismatch", ""},
+		{testPin, "https:///r", "mismatch", ""},
+		{testPin, "https://replica.example.com/x\n", "mismatch", ""}, // control character
 
 		// Targets the pinned host but is unusable: stays a per-repository failure.
 		{testPin, "", "invalid", ""},
-		{testPin, "/just/a/path", "invalid", ""},
-		{testPin, "not a url", "invalid", ""},
+		{testPin, "https://replica.example.com/r g.git", "invalid", ""},                      // space in path
+		{testPin, "https://replica.example.com/" + strings.Repeat("a", 3000), "invalid", ""}, // over the URL length bound
 		{testPin, "https://user:pw@replica.example.com/r", "invalid", ""},
 		{testPin, "https://a@b@replica.example.com/r", "invalid", ""},
 		{testPin, "https://replica.example.com/r?token=1", "invalid", ""},

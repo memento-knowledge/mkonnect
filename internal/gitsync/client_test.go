@@ -488,7 +488,7 @@ func TestCriticalPatchGateViaHandleMessage(t *testing.T) {
 	}
 }
 
-func TestMalformedMessagesAreIgnored(t *testing.T) {
+func TestMalformedMessagesGetAtMostAConfigError(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(`{"repositories":"nope"}`))

@@ -220,7 +220,7 @@ func printReplicaHostPin(w io.Writer) {
 		fmt.Fprintln(w, "  The connector pushes only to this host and rejects any configuration naming another.")
 	case errors.Is(err, gitsync.ErrReplicaHostNotSet):
 		fmt.Fprintf(w, "  %s: NOT SET - the connector will reject every configuration and will not sync.\n", gitsync.ReplicaHostEnv)
-		fmt.Fprintf(w, "  Set it to the replica host (host or host:port) and restart the connector.\n")
+		fmt.Fprintln(w, "  Set it to the replica host (host or host:port) and restart the connector.")
 	default:
 		fmt.Fprintf(w, "  %s: INVALID - the connector will reject every configuration and will not sync.\n", gitsync.ReplicaHostEnv)
 		fmt.Fprintf(w, "  %v\n", err)
