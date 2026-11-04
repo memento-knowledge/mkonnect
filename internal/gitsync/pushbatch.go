@@ -45,8 +45,8 @@ const (
 	// maxPlanBytes bounds the ref names a plan retains; a plan that needs more is refused, not
 	// truncated, because a partial plan cannot be pushed in full.
 	maxPlanBytes = 64 << 20
-	// maxPlanRefLen bounds a ref name the plan accepts: longer than any ref git can store (a path is
-	// at most 4096 bytes), so a plan naming one is not a plan from git.
+	// maxPlanRefLen bounds a ref name the plan accepts: longer than any ref a Linux filesystem path
+	// (at most 4096 bytes) can hold, so a plan naming one is not a plan from git.
 	maxPlanRefLen = 4096
 	// maxPlanLine bounds one porcelain status line the plan reads: two names, the flag, the
 	// separators and git's summary.
@@ -199,7 +199,8 @@ func (d syncDeps) planPush(ctx context.Context, home string, t syncTask, lim Lim
 // write, '-' for one it would delete, '=' for one already current and '!' for one it would refuse.
 // Only the first two kinds are retained, by destination name; the rest is ignored (a rejection is
 // pushCounter's business). The names come from the replica's advertisement and the mirror, so they are
-// untrusted text: each must pass validPushRef or the whole plan is unusable.
+// untrusted text: each must pass validPushRef or the whole plan is unusable. That fails closed: a
+// status line this code cannot read stops the sync rather than risk a partial plan.
 type pushPlan struct {
 	upserts, deletes []string
 	// shadows are the names, on either side, of the form refs/heads/refs/... or refs/tags/refs/...
@@ -264,11 +265,15 @@ func (p *pushPlan) endLine() {
 		p.bad = true
 		return
 	}
-	if p.retained += len(to); p.retained > maxPlanBytes {
-		p.bad = true
-		return
+	// Count only what is kept: an up-to-date ref is most of a plan and is kept only if it shadows.
+	shadow := isShadow(to)
+	if flag != '=' || shadow {
+		if p.retained += len(to); p.retained > maxPlanBytes {
+			p.bad = true
+			return
+		}
 	}
-	if isShadow(to) {
+	if shadow {
 		if p.shadows == nil {
 			p.shadows = map[string]struct{}{}
 		}
@@ -330,6 +335,10 @@ func validPushRef(name string) bool {
 //     refs/heads/x and refs/heads/refs/heads/x, the refspec refs/heads/x matches more than one ref and
 //     git refuses it (shadows holds every such name of the plan, on either side);
 //   - a ref too long to put in an argument list with others.
+//
+// Known limit: git also counts refs/<name> as a match for a full ref name, so a legacy mirror holding
+// refs/refs/heads/x, or a replica advertising it, would still make refs/heads/x ambiguous. The plan
+// lists only branches and tags, so it cannot see those; such a repository needs the unbatched path.
 func splitConflicts(upserts, deletes []string, shadows map[string]struct{}) (free, held []string) {
 	deleted := make(map[string]struct{}, len(deletes))
 	dirs := map[string]struct{}{}

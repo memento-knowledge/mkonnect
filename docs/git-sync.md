@@ -585,10 +585,12 @@ goes back to its default. These are applied:
 When pushes are batched, git-sync first asks the replica what a push would change (a request that
 sends no data), writes the changed branches and tags in batches, and only after **every batch has
 succeeded** makes one final push that also removes the refs that no longer exist on your git server.
-If a batch fails, the token expires, or git-sync is stopped part-way, nothing is removed from the
-replica in that run and the next run continues from where the replica stands. The batch size bounds
-the refs written per batch; the final push carries all the removals. A repository whose mirror holds
-no more refs than one batch is pushed as before, without the extra request.
+If a batch fails, the token expires, or git-sync is stopped before that final push, nothing is
+removed from the replica in that run and the next run continues from where the replica stands. The
+batch size bounds the refs written per batch; the final push carries all the removals, and also
+writes the few refs that cannot go in a batch (for example a name that git would find ambiguous next
+to another ref). A repository whose mirror holds no more refs than one batch is pushed as before,
+without the extra request.
 
 ## Data on the volume
 

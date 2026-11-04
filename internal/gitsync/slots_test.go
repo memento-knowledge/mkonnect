@@ -191,17 +191,21 @@ func TestSlotPoolAbandonAfterTheSlotWasGrantedHandsItBack(t *testing.T) {
 	p.mu.Unlock()
 
 	p.release() // grants the slot to first
-	if !first.granted {
+	p.mu.Lock()
+	granted := first.granted
+	p.mu.Unlock()
+	if !granted {
 		t.Fatal("setup: the slot was not granted to the first waiter")
 	}
 	p.abandon(first, e1) // first was cancelled before it noticed
 
-	if !second.granted {
-		t.Error("the slot first gave up was not passed to the next waiter")
-	}
 	p.mu.Lock()
+	passedOn := second.granted
 	held, queued := p.held, p.waiters.Len()
 	p.mu.Unlock()
+	if !passedOn {
+		t.Error("the slot first gave up was not passed to the next waiter")
+	}
 	if held != 1 || queued != 0 {
 		t.Errorf("held=%d queued=%d, want 1 held (by second) and nothing queued", held, queued)
 	}
@@ -219,9 +223,9 @@ func TestSlotPoolAbandonBeforeAnyGrantLeavesTheQueue(t *testing.T) {
 	p.release()
 
 	p.mu.Lock()
-	held, queued := p.held, p.waiters.Len()
+	granted, held, queued := w.granted, p.held, p.waiters.Len()
 	p.mu.Unlock()
-	if w.granted || held != 0 || queued != 0 {
-		t.Errorf("granted=%v held=%d queued=%d, want an abandoned waiter to be skipped and the pool empty", w.granted, held, queued)
+	if granted || held != 0 || queued != 0 {
+		t.Errorf("granted=%v held=%d queued=%d, want an abandoned waiter to be skipped and the pool empty", granted, held, queued)
 	}
 }

@@ -775,3 +775,34 @@ func TestLongRefIsLeftToTheFinalPush(t *testing.T) {
 		t.Errorf("the last push = %v, want the full pruning push", last.argv)
 	}
 }
+
+// An unchanged mirror is a plan of nothing but up-to-date lines. They are not kept, so they must not
+// count against the plan's size bound however many there are.
+func TestHugeAllUpToDatePlanIsStillUsable(t *testing.T) {
+	name := "refs/heads/" + strings.Repeat("a", 200)
+	line := "=\t" + name + ":" + name + "\t[up to date]\n"
+	p := &pushPlan{}
+	chunk := []byte(strings.Repeat(line, 1000))
+	for range maxPlanBytes/(200*1000) + 2 {
+		_, _ = p.Write(chunk)
+	}
+	if p.unusable() {
+		t.Error("a plan of only up-to-date refs was refused as too big")
+	}
+	if len(p.upserts) != 0 || len(p.deletes) != 0 {
+		t.Errorf("up-to-date refs were kept as changes: %d upserts, %d deletes", len(p.upserts), len(p.deletes))
+	}
+}
+
+// The bound still applies to what is kept.
+func TestPlanOfTooManyChangesIsRefused(t *testing.T) {
+	p := &pushPlan{}
+	name := "refs/heads/" + strings.Repeat("a", 200)
+	chunk := []byte(strings.Repeat("*\t"+name+":"+name+"\t[new branch]\n", 1000))
+	for range maxPlanBytes/(len(name)*1000) + 2 {
+		_, _ = p.Write(chunk)
+	}
+	if !p.unusable() {
+		t.Error("a plan retaining more than the bound was accepted")
+	}
+}
