@@ -40,6 +40,11 @@ const maxReplicaHostLength = 262
 // dials (see canonicalASCIIHost), so a Unicode, fullwidth, percent-encoded or inet_aton-style host
 // is rejected rather than folded onto an ASCII one.
 //
+// A trailing dot (an absolute DNS name) is stripped, as it is from every URL the connector dials, so
+// the pinned name is resolved as a relative one and a resolver search domain (for example a
+// Kubernetes ndots setting) may apply. TLS hostname verification still binds the certificate to the
+// name; do not relax it.
+//
 // An empty value is ErrReplicaHostNotSet. Every other failure is a fixed message: the value is never
 // echoed, so it cannot inject into a log.
 func ParseReplicaHost(raw string) (string, error) {
@@ -71,6 +76,16 @@ func ParseReplicaHost(raw string) (string, error) {
 	host, err := canonicalASCIIHost(strings.TrimSuffix(u.Hostname(), "."))
 	if err != nil {
 		return "", errors.New(ReplicaHostEnv + " " + err.Error())
+	}
+	// canonicalASCIIHost is shared with the URLs the platform supplies and accepts a leading or
+	// trailing hyphen in a label; a pin is operator-typed and must be a real name, so a typo such as
+	// "-" fails loudly at startup instead of silently matching nothing.
+	if !strings.Contains(host, ":") {
+		for _, label := range strings.Split(host, ".") {
+			if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+				return "", errors.New(ReplicaHostEnv + " has a host label that starts or ends with a hyphen")
+			}
+		}
 	}
 	port, err := canonicalPort(u)
 	if err != nil {
