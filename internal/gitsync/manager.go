@@ -72,7 +72,7 @@ func newManager(limit int, deps syncDeps, hooks syncHooks) *manager {
 
 // enqueue starts a sync for each repository that is syncable and not already in flight, and marks a
 // trailing rerun for each that is. ctx bounds the syncs it starts: it is the process-lifetime
-// context, not a connection's, so a reconnect does not kill a long clone.
+// context, not a connection's, so a reconnect does not kill a long fetch.
 func (m *manager) enqueue(ctx context.Context, repoIDs []string) {
 	for _, id := range repoIDs {
 		if _, ok := m.hooks.resolve(id); !ok {

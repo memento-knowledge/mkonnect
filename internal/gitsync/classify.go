@@ -15,7 +15,7 @@ import (
 type gitSide int
 
 const (
-	originSide  gitSide = iota // clone / fetch from the customer origin
+	originSide  gitSide = iota // init / fetch from the customer origin
 	replicaSide                // push to the Memento replica
 )
 
@@ -76,7 +76,7 @@ func containsAny(s string, markers []string) bool {
 // 404 for a repository the credential cannot see, and the contract has no separate "not found" code.
 // An HTTP 407 (proxy authentication) is not the customer's credential being rejected, so it is
 // origin_unreachable. A deadline is attributed by side: a push that outlives its deadline is
-// push_timeout, a clone or fetch that does is origin_unreachable.
+// push_timeout, a fetch that does is origin_unreachable.
 func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired bool) (errorType, detail string) {
 	if err == nil {
 		return "", ""
@@ -168,8 +168,8 @@ func matchText(stderr []byte) string {
 }
 
 // isCorruptMirror reports whether a failed fetch says the LOCAL mirror is unusable, which is
-// repaired by recloning. Lines the remote sent ("remote:") and ref names are excluded: an origin
-// reporting its own corruption, or a branch named "fix-corrupt-cache", must not make the connector
+// repaired by rebuilding the mirror. Lines the remote sent ("remote:") and ref names are excluded:
+// an origin reporting its own corruption, or a branch named "fix-corrupt-cache", must not make the connector
 // delete a healthy mirror and download the whole repository again.
 func isCorruptMirror(stderr []byte) bool {
 	return containsAny(localLines(matchText(stderr)), corruptMirrorMarkers)

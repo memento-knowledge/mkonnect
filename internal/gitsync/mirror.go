@@ -39,7 +39,7 @@ func (m Mirrors) EnsureRoot() error {
 }
 
 // Exists reports whether a mirror directory for repoID is present. It says nothing about whether the
-// directory is a valid repository; the sync treats an unusable one as a failed fetch and reclones.
+// directory is a valid repository; the sync treats an unusable one as a failed fetch and rebuilds it.
 func (m Mirrors) Exists(repoID string) bool {
 	info, err := os.Stat(m.Dir(repoID))
 	return err == nil && info.IsDir()
