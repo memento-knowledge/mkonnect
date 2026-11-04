@@ -224,10 +224,15 @@ type GitSyncRepoStatus struct {
 	// LastAttemptAt is when the most recent sync attempt started (RFC3339 UTC); omitted when the
 	// repository has never been attempted. INFERRED.
 	LastAttemptAt *string `json:"last_attempt_at,omitempty"`
-	// LastSuccessAt is when the most recent successful sync finished (RFC3339 UTC); present as null
-	// until the first success (deliberately not omitempty, so the platform can tell "never
-	// succeeded" from "field not supported"). INFERRED.
-	LastSuccessAt *string `json:"last_success_at"`
+	// LastSuccessAt is when the most recent successful sync finished (RFC3339 UTC). INFERRED.
+	//
+	// The intended wire form is present as null until the first success, so the platform can tell
+	// "never succeeded" from "field not supported", the same convention as ConfigVersion. It is
+	// omitempty for now only because the connector does not yet record success times: emitting null
+	// would wrongly tell the platform that healthy repositories have never succeeded. The change
+	// that starts populating it must drop omitempty here and update the status goldens and
+	// TestGitSyncNewStatusFieldPresence.
+	LastSuccessAt *string `json:"last_success_at,omitempty"`
 	// DurationMS is how long the most recently FINISHED attempt took, in milliseconds; omitted until
 	// an attempt has finished. While a re-sync is in flight, LastAttemptAt names that attempt but
 	// this and the two fields below still describe the previous finished one. INFERRED.

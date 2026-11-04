@@ -252,17 +252,22 @@ func TestGitSyncStatusFullGolden(t *testing.T) {
 }
 
 // TestGitSyncNewStatusFieldPresence pins which of the new status fields are omitted when unset and
-// which are present as null: last_success_at stays null until the first success, and a config_error
-// without a usable version still carries config_version as null.
+// which are present as null: a config_error without a usable version still carries config_version
+// as null. last_success_at is omitted while unset because the connector does not yet record success
+// times; it is meant to become present-as-null in the change that populates it.
 func TestGitSyncNewStatusFieldPresence(t *testing.T) {
 	repo := marshalToObject(t, proto.GitSyncRepoStatus{RepoID: "r", State: "pending"})
-	for _, k := range []string{"last_attempt_at", "duration_ms", "refs_pushed", "newest_origin_commit_at"} {
+	for _, k := range []string{"last_attempt_at", "last_success_at", "duration_ms", "refs_pushed", "newest_origin_commit_at"} {
 		if _, ok := repo[k]; ok {
 			t.Errorf("empty GitSyncRepoStatus must omit %q, got %v", k, repo)
 		}
 	}
-	if v, ok := repo["last_success_at"]; !ok || v != nil {
-		t.Errorf("last_success_at should be present as null, got %v ok=%v", v, ok)
+	var decoded proto.GitSyncRepoStatus
+	if err := json.Unmarshal([]byte(`{"repo_id":"r","state":"pending","last_success_at":null}`), &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.LastSuccessAt != nil {
+		t.Errorf("last_success_at null decoded to %q, want nil", *decoded.LastSuccessAt)
 	}
 
 	msg := marshalToObject(t, proto.GitSyncStatusMsg{Type: "git_sync_status"})

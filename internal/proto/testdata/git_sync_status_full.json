@@ -20,14 +20,12 @@
       "repo_id": "repo-b",
       "state": "error",
       "last_attempt_at": "2026-01-02T03:01:00Z",
-      "last_success_at": null,
       "duration_ms": 120,
       "error_type": "origin_unreachable"
     },
     {
       "repo_id": "repo-c",
-      "state": "pending",
-      "last_success_at": null
+      "state": "pending"
     }
   ],
   "config_error": {
