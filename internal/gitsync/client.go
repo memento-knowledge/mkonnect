@@ -225,6 +225,9 @@ type Client struct {
 
 	// afterClaimRead, when set by a test, runs inside claimTask's critical section.
 	afterClaimRead func()
+	// beforeConfigInstall, when set by a test, runs in applyConfig after the new set is built and
+	// before the lock that installs it is taken.
+	beforeConfigInstall func()
 
 	// statusMu serialises build-and-send so a heartbeat cannot send a stale snapshot after the read
 	// loop has already sent a newer one, and so the sequence number matches wire order.
@@ -636,9 +639,11 @@ func (c *Client) schedulableTargets() map[string]targetKey {
 	return out
 }
 
-// targetMatches reports whether t was resolved from r's current sync target.
+// targetMatches reports whether t was resolved from r's current sync target. The origin is compared
+// as the validated URL rather than the bound one, so a repository whose provider has since been
+// removed still recognises the sync that was running for it.
 func targetMatches(r repoState, t syncTask) bool {
-	return r.canonicalURL == t.CanonicalURL && r.replicaURL == t.ReplicaURL
+	return r.originURL == t.CanonicalURL && r.replicaURL == t.ReplicaURL
 }
 
 // Wait blocks until no sync is in flight or ctx ends, then writes any run state still pending. The

@@ -9,7 +9,7 @@ import (
 // supersededStopWait bounds how long setProviders waits, after cancelling attempts, for their git
 // processes to be gone. Cancelling only signals them; this wait exists to confirm to the operator
 // (and to the tests) that they stopped, and it never holds up the providers already being in force.
-const supersededStopWait = 3 * time.Second
+var supersededStopWait = 3 * time.Second
 
 // setProviders makes next the local provider configuration in force, immediately: from the moment it
 // returns, no new sync or probe is made from the previous one.

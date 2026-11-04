@@ -257,6 +257,9 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	if msg.ConfigVersion == nil {
 		slog.Warn("git_sync_config has no config_version; status will report null until the platform includes one")
 	}
+	if c.beforeConfigInstall != nil {
+		c.beforeConfigInstall()
+	}
 	c.mu.Lock()
 	// Carry a prior result and in-flight marker across a configuration that leaves a repository's
 	// sync target unchanged (the platform re-sends config on every token refresh), so a healthy

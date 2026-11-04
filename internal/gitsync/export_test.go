@@ -104,3 +104,46 @@ func (c *Client) IdleForTest() bool { return c.mgr.idle() }
 func WithRunSaveIntervalForTest(d time.Duration) Option {
 	return func(o *clientOptions) { o.runSaveInterval = d }
 }
+
+// SetProvidersForTest makes next the provider configuration in force, as a reload does.
+func (c *Client) SetProvidersForTest(next *Store) { c.setProviders(next) }
+
+// SetAfterClaimReadForTest installs a function that runs inside the critical section in which a sync
+// claims its task: after the credential has been read, before the attempt is registered. It lets a
+// test hold a sync at the one point where a credential change could otherwise slip past it.
+func (c *Client) SetAfterClaimReadForTest(fn func()) {
+	c.mu.Lock()
+	c.afterClaimRead = fn
+	c.mu.Unlock()
+}
+
+// BindingForTest returns whether repoID is bound to a provider and, if so, the provider name.
+func (c *Client) BindingForTest(repoID string) (provider string, bound, found bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r, ok := c.repos[repoID]
+	return r.provider, r.matched, ok
+}
+
+// AttemptsForTest returns how many sync attempts are registered as running.
+func (c *Client) AttemptsForTest() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.attempts)
+}
+
+// SetSupersededStopWaitForTest bounds how long a provider replacement waits for the syncs it
+// cancelled; it returns a function that restores the previous bound.
+func SetSupersededStopWaitForTest(d time.Duration) func() {
+	prev := supersededStopWait
+	supersededStopWait = d
+	return func() { supersededStopWait = prev }
+}
+
+// SetBeforeConfigInstallForTest installs a function that runs while a configuration has been built
+// but not yet installed, which is where a provider reload could otherwise leave a stale binding.
+func (c *Client) SetBeforeConfigInstallForTest(fn func()) {
+	c.mu.Lock()
+	c.beforeConfigInstall = fn
+	c.mu.Unlock()
+}
