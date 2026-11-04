@@ -1,0 +1,59 @@
+# Container image for the git-sync connector (cmd/mkonnect-gitsync). It is built and released
+# independently of the API connector image defined in ./Dockerfile.
+
+# Stage 1: build
+FROM golang:1.27-alpine AS builder
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X github.com/memento-knowledge/mkonnect/internal/version.Version=${VERSION}" -o /mkonnect-gitsync ./cmd/mkonnect-gitsync
+
+# Stage 2: runtime (Alpine, non-root)
+#
+# Unlike the API connector, git-sync shells out to git, so the runtime needs a real userland
+# rather than a distroless base. The base layer is pinned by digest, so a moved upstream tag
+# cannot change it; the packages installed on top are resolved from Alpine's package index at
+# build time, so the build as a whole is not bit-for-bit reproducible. The tag below
+# (Alpine 3.24) is documentation, the digest is what Docker resolves. Refresh both together as
+# described in RELEASING.md ("Update the git-sync base image").
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+ARG VERSION=dev
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.title="mkonnect-gitsync" \
+      org.opencontainers.image.description="Memento git-sync connector — mirrors customer-internal git repositories to the Memento platform" \
+      org.opencontainers.image.source="https://github.com/memento-knowledge/mkonnect" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.revision="$REVISION"
+
+# git and CA certificates only: no ssh client, git daemon, or perl tooling. The connector uses
+# git's GIT_CONFIG_COUNT credential injection, which needs git >= 2.31. The base image is pinned
+# but the package index is not, so fail the build rather than ship a git that is too old. The
+# package manager is removed afterwards to shrink the attack surface of the running container.
+RUN apk add --no-cache git ca-certificates \
+    && version=$(git --version | sed -n 's/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p') \
+    && set -- $version \
+    && if [ "$#" -ne 2 ] || [ "$1" -lt 2 ] || { [ "$1" -eq 2 ] && [ "$2" -lt 31 ]; }; then \
+         echo "git >= 2.31 is required, found: $(git --version)" >&2; \
+         exit 1; \
+       fi \
+    && apk del --no-cache apk-tools
+
+# Ship /data owned by the non-root runtime user (uid/gid 65532) so a mounted empty named
+# volume inherits writable ownership and the connector can persist its key and config there.
+RUN install -d -m 0700 -o 65532 -g 65532 /data
+
+COPY --from=builder /mkonnect-gitsync /mkonnect-gitsync
+
+ENV KEY_FILE=/data/gitsync-key
+
+USER 65532:65532
+
+ENTRYPOINT ["/mkonnect-gitsync"]

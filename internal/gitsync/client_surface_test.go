@@ -84,7 +84,7 @@ func TestConfigOmittingOneLimitResetsOnlyThatField(t *testing.T) {
 }
 
 // An out-of-range value rejects the whole configuration: the limits, the repositories and the
-// version it would have replaced all stay as they were, and no status reports an acceptance.
+// version it would have replaced all stay as they were, and the status reports config_error.
 func TestOutOfRangeLimitsRejectTheWholeConfig(t *testing.T) {
 	for name, extras := range map[string][]string{
 		"interval below minimum":      {`"schedule":{"interval_seconds":59}`},
@@ -113,9 +113,10 @@ func TestOutOfRangeLimitsRejectTheWholeConfig(t *testing.T) {
 			bad := withExtras(configJSON("2", [3]string{"repo-b", "https://other.example.com/b", ""}), extras...)
 			c.HandleMessage(ctx, s, "git_sync_config", bad)
 
-			if n := len(s.messages()); n != before {
-				t.Errorf("a rejected config sent %d new messages, want none", n-before)
+			if n := len(s.messages()); n != before+1 {
+				t.Fatalf("a rejected config sent %d new messages, want one status", n-before)
 			}
+			wantConfigError(t, lastStatus(t, s.messages()), "2", proto.GitSyncConfigErrLimitsOutOfRange)
 			if got := c.EffectiveLimitsForTest(); got != previous {
 				t.Errorf("effective limits = %+v after a rejected config, want the previous %+v", got, previous)
 			}

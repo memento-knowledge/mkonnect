@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -147,5 +148,64 @@ func TestSetUsageShowsContainerHint(t *testing.T) {
 	_, err := runCLI(t, "", "config", "set")
 	if err == nil || !strings.Contains(err.Error(), "docker exec -i") {
 		t.Errorf("set usage should include the docker exec hint, got %v", err)
+	}
+}
+
+func TestStatusShowsPinnedReplicaHost(t *testing.T) {
+	withConfig(t)
+	t.Setenv(gitsync.ReplicaHostEnv, "Replica.Example.com:9443")
+	out, err := runCLI(t, "", "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, "replica.example.com:9443") || !strings.Contains(out, gitsync.ReplicaHostEnv) {
+		t.Errorf("status does not show the effective pin and its source: %q", out)
+	}
+	if strings.Contains(out, "NOT SET") || strings.Contains(out, "INVALID") {
+		t.Errorf("a valid pin is flagged as a problem: %q", out)
+	}
+}
+
+func TestStatusWarnsLoudlyWhenNoReplicaHostIsPinned(t *testing.T) {
+	withConfig(t)
+	t.Setenv(gitsync.ReplicaHostEnv, "")
+	out, err := runCLI(t, "", "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, "NOT SET - the connector will reject every configuration") {
+		t.Errorf("status must flag the missing pin: %q", out)
+	}
+}
+
+func TestStatusFlagsInvalidReplicaHostWithoutEchoingIt(t *testing.T) {
+	withConfig(t)
+	t.Setenv(gitsync.ReplicaHostEnv, "https://pin-leak-marker.example.com/path")
+	out, err := runCLI(t, "", "status")
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if !strings.Contains(out, "INVALID") || !strings.Contains(out, "reject every configuration") {
+		t.Errorf("status must flag an invalid pin: %q", out)
+	}
+	if strings.Contains(out, "pin-leak-marker") {
+		t.Errorf("status echoed the invalid value: %q", out)
+	}
+}
+
+// The pin is the most important line for an operator, so it prints even when the provider config
+// cannot be loaded.
+func TestStatusShowsPinEvenWhenProviderConfigIsBroken(t *testing.T) {
+	path := withConfig(t)
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(gitsync.ReplicaHostEnv, "replica.example.com")
+	out, err := runCLI(t, "", "status")
+	if err == nil {
+		t.Error("a broken provider config should still be reported as an error")
+	}
+	if !strings.Contains(out, "replica.example.com:443") {
+		t.Errorf("pin line missing when the provider config is broken: %q", out)
 	}
 }

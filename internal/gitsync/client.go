@@ -3,7 +3,9 @@ package gitsync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -76,6 +78,7 @@ type clientOptions struct {
 	mirrorsRoot    string
 	drainTimeout   time.Duration
 	statusInterval time.Duration
+	replicaHost    string // raw pin value; canonicalised by NewClient
 }
 
 // defaultStatusInterval is the minimum spacing between statuses sent because syncs finished. Each
@@ -86,6 +89,14 @@ const defaultStatusInterval = time.Second
 // sent immediately and the last state is always flushed within one interval. The default is one second.
 func WithStatusInterval(d time.Duration) Option {
 	return func(o *clientOptions) { o.statusInterval = d }
+}
+
+// WithReplicaHost pins the one replica host (`host` or `host:port`, https implied) the connector may
+// push to; see ParseReplicaHost for the accepted form. The daemon passes the value of
+// GIT_SYNC_REPLICA_HOST, read once at startup. The default, and the result of an invalid value, is
+// not pinned: the connector then rejects every configuration and never syncs.
+func WithReplicaHost(host string) Option {
+	return func(o *clientOptions) { o.replicaHost = host }
 }
 
 // WithGitRunner replaces how git is executed. The default runs the real git binary in the locked-down
@@ -116,7 +127,18 @@ type Client struct {
 	bootID string
 
 	mgr          *manager
+	sched        *scheduler
 	drainTimeout time.Duration
+
+	// replicaHost is the canonical "host:port" the connector may push to ("" = not pinned, in which
+	// case every configuration is rejected). It is written once in NewClient and never changed, so it
+	// is read without a lock.
+	replicaHost string
+
+	// limits holds the effective schedule and resource limits. It starts as DefaultLimits and is
+	// replaced as a whole by each accepted configuration, which is a full replace: limits it leaves
+	// out revert to their defaults. Read it through effectiveLimits.
+	limits atomic.Pointer[Limits]
 
 	// Completion-triggered statuses are coalesced: see notifyStatus.
 	statusInterval  time.Duration
@@ -138,16 +160,15 @@ type Client struct {
 	probing     atomic.Bool
 	lastProbe   atomic.Int64 // UnixNano of the last probe start
 
-	// limits is the schedule and resource bounds in force: the defaults until a configuration is
-	// accepted, then what that configuration resolved to. Read through effectiveLimits.
-	limits atomic.Pointer[Limits]
-
 	// mu guards the configured set and version, which OnHeartbeat (its own goroutine) and
 	// HandleMessage (the read loop) both reach.
 	mu             sync.Mutex
 	configAccepted bool
 	configVersion  json.RawMessage
-	repos          map[string]repoState // by repo_id
+	// configErr is set while the most recent git_sync_config was rejected as a whole, and cleared when
+	// a later one is accepted. See rejectConfig.
+	configErr *proto.GitSyncConfigError
+	repos     map[string]repoState // by repo_id
 	// connCtx/connSender are the current connection's context and sender, captured in OnConnected.
 	// A probe started from a heartbeat must run under the connection's lifetime, NOT the
 	// per-heartbeat context the gateway cancels as soon as OnHeartbeat returns.
@@ -175,6 +196,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
+	replicaHost := pinReplicaHost(o.replicaHost)
 	c := &Client{
 		cfg:            cfg,
 		local:          local,
@@ -184,6 +206,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		repos:          map[string]repoState{},
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
+		replicaHost:    replicaHost,
 	}
 	defaults := DefaultLimits()
 	c.limits.Store(&defaults)
@@ -192,11 +215,19 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		syncHooks{
 			resolve:   c.resolveTask,
 			begin:     c.beginSync,
-			finish:    c.finishSync,
+			finish:    c.finishAndReschedule,
 			release:   c.releaseSync,
 			suspended: c.criticalPatchRequired.Load,
 			changed:   c.notifyStatus,
 		})
+	c.sched = newScheduler(schedHooks{
+		repos:     c.schedulableTargets,
+		enqueue:   c.mgr.enqueueScheduled,
+		suspended: c.criticalPatchRequired.Load,
+		limits:    c.effectiveLimits,
+		now:       now,
+		rand:      rand.Float64,
+	})
 	c.gw = gateway.NewClient(gateway.Config{
 		GatewayURL:        cfg.GatewayURL,
 		ConnectorID:       cfg.ConnectorID,
@@ -207,12 +238,33 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	return c
 }
 
-// effectiveLimits returns the schedule and resource bounds currently in force. It is safe to call
-// from any goroutine; the value is a snapshot, replaced as a whole when a configuration is accepted.
-func (c *Client) effectiveLimits() Limits { return *c.limits.Load() }
+// pinReplicaHost canonicalises the configured pin and logs the effective state once, loudly when
+// there is none. An unset or invalid pin yields "" (not pinned). The log carries only the canonical
+// pin or a fixed reason, never the raw value.
+func pinReplicaHost(raw string) string {
+	host, err := ParseReplicaHost(raw)
+	switch {
+	case err == nil:
+		slog.Info("replica host pinned", "host", host)
+		return host
+	case errors.Is(err, ErrReplicaHostNotSet):
+		slog.Error(ReplicaHostEnv + " is not set: the connector will reject every configuration and will not sync until a replica host is pinned")
+	default:
+		slog.Error("invalid replica host pin: the connector will reject every configuration and will not sync", "reason", err.Error())
+	}
+	return ""
+}
 
-// Run connects and maintains the connection with backoff until ctx is cancelled.
-func (c *Client) Run(ctx context.Context) { c.gw.Run(ctx) }
+// Run connects and maintains the connection with backoff until ctx is cancelled. It also runs the
+// periodic resync scheduler for as long as it runs, and returns only after that has stopped.
+func (c *Client) Run(ctx context.Context) {
+	stop := c.sched.start(ctx)
+	defer stop()
+	c.gw.Run(ctx)
+}
+
+// effectiveLimits returns the limits in force: the defaults until a configuration supplies others.
+func (c *Client) effectiveLimits() Limits { return *c.limits.Load() }
 
 // Connect performs a single connection attempt.
 func (c *Client) Connect(ctx context.Context) error { return c.gw.Connect(ctx) }
@@ -263,12 +315,17 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 	switch typ {
 	case "git_sync_config":
 		if c.applyConfig(raw) {
+			// The schedule is brought up to date first, so the outcome of the sync started below,
+			// even a failed one, is recorded against it.
+			c.sched.reconcile()
 			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
 			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
 			// before the status is built, so the status already reports them as syncing.
 			c.startSyncs(ctx, c.syncableRepos())
-			c.emitStatus(ctx, s, dispatchStatusTimeout)
 		}
+		// Accepted or rejected, report at once: a rejection is carried as config_error so the
+		// platform learns promptly that the configuration it sent is not in effect.
+		c.emitStatus(ctx, s, dispatchStatusTimeout)
 	case "git_sync_now":
 		var msg proto.GitSyncNowMsg
 		if err := json.Unmarshal(raw, &msg); err != nil {
@@ -306,6 +363,12 @@ func (c *Client) resolveTask(repoID string) (syncTask, bool) {
 	r, ok := c.repos[repoID]
 	c.mu.Unlock()
 	if !ok || !r.matched || r.replicaURL == "" || c.local == nil {
+		return syncTask{}, false
+	}
+	// Second layer of the replica-host pin: applyConfig only retains a URL on the pinned host, but a
+	// sync is the point at which the push token leaves the process, so re-check it here.
+	if _, v := checkReplicaURL(r.replicaURL, c.replicaHost); v != replicaOK {
+		slog.Error("refusing to sync: the replica URL is not on the pinned replica host", "repo_id", repoID)
 		return syncTask{}, false
 	}
 	origin, ok := c.local.Get(r.provider)
@@ -358,6 +421,41 @@ func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
 		r.result = res
 	}
 	c.repos[repoID] = r
+}
+
+// finishAndReschedule records a sync's outcome, then lets the scheduler plan the repository's next
+// run from it.
+func (c *Client) finishAndReschedule(repoID string, t syncTask, res syncResult) {
+	c.finishSync(repoID, t, res)
+	c.sched.completed(repoID, t, res)
+}
+
+// schedulableTargets returns the sync target of every repository the scheduler may start: exactly
+// those resolveTask would accept. It copies no secret.
+func (c *Client) schedulableTargets() map[string]targetKey {
+	type candidate struct {
+		id, provider string
+		key          targetKey
+	}
+	c.mu.Lock()
+	candidates := make([]candidate, 0, len(c.repos))
+	for id, r := range c.repos {
+		if r.matched && r.replicaURL != "" {
+			candidates = append(candidates, candidate{id, r.provider, targetKey{r.canonicalURL, r.replicaURL}})
+		}
+	}
+	c.mu.Unlock()
+
+	out := make(map[string]targetKey, len(candidates))
+	if c.local == nil {
+		return out
+	}
+	for _, cand := range candidates {
+		if _, ok := c.local.Get(cand.provider); ok {
+			out[cand.id] = cand.key
+		}
+	}
+	return out
 }
 
 // targetMatches reports whether t was resolved from r's current sync target.

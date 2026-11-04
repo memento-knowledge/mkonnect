@@ -1,0 +1,46 @@
+{{- if include "mkonnect.gitsync.enabled" . -}}
+{{- $gs := include "mkonnect.gitsync.values" . | fromYaml -}}
+{{- if $gs.networkPolicy.enabled -}}
+{{- $egress := $gs.networkPolicy.egress -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mkonnect.gitsync.fullname" . }}
+  labels:
+    {{- include "mkonnect.gitsync.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mkonnect.gitsync.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $egress.cidrs }}
+    - Egress
+    {{- end }}
+  # No ingress rules: every inbound connection to the git-sync pods is denied. The
+  # connector only dials out.
+  {{- if $egress.cidrs }}
+  egress:
+    - to:
+        {{- range $egress.cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        {{- range $egress.ports | default (list 443) }}
+        - protocol: TCP
+          port: {{ . | int }}
+        {{- end }}
+    # Name resolution, to the cluster DNS namespace only.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $egress.dnsNamespace | default "kube-system" | quote }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+  {{- end }}
+{{- end }}
+{{- end }}
