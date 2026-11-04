@@ -165,9 +165,10 @@ gitSync:
   # repository, and a small run-state file. Fetched objects are written into
   # the mirrors here (and repacked there), so this is where headroom matters:
   # size it at roughly 1.2x the sum of your mirrored repositories, plus growth.
-  # The mirror of a repository the platform stops listing is deleted after
-  # seven days, so leave room for those too (GIT_SYNC_MIRROR_GC=off disables
-  # that cleanup; there is no chart value for it yet).
+  # The mirror of a repository the platform stops listing is deleted once it
+  # has been unlisted for seven days, so leave room for those too
+  # (GIT_SYNC_MIRROR_GC=off disables that cleanup; there is no chart value for
+  # it yet).
   persistence:
     size: 20Gi
     storageClass: ""
