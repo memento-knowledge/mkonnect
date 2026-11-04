@@ -312,6 +312,13 @@ func TestGitSyncConfigErrorWireStringsPinned(t *testing.T) {
 	}
 }
 
+// TestGitSyncWarningWireStringsPinned fails if a warning code drifts; the platform matches on it.
+func TestGitSyncWarningWireStringsPinned(t *testing.T) {
+	if proto.GitSyncWarnLFSNotReplicated != "lfs_not_replicated" {
+		t.Errorf("warning wire string drifted: %q", proto.GitSyncWarnLFSNotReplicated)
+	}
+}
+
 func TestGitSyncNowMsgGolden(t *testing.T) {
 	msg := proto.GitSyncNowMsg{Type: "git_sync_now", RepoID: "repo-a"}
 	if got := marshalToObject(t, msg); !reflect.DeepEqual(got, readGoldenObject(t, "git_sync_now.json")) {

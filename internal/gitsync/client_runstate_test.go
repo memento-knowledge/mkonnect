@@ -48,7 +48,7 @@ func newStatsGit(clock *testClock) *statsGit {
 func subCmd(argv []string) string {
 	for _, a := range argv {
 		switch a {
-		case "init", "fetch", "push", "show-ref", "for-each-ref", "ls-remote":
+		case "init", "fetch", "push", "show-ref", "for-each-ref", "ls-remote", "ls-tree", "cat-file":
 			return a
 		}
 	}

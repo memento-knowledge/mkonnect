@@ -59,7 +59,10 @@ type syncResult struct {
 	ErrorType   string
 	ErrorDetail string
 	Warnings    []string
-	Stats       syncStats
+	// WarningsUndecided says this attempt could not determine its warnings (see detectLFS), so
+	// finishSync keeps the previous attempt's rather than reporting none.
+	WarningsUndecided bool
+	Stats             syncStats
 }
 
 // syncStats is what one attempt measured. StartedAt and Duration are stamped by whoever runs the
@@ -204,7 +207,11 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 		return res
 	}
 	d.learnDefaultBranch(ctx, home, t, stats)
-	return syncResult{State: StateOK}
+	// Only a healthy sync carries the warning; it is recomputed from this sync's mirror, so it clears
+	// itself once the repository stops using LFS. A sync that could not tell says so, and keeps what
+	// the previous one reported.
+	warnings, decided := d.detectLFS(ctx, home, t, stats.DefaultBranch)
+	return syncResult{State: StateOK, Warnings: warnings, WarningsUndecided: !decided}
 }
 
 // errOriginEmpty is the detail reported when the origin has no branches or tags to replicate. The

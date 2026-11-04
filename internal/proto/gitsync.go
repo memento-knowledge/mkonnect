@@ -206,6 +206,17 @@ const (
 // stopped syncing until it is upgraded. INFERRED.
 const GitSyncSuspendedCriticalUpdate = "critical_update_required"
 
+// Wire values for GitSyncRepoStatus.Warnings: non-fatal codes a repository in state "ok" can carry.
+// They are pinned by a test and defined only here.
+const (
+	// GitSyncWarnLFSNotReplicated: the repository appears to use Git LFS, whose objects the connector
+	// does not replicate (it mirrors and pushes branches and tags only, so pointer files arrive but the
+	// large objects they name do not). It is a heuristic: the connector looks for the LFS filter in
+	// the root .gitattributes at the tip of the origin's default branch, so it can miss LFS used only
+	// elsewhere and can flag a repository that has the rule but no pointer files.
+	GitSyncWarnLFSNotReplicated = "lfs_not_replicated"
+)
+
 // GitSyncConfigError describes a whole-configuration rejection. INFERRED.
 type GitSyncConfigError struct {
 	// ConfigVersion is the version of the rejected configuration, echoed opaquely (any JSON scalar);
@@ -262,7 +273,10 @@ type GitSyncRepoStatus struct {
 	// ErrorDetail is a short, sanitised detail (never a URL, host, or path). It carries the raw
 	// detail for the "unclassified" error type; omitted when there is no error.
 	ErrorDetail string `json:"error_detail,omitempty"`
-	// Warnings are non-fatal codes (for example "lfs_not_replicated") a healthy repository can carry.
+	// Warnings are non-fatal GitSyncWarn* codes (for example "lfs_not_replicated") a healthy
+	// repository can carry. They are recomputed by every sync, so a warning disappears from the status
+	// of the first sync that no longer finds its cause; one is also carried while a re-sync of a healthy
+	// repository is in flight, and absent while the repository is pending or in error.
 	Warnings []string `json:"warnings,omitempty"`
 }
 
