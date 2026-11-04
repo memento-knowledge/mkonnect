@@ -131,7 +131,7 @@ func TestRunStateUnusableFilesLoadAsEmpty(t *testing.T) {
 		{"garbage", "this is not json", "corrupt"},
 		{"truncated", good[:len(good)/2], "corrupt"},
 		{"trailing garbage", good + "x", "corrupt"},
-		{"empty file", "", "corrupt"},
+		{"empty file", "", "empty"},
 		{"not an object", "[1,2,3]", "corrupt"},
 		{"future version", `{"version":2,"repositories":{}}`, "unsupported_version"},
 		{"no version", `{"repositories":{}}`, "unsupported_version"},

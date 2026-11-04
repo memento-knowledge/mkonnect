@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "run_state": {
+    "status": "ok",
+    "dropped": 1,
+    "repositories": [
+      {
+        "repo_id": "repo-good",
+        "last_attempt_at": "2030-01-15T11:59:00Z",
+        "last_success_at": null,
+        "duration_ms": null,
+        "refs_pushed": null,
+        "newest_origin_commit_at": null,
+        "origin_default_branch": "main"
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+=== Replica host pin ===
+  GIT_SYNC_REPLICA_HOST=replica.example.net:443 (from this process's environment)
+  The connector pushes only to this host and rejects any configuration naming another.
+
+=== Configured git-sync providers ===
+  (none)
+
+=== Repository sync state ===
+  No finished attempt recorded in the directory this command resolved. If the connector has run, check that GIT_SYNC_MIRRORS_DIR (or GIT_SYNC_CONFIG_FILE) matches its environment.
+
+Enrollment status and failure reasons are visible in the Memento portal.

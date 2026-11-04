@@ -1,0 +1,23 @@
+=== Replica host pin ===
+  GIT_SYNC_REPLICA_HOST=replica.example.net:443 (from this process's environment)
+  The connector pushes only to this host and rejects any configuration naming another.
+
+=== Configured git-sync providers ===
+  (none)
+
+=== Repository sync state ===
+  REPOSITORY   LAST ATTEMPT   LAST SUCCESS  DURATION  REFS PUSHED  NEWEST ORIGIN COMMIT  ORIGIN DEFAULT BRANCH
+  repo-47h     47h ago        never         -         -            -                     -
+  repo-48h     2d ago         never         -         -            -                     -
+  repo-days    14d ago        never         -         -            -                     -
+  repo-future  in the future  never         -         -            -                     -
+  repo-hours   5h ago         never         -         -            -                     -
+  repo-now     just now       never         -         -            -                     -
+  repo-secs    45s ago        never         -         -            -                     -
+
+  As last recorded by the connector after each finished attempt: it can lag by a few seconds, omits
+  attempts in progress and repositories not yet attempted, and may list repositories no longer
+  configured. LAST SUCCESS is kept across failed attempts, so a LAST ATTEMPT later than it means the
+  latest attempt did not succeed (use --absolute to compare; times are whole seconds).
+
+Enrollment status and failure reasons are visible in the Memento portal.
