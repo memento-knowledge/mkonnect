@@ -290,10 +290,11 @@ func TestGitSyncConfigErrorWireStringsPinned(t *testing.T) {
 		proto.GitSyncConfigErrTooManyRepositories, proto.GitSyncConfigErrInvalidRepoID,
 		proto.GitSyncConfigErrDuplicateRepoID, proto.GitSyncConfigErrInvalidConfigVersion,
 		proto.GitSyncConfigErrLimitsOutOfRange, proto.GitSyncConfigErrMalformedMessage,
+		proto.GitSyncConfigErrReplicaHostMismatch, proto.GitSyncConfigErrReplicaHostNotPinned,
 	}
 	want := []string{
 		"too_many_repositories", "invalid_repo_id", "duplicate_repo_id", "invalid_config_version",
-		"limits_out_of_range", "malformed_message",
+		"limits_out_of_range", "malformed_message", "replica_host_mismatch", "replica_host_not_pinned",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("config_error reason wire strings drifted:\n got %v\nwant %v", got, want)

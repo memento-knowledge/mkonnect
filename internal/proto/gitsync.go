@@ -179,6 +179,13 @@ const (
 	// GitSyncConfigErrMalformedMessage: the message could not be decoded, or a required field was
 	// missing or of the wrong type.
 	GitSyncConfigErrMalformedMessage = "malformed_message"
+	// GitSyncConfigErrReplicaHostMismatch: a replica_push_url named a host other than the replica host
+	// pinned at install (GIT_SYNC_REPLICA_HOST). The connector pushes only to the pinned host.
+	GitSyncConfigErrReplicaHostMismatch = "replica_host_mismatch"
+	// GitSyncConfigErrReplicaHostNotPinned: no replica host is pinned at install (GIT_SYNC_REPLICA_HOST
+	// is absent or empty), so the connector fails closed: it rejects every configuration and never
+	// pushes. Distinct from a mismatch so an operator can tell an incomplete install from a bad URL.
+	GitSyncConfigErrReplicaHostNotPinned = "replica_host_not_pinned"
 )
 
 // GitSyncSuspendedCriticalUpdate is the GitSyncStatusMsg.Suspended value meaning the connector has
