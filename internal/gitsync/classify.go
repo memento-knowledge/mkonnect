@@ -52,9 +52,16 @@ var (
 	}
 	diskMarkers   = []string{"no space left on device", "disk quota exceeded"}
 	memoryMarkers = []string{"out of memory", "cannot allocate memory", "std::bad_alloc"}
-	// overLimitMarkers are the replica refusing the push because the repository is too big.
-	overLimitMarkers = []string{"size limit", "maximum allowed size", "too large", "quota"}
-	rejectedMarkers  = []string{"remote rejected", "hook declined", "pre-receive hook", "unpacker error"}
+	// replicaQuotaMarkers are the replica refusing the push over a size or quota limit. That is the
+	// replica's own limit, so it is replica_rejected: the fix is to raise the replica's quota, not
+	// the connector's repository ceiling (ErrRepositoryOverLimit).
+	replicaQuotaMarkers = []string{"size limit", "maximum allowed size", "too large", "quota"}
+	rejectedMarkers     = []string{"remote rejected", "hook declined", "pre-receive hook", "unpacker error"}
+
+	// childKilledRE matches git reporting that one of its child processes (index-pack, pack-objects,
+	// git-remote-https) was SIGKILLed: "error: index-pack died of signal 9". With no deadline that is
+	// the kernel's OOM killer. Only signal 9, and only as a whole number ("signal 90" is not it).
+	childKilledRE = regexp.MustCompile(`\bdied of signal 9\b`)
 )
 
 func containsAny(s string, markers []string) bool {
@@ -77,6 +84,10 @@ func containsAny(s string, markers []string) bool {
 // An HTTP 407 (proxy authentication) is not the customer's credential being rejected, so it is
 // origin_unreachable. A deadline is attributed by side: a push that outlives its deadline is
 // push_timeout, a clone or fetch that does is origin_unreachable.
+//
+// A replica refusal over size or quota (HTTP 413, "size limit", "quota", ...) is replica_rejected,
+// whether it arrives as a status or as the reason in a rejected-ref line. repository_over_limit is
+// never produced here: it is reserved for the connector's own repository-size ceiling.
 func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired bool) (errorType, detail string) {
 	if err == nil {
 		return "", ""
@@ -96,8 +107,10 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	if containsAny(local, diskMarkers) {
 		return ErrLocalDiskExhausted, ""
 	}
-	// SIGKILL with no deadline is the kernel's OOM killer (a deadline kill returned above).
-	if containsAny(local, memoryMarkers) || strings.Contains(err.Error(), "signal: killed") {
+	// SIGKILL with no deadline is the kernel's OOM killer (a deadline kill returned above). That is
+	// either git itself ("signal: killed") or one of its children, which git reports on a local line.
+	if containsAny(local, memoryMarkers) || childKilledRE.MatchString(local) ||
+		strings.Contains(err.Error(), "signal: killed") {
 		return ErrJobOutOfMemory, ""
 	}
 
@@ -121,8 +134,8 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	}
 
 	switch {
-	case status == "413", containsAny(s, overLimitMarkers):
-		return ErrRepositoryOverLimit, ""
+	case status == "413", containsAny(s, replicaQuotaMarkers):
+		return ErrReplicaRejected, ""
 	case authFailed:
 		if tokenExpired {
 			return ErrPushTokenExpired, ""
