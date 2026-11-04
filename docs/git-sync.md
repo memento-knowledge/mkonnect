@@ -181,9 +181,24 @@ connector's resources. The commands below add git-sync to an existing release cr
 API connector's `--set` options from that guide.
 
 `--reset-then-reuse-values` (Helm 3.14+) takes the new chart's defaults and then re-applies the
-values you set on earlier installs and upgrades. Plain `--reuse-values` on Helm 3 would drop the
-chart's defaults for new settings, so use `--reset-then-reuse-values` for every upgrade of a
-release that has git-sync enabled.
+values you set on earlier installs and upgrades. The connector guide uses `--reuse-values`, which
+is fine for the connector alone. For a release that has git-sync, use
+`--reset-then-reuse-values` for every upgrade instead: on Helm 3, `--reuse-values` replaces the
+chart's defaults with the previous release's values, so settings added by a newer chart (such as
+the defaults for git-sync) would be missing.
+
+> **Warning: always keep the git-sync values on an upgrade.** `helm upgrade` without
+> `--reset-then-reuse-values` or a `-f` values file that repeats your `gitSync.*` settings resets
+> `gitSync.enabled` to `false`. Helm then **deletes the git-sync Deployment and its
+> `PersistentVolumeClaim`, which holds the connector's private key and all mirrors**, and the
+> connector would have to be registered again with a new one-time token. The chart deliberately
+> does not mark the claim to be kept, so that uninstalling really removes the key and the
+> mirrors.
+
+Quote values that look like numbers (for example `tag: "20261022.0"` or
+`sizeLimit: "21474836480"`) in values files: an unquoted number is read as a floating-point number
+and can come out in exponent form, and Helm also stores `--set` integers as floats in the release
+history.
 
 Create the registration token as a Secret from an owner-only file. Run this snippet from Bash or
 Zsh:
@@ -248,6 +263,10 @@ What the chart sets up:
 
 See [`charts/mkonnect/values.yaml`](../charts/mkonnect/values.yaml) for every option.
 
+To remove a default rather than change it, such as the CPU limit, set it to `null`
+(`--set gitSync.resources.limits.cpu=null`): Helm drops the key before the chart renders. Setting it
+to an empty value does not remove it.
+
 The pod runs as uid/gid `65532` with a read-only root filesystem, no capabilities, no privilege
 escalation, the runtime-default seccomp profile, and no mounted ServiceAccount token. It exposes
 no port and there is no Service. The Deployment has one replica and uses the `Recreate` strategy,
@@ -276,19 +295,22 @@ the connector's own connection to the gateway.
 
 ### Using an HTTP proxy
 
-git-sync reads the standard `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` variables in two places:
+git-sync reads the standard proxy variables in two places:
 
-- **git** (every fetch, push, and reachability check). git-sync passes these three variables, and
-  nothing else from its environment, on to git.
-- **the connection to the gateway**, which uses Go's default HTTP transport and so honours the same
-  variables for its `wss://` connection.
+- **git** (every fetch, push, and reachability check). git-sync passes `HTTPS_PROXY`,
+  `HTTP_PROXY`, `NO_PROXY` and their lower-case forms, and nothing else from its environment, on to
+  git. git's HTTP library reads **only the lower-case `http_proxy`** for plain `http://` URLs and
+  ignores upper-case `HTTP_PROXY` on purpose, so set both cases.
+- **the connection to the gateway**, which uses Go's default HTTP transport. It reads
+  `HTTPS_PROXY` (or `https_proxy`) for its `wss://` connection, and `NO_PROXY` (or `no_proxy`).
 
-With Docker, add them to `gitsync.env`. With Helm, set `gitSync.proxy.https`, `gitSync.proxy.http`,
-and `gitSync.proxy.noProxy`; they are exported with the standard names. Do not put credentials in a
-proxy URL: values are visible in the Deployment specification. The proxy must allow `CONNECT`
-tunnelling to the gateway, the replica, and your git servers, and must pass the gateway's
-WebSocket upgrade. Add your cluster's internal addresses to `NO_PROXY` if git servers are
-reached directly.
+With Docker, add both cases of each variable to `gitsync.env`. With Helm, set
+`gitSync.proxy.https`, `gitSync.proxy.http`, and `gitSync.proxy.noProxy`; the chart exports each
+one in both upper and lower case. Do not put credentials in a proxy URL: values are visible in the
+Deployment specification. The proxy must allow `CONNECT` tunnelling to the gateway, the replica,
+and your git servers, and must pass the gateway's WebSocket upgrade. Add your cluster's internal
+addresses to `NO_PROXY` if git servers are reached directly. This is based on reading the code and
+the behaviour of git and Go; it has not been tested through every kind of proxy.
 
 ## Configure your git server credential
 
@@ -472,6 +494,11 @@ helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
 Without a pinned digest, the image tag follows the chart's `appVersion`, so the upgrade fails to
 pull if that release has no git-sync image. If you pinned `gitSync.image.tag`, update that instead.
 
+> **Warning:** keep `--reset-then-reuse-values` (or repeat all your `gitSync.*` values with `-f`)
+> on every upgrade. A plain `helm upgrade` resets `gitSync.enabled` to `false`, which deletes the
+> git-sync Deployment **and its volume with the private key and all mirrors**; you would then have
+> to register the connector again with a new token. See [Uninstalling](#uninstalling).
+
 The key, provider configuration, and mirrors are on the volume, so the connector reconnects with
 its existing key and syncs incrementally. A sync that is running when the container stops is
 cancelled and starts again afterwards. If the platform reports that a critical security update is
@@ -493,8 +520,14 @@ helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
   --version <chart-version> --reset-then-reuse-values --set gitSync.enabled=false
 ```
 
-This removes the git-sync Deployment, ServiceAccount, NetworkPolicy, and `PersistentVolumeClaim`
-(`mkonnect-gitsync-data`), and leaves the API connector untouched. Your storage class's reclaim
+> **Warning: this deletes the git-sync data.** Disabling git-sync (and a plain `helm upgrade` that
+> drops the `gitSync.*` values) removes the Deployment, ServiceAccount, NetworkPolicy, and the
+> `PersistentVolumeClaim` (`mkonnect-gitsync-data`) with the private key and every mirror. The
+> connector would need to be registered again with a new token to come back. The same happens with
+> `helm uninstall`. The chart does not keep the claim, so removing git-sync never leaves a
+> forgotten copy of your source code behind.
+
+This leaves the API connector untouched. Your storage class's reclaim
 policy decides whether the underlying disk is deleted; check with `kubectl get pv`. Secrets you
 created yourself (the registration token, provider config, and CA bundle) are not removed;
 delete them too. Deleting the volume deletes the private key and every mirror, which hold a full
@@ -528,8 +561,8 @@ your own logs and network for those.
 | `local_disk_exhausted` | The data volume or the `/tmp` scratch space is full. The mirrors are on the data volume: grow `gitSync.persistence.size` (or the Docker volume's backing disk). For `/tmp`, raise `gitSync.tmp.sizeLimit`. See [Sizing](#sizing). |
 | `job_out_of_memory` | git was killed for lack of memory. Raise the memory limit (`gitSync.resources.limits.memory`, or `--memory` with Docker). |
 | `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
-| The portal says the configuration was rejected, with reason `replica_host_not_pinned` | `GIT_SYNC_REPLICA_HOST` is missing, empty, or not a valid `host` or `host:port` (the chart requires `gitSync.config.replicaHost`). git-sync then rejects every configuration and never pushes, though it stays connected. `connector status` shows what the process sees; the log line says why. Fix the value and restart. |
-| The portal says the configuration was rejected, with reason `replica_host_mismatch` | A repository's replica URL names a host or port other than the one you pinned (the match is exact, and the URL must be `https`). Re-copy the replica host and port from your instructions, including a non-default port as `host:port`. If the value is correct, contact Memento. git-sync never pushes to any other host; the previous configuration stays in effect. |
+| The connector reports `config_error` with reason `replica_host_not_pinned` (how the portal shows it is up to the platform; reason values may be refined in later releases) | `GIT_SYNC_REPLICA_HOST` is missing, empty, or not a valid `host` or `host:port` (the chart requires `gitSync.config.replicaHost`). git-sync then rejects every configuration and never pushes, though it stays connected. `connector status` shows what the process sees; the log line says why. Fix the value and restart. |
+| The connector reports `config_error` with reason `replica_host_mismatch` | A repository's replica URL names a host or port other than the one you pinned (the match is exact, and the URL must be `https`). Re-copy the replica host and port from your instructions, including a non-default port as `host:port`. If the value is correct, contact Memento. git-sync never pushes to any other host; the previous configuration stays in effect. |
 | Repositories stay `pending`, and the log says a critical security update is required | The platform requires an upgrade before syncing continues. Upgrade to the latest release. |
 | A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time). Watch `kubectl logs` / `docker logs` for the outcome. |
 | Container exits at start with `configuration error: GATEWAY_URL …` or `CONNECTOR_ID is required` | `GATEWAY_URL` must be an absolute `wss://` URL, and `CONNECTOR_ID` must be set. |
@@ -537,10 +570,27 @@ your own logs and network for those.
 | Start fails with `local config load failed` | The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file readable by others. The message names the cause; it never includes a credential. |
 | Start fails with `temp directory … is not writable` | `/tmp` is not writable by uid 65532. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
-| After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode (typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount; the chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this). Check the mode, then restore `0600` with the pod stopped: `kubectl scale deployment/mkonnect-gitsync --replicas=0`, then run a one-off pod that mounts the `mkonnect-gitsync-data` claim and runs `ls -ln /data/gitsync-key` and `chmod 600 /data/gitsync-key` as user 65532 (for example with `kubectl run` and `--overrides`, using the git-sync image with `sh` as the command), then scale back to `1`. The key itself is unchanged, so no re-registration is needed. |
+| After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |
 | A credential change did not take effect | The provider configuration is read at startup. Restart git-sync; see [Configure your git server credential](#configure-your-git-server-credential). |
 | `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret and restart, or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
 | Log warns that syncing needs git 2.31 or newer | The image does not contain a usable git. Use an official image for your release ID. |
+
+### Restoring the key file mode
+
+Run the one-off pod below with git-sync stopped (the volume can be mounted by one pod at a time).
+Adjust the namespace and the claim name (`<release>-gitsync-data`), and use the same image as the
+Deployment:
+
+```bash
+kubectl -n <namespace> scale deployment/mkonnect-gitsync --replicas=0
+kubectl -n <namespace> run gitsync-fixperms --rm -i --restart=Never \
+  --image=public.ecr.aws/h2a8k0r3/memento-gitsync:<release-id> \
+  --overrides='{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532},"containers":[{"name":"gitsync-fixperms","image":"public.ecr.aws/h2a8k0r3/memento-gitsync:<release-id>","command":["sh","-c","ls -ln /data/gitsync-key && chmod 600 /data/gitsync-key && ls -ln /data/gitsync-key"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"mkonnect-gitsync-data"}}]}}'
+kubectl -n <namespace> scale deployment/mkonnect-gitsync --replicas=1
+```
+
+The first `ls` shows the current mode and the second confirms `-rw-------`. This pod sets no
+`fsGroup`, so nothing re-applies group permissions while it runs.
 
 For connection problems with the gateway itself (repeating `gateway connection failed` warnings,
 registration errors), the causes and fixes are the same as for the API connector; see the

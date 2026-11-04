@@ -38,12 +38,14 @@ connector refuses to push to any host other than the pinned replica host and onl
 credential against git servers that you configured (see
 [How the credentials are kept to their destination](#how-the-credentials-are-kept-to-their-destination)).
 
-If your environment requires an HTTP proxy, set `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` in the
-container environment (the chart's `gitSync.proxy.*` values). git-sync passes exactly these
-variables on to git for its fetches and pushes, and the connection to the gateway uses Go's
-default HTTP transport, which reads the same variables. A proxy that tunnels with `CONNECT` sees
-the destination host names but not the TLS-protected content. The gateway connection through a
-proxy depends on the proxy allowing WebSocket upgrades; it is not specifically tested here.
+If your environment requires an HTTP proxy, set `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`, and
+their lower-case forms, in the container environment (the chart's `gitSync.proxy.*` values set
+both cases). git-sync passes exactly these six variables on to git for its fetches and pushes; git's
+HTTP library reads only the lower-case `http_proxy` for `http://` URLs. The connection to the
+gateway uses Go's default HTTP transport, which reads `HTTPS_PROXY` / `https_proxy` and `NO_PROXY` /
+`no_proxy` for its `wss://` connection. A proxy that tunnels with `CONNECT` sees the destination
+host names but not the TLS-protected content. The gateway connection through a proxy depends on
+the proxy allowing WebSocket upgrades; it has not been tested through a proxy here.
 
 ## Data flow
 
@@ -165,7 +167,9 @@ unprivileged user the process itself runs as.
 
 The Helm chart and the Docker instructions apply the following:
 
-- Runs as a non-root user (uid and gid `65532`); the data volume is owned by that user.
+- Runs as a non-root user (uid and gid `65532`). With Docker the image ships `/data` owned by that
+  user. On Kubernetes the data volume's root is group-owned by `65532` through the pod's `fsGroup`
+  (the volume itself is provisioned by your storage class).
 - **Read-only root filesystem.** The writable paths this configuration provides are the data
   volume (`/data`) and the scratch volume (`/tmp`); the scratch volume is disk-backed, not memory.
   The container runtime also provides a small in-memory `/dev/shm`, which these settings do not

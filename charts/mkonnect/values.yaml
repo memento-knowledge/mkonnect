@@ -74,6 +74,12 @@ serviceAccount:
 # gitSync.enabled is true, and enabling it leaves the connector resources above
 # unchanged. See docs/git-sync.md and docs/git-sync-security.md.
 #
+# Always quote values that look like numbers in a values file, for example
+# tag: "20261022.0" or sizeLimit: "21474836480". An unquoted YAML number is read as
+# a floating-point number and can be printed in exponent form (2.0261022e+07), and
+# Helm also keeps `--set` integers as floats in the release history. A quoted
+# string is never reformatted.
+#
 # Maintainers: the templates also carry these defaults (templates/_gitsync.tpl,
 # "mkonnect.gitsync.defaults") so they render under `helm upgrade --reuse-values`
 # on Helm 3, which does not apply a new chart's defaults. Change both together;
@@ -170,6 +176,10 @@ gitSync:
   tmp:
     sizeLimit: 5Gi
 
+  # To remove a default, such as the CPU limit, set it to null:
+  #   --set gitSync.resources.limits.cpu=null
+  # (Helm drops the key before rendering). Setting it to an empty value does not
+  # remove it.
   resources:
     requests:
       cpu: 250m
@@ -178,10 +188,13 @@ gitSync:
       cpu: "1"
       memory: 2Gi
 
-  # Optional outbound proxy, exported as HTTPS_PROXY / HTTP_PROXY / NO_PROXY. Both
-  # git (fetch and push) and the connector's gateway connection (Go's default HTTP
-  # transport) read these standard variables. Do not embed credentials in a proxy
-  # URL here: values are visible in the Deployment spec.
+  # Optional outbound proxy. Each value is exported in upper and lower case
+  # (HTTPS_PROXY and https_proxy, HTTP_PROXY and http_proxy, NO_PROXY and no_proxy)
+  # because git's HTTP library reads only the lower-case http_proxy, while Go reads
+  # either. git-sync passes exactly these variables to git (fetch and push), and the
+  # connector's own gateway connection (Go's default HTTP transport) reads them too.
+  # Do not embed credentials in a proxy URL here: values are visible in the
+  # Deployment spec.
   proxy:
     https: ""                 # e.g. http://proxy.example.com:3128
     http: ""

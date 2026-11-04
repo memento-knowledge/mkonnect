@@ -90,16 +90,23 @@ spec:
             - name: GIT_SSL_CAINFO
               value: {{ printf "%s/%s" ($gs.caBundle.mountPath | clean) $gs.caBundle.key | quote }}
             {{- end }}
+            {{- /* Both cases are exported: libcurl (git) reads only lower-case http_proxy, Go reads either. */}}
             {{- if $gs.proxy.https }}
             - name: HTTPS_PROXY
+              value: {{ $gs.proxy.https | quote }}
+            - name: https_proxy
               value: {{ $gs.proxy.https | quote }}
             {{- end }}
             {{- if $gs.proxy.http }}
             - name: HTTP_PROXY
               value: {{ $gs.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ $gs.proxy.http | quote }}
             {{- end }}
             {{- if $gs.proxy.noProxy }}
             - name: NO_PROXY
+              value: {{ $gs.proxy.noProxy | quote }}
+            - name: no_proxy
               value: {{ $gs.proxy.noProxy | quote }}
             {{- end }}
           volumeMounts:

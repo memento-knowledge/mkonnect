@@ -79,8 +79,17 @@ The effective git-sync settings as YAML: the user's values over the defaults. Us
 {{- $enabled := dig "enabled" false $user -}}
 {{- $npEnabled := dig "networkPolicy" "enabled" true $user -}}
 {{- $saCreate := dig "serviceAccount" "create" true $user -}}
+{{- /*
+  When the user's values have a resources map, use it exactly as given. Helm has already
+  combined it with values.yaml (and applied `null` to remove a default such as the CPU limit),
+  and merging the built-in defaults back in would undo that removal. The defaults only fill in
+  a resources map that is missing altogether.
+*/ -}}
+{{- $keepResources := and (hasKey $user "resources") (kindIs "map" (get $user "resources")) -}}
+{{- $userResources := deepCopy (get $user "resources") -}}
 {{- $merged := merge $user (fromYaml (include "mkonnect.gitsync.defaults" .)) -}}
 {{- $_ := set $merged "enabled" $enabled -}}
+{{- if $keepResources -}}{{- $_ = set $merged "resources" $userResources -}}{{- end -}}
 {{- $_ = set (get $merged "networkPolicy") "enabled" $npEnabled -}}
 {{- $_ = set (get $merged "serviceAccount") "create" $saCreate -}}
 {{- /*
@@ -92,6 +101,8 @@ The effective git-sync settings as YAML: the user's values over the defaults. Us
 {{- $section := get $merged (first $p) -}}
 {{- $_ = set $section (last $p) (toString (get $section (last $p))) -}}
 {{- end -}}
+{{- $egress := get (get $merged "networkPolicy") "egress" -}}
+{{- $_ = set $egress "dnsNamespace" (toString (get $egress "dnsNamespace")) -}}
 {{- $tokenSecret := get (get $merged "config") "registrationTokenSecret" -}}
 {{- $_ = set $tokenSecret "name" (toString (get $tokenSecret "name")) -}}
 {{- $_ = set $tokenSecret "key" (toString (get $tokenSecret "key")) -}}
@@ -153,36 +164,83 @@ Takes a list of two paths.
 {{- end }}
 
 {{/*
-"true" when the argument is an acceptable replica host: a host name, IPv4 address or bracketed IPv6
-address, optionally followed by :port (1-65535), with no scheme, path, userinfo or whitespace. This
-follows the syntax the connector accepts for GIT_SYNC_REPLICA_HOST: host names are ASCII letters,
-digits, hyphen and underscore in labels of at most 63 characters, with a numeric final label rejected
-(it would be read as an address). The connector applies the authoritative check at startup.
+"true" when the argument is a valid IPv6 address (the text between the brackets), including the "::"
+compression and an embedded IPv4 tail. Takes the address without brackets.
+*/}}
+{{- define "mkonnect.gitsync.validIPv6" -}}
+{{- $s := . | toString -}}
+{{- $ok := false -}}
+{{- $v4ok := true -}}
+{{- if and (regexMatch "^[0-9A-Fa-f:.]+$" $s) (contains ":" $s) (not (contains ":::" $s)) -}}
+{{- if contains "." $s -}}
+{{- $tail := last (splitList ":" $s) -}}
+{{- if regexMatch "^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$" $tail -}}
+{{- /* the IPv4 tail stands for two groups */ -}}
+{{- $s = printf "%s0:0" (trimSuffix $tail $s) -}}
+{{- else -}}
+{{- $v4ok = false -}}
+{{- end -}}
+{{- end -}}
+{{- if $v4ok -}}
+{{- $parts := splitList "::" $s -}}
+{{- if eq (len $parts) 1 -}}
+{{- if regexMatch "^([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}$" $s -}}{{- $ok = true -}}{{- end -}}
+{{- else if eq (len $parts) 2 -}}
+{{- $n := 0 -}}
+{{- $good := true -}}
+{{- range $side := $parts -}}
+{{- if ne $side "" -}}
+{{- range $g := splitList ":" $side -}}
+{{- if regexMatch "^[0-9A-Fa-f]{1,4}$" $g -}}{{- $n = add1 $n -}}{{- else -}}{{- $good = false -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $good (le $n 7) -}}{{- $ok = true -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $ok -}}true{{- end -}}
+{{- end }}
+
+{{/*
+"true" when the argument is an acceptable replica host: a host name or IPv4 address, or a bracketed
+IPv6 address, optionally followed by :port. It is written to accept what the connector's own check
+of GIT_SYNC_REPLICA_HOST accepts, so that a bad value fails at render time rather than at startup:
+ASCII only, no scheme, path, userinfo, query or empty port; labels of letters, digits, hyphen and
+underscore up to 63 characters, none starting or ending with a hyphen, one trailing dot allowed, and
+no numeric final label (which would be read as an address); a port that is a number from 1 to 65535
+(leading zeros allowed). The connector's check at startup remains the authoritative one.
 */}}
 {{- define "mkonnect.gitsync.validReplicaHost" -}}
 {{- $h := . | toString -}}
 {{- $ok := false -}}
 {{- $host := "" -}}
 {{- $port := "" -}}
-{{- if and (le (len $h) 262) (regexMatch "^[!-~]+$" $h) (not (contains "://" $h)) -}}
+{{- $hasPort := false -}}
+{{- if and (le (len $h) 262) (regexMatch "^[!-~]+$" $h) -}}
 {{- if hasPrefix "[" $h -}}
-{{- if regexMatch "^\\[[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\\](:[0-9]+)?$" $h -}}
+{{- if regexMatch "^\\[[^\\]]*\\](:[0-9]*)?$" $h -}}
 {{- $host = regexFind "^\\[[^\\]]*\\]" $h -}}
-{{- $port = trimPrefix ":" (trimPrefix $host $h) -}}
-{{- $ok = true -}}
+{{- $rest := trimPrefix $host $h -}}
+{{- if include "mkonnect.gitsync.validIPv6" (trimSuffix "]" (trimPrefix "[" $host)) -}}{{- $ok = true -}}{{- end -}}
+{{- if ne $rest "" -}}{{- $hasPort = true -}}{{- $port = trimPrefix ":" $rest -}}{{- end -}}
 {{- end -}}
 {{- else if le (len (splitList ":" $h)) 2 -}}
 {{- $host = first (splitList ":" $h) -}}
-{{- $port = ternary (last (splitList ":" $h)) "" (eq (len (splitList ":" $h)) 2) -}}
+{{- if eq (len (splitList ":" $h)) 2 -}}{{- $hasPort = true -}}{{- $port = last (splitList ":" $h) -}}{{- end -}}
 {{- $name := trimSuffix "." $host -}}
 {{- if regexMatch "^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$" $name -}}
 {{- $ok = true -}}
 {{- else if and (ne $name "") (regexMatch "^[A-Za-z0-9_-]{1,63}(\\.[A-Za-z0-9_-]{1,63})*$" $name) (not (regexMatch "^([0-9]+|0[xX][0-9a-fA-F]*)$" (last (splitList "." $name)))) -}}
-{{- $ok = true -}}
+{{- $hyphen := false -}}
+{{- range $label := splitList "." $name -}}
+{{- if or (hasPrefix "-" $label) (hasSuffix "-" $label) -}}{{- $hyphen = true -}}{{- end -}}
+{{- end -}}
+{{- if not $hyphen -}}{{- $ok = true -}}{{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if and $ok (contains ":" (trimPrefix $host $h)) -}}
-{{- if not (regexMatch "^[0-9]{1,5}$" $port) -}}
+{{- if and $ok $hasPort -}}
+{{- if not (regexMatch "^[0-9]+$" $port) -}}
 {{- $ok = false -}}
 {{- else if or (lt (atoi $port) 1) (gt (atoi $port) 65535) -}}
 {{- $ok = false -}}
@@ -204,7 +262,7 @@ Fail the render, with a clear message, for any required value that is missing or
 {{- $_ := required "gitSync.config.gatewayUrl (or config.gatewayUrl) is required when gitSync.enabled is true" (default .Values.config.gatewayUrl $gs.config.gatewayUrl) -}}
 {{- $host := required "gitSync.config.replicaHost is required when gitSync.enabled is true: use the replica host from your installation instructions" $gs.config.replicaHost | toString -}}
 {{- if not (include "mkonnect.gitsync.validReplicaHost" $host) -}}
-{{- fail (printf "gitSync.config.replicaHost must be a host name, IP address or [IPv6]:port, optionally with :port, and no scheme, path or userinfo (got %q)" $host) -}}
+{{- fail (printf "gitSync.config.replicaHost must be a host name, an IPv4 address or a bracketed IPv6 address such as [2001:db8::1], optionally followed by :port (1-65535), with no scheme, path or userinfo (got %q)" $host) -}}
 {{- end -}}
 {{- $_ = include "mkonnect.gitsync.image" . -}}
 {{- $key := clean $gs.config.keyFile -}}

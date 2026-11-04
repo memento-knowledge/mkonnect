@@ -85,9 +85,13 @@ volume() { section "        - name: $1"; }
 mount() { section "            - name: $1"; }
 env_var() { section "            - name: $1"; }
 
-# check <text> <ERE> <message> requires the text to match; refute requires it not to.
-check() { grep -Eq -- "$2" <<<"$1" || fail "$3"; }
-refute() { if grep -Eq -- "$2" <<<"$1"; then fail "$3"; fi; }
+# check <text> <ERE> <message> requires the text to match; refute requires it not to; the _i
+# variants ignore case. Each takes exactly three arguments, so a misplaced option or a missing
+# message fails loudly instead of being read as a pattern.
+need3() { [ "$1" -eq 3 ] || fail "assertion called with $1 arguments instead of 3 (text, pattern, message)"; }
+check() { need3 $#; grep -Eq -- "$2" <<<"$1" || fail "$3"; }
+refute() { need3 $#; if grep -Eq -- "$2" <<<"$1"; then fail "$3"; fi; }
+refute_i() { need3 $#; if grep -Eiq -- "$2" <<<"$1"; then fail "$3"; fi; }
 
 # expect_failure <expected message fragment> <helm args...> requires the render to fail with
 # a message containing the fragment, so a regression that fails for another reason is caught.
@@ -108,10 +112,11 @@ overlaps() {
 
 # 1. Disabled (the default): no git-sync resource of any kind renders.
 out=$(render "${common[@]}")
-refute "$out" -i 'gitsync' "git-sync artifacts rendered while gitSync.enabled is false"
+refute_i "$out" 'gitsync' "git-sync artifacts rendered while gitSync.enabled is false"
 out=$(render "${common[@]}" --set gitSync.enabled=false \
-  --set gitSync.image.repository=example/gitsync --set gitSync.networkPolicy.enabled=true)
-refute "$out" -i 'gitsync' "git-sync artifacts rendered with gitSync.enabled=false and other gitSync values set"
+  --set gitSync.image.repository=example/gitsync --set gitSync.networkPolicy.enabled=true \
+  --set gitSync.config.registrationToken=tok --set gitSync.providerConfig.secretName=prov)
+refute_i "$out" 'gitsync' "git-sync artifacts rendered with gitSync.enabled=false and other gitSync values set"
 
 # 2. Enabling git-sync must not change any connector resource.
 for tpl in deployment secret pvc serviceaccount; do
@@ -130,7 +135,7 @@ if grep -q 'gitSync' "$old/values.yaml"; then fail "could not build the pre-git-
 # 3a. A plain connector upgrade still renders, identically.
 [ "$(render_in "$old" "${common[@]}")" = "$(render "${common[@]}")" ] ||
   fail "connector render differs when the stored values have no gitSync"
-refute "$(render_in "$old" "${common[@]}")" -i 'gitsync' "git-sync rendered from values without gitSync"
+refute_i "$(render_in "$old" "${common[@]}")" 'gitsync' "git-sync rendered from values without gitSync"
 # 3b. A partial stored gitSync map (only the keys the user set) gets the defaults, and the
 #     result is identical to rendering with the chart's own values.yaml.
 for variant in "" "egress" "mounts"; do
@@ -150,7 +155,7 @@ out=$(render_in "$old" "${enabled[@]}" --set gitSync.networkPolicy.enabled=false
 [ -z "$(doc NetworkPolicy "$dep_name" <<<"$out")" ] || fail "networkPolicy.enabled=false ignored with partial values"
 [ -z "$(doc ServiceAccount "$dep_name" <<<"$out")" ] || fail "serviceAccount.create=false ignored with partial values"
 # 3c. A stored gitSync map that only says enabled=false (or a disabled add-on) renders nothing.
-refute "$(render_in "$old" "${common[@]}" --set gitSync.enabled=false)" -i 'gitsync' "git-sync rendered from a disabled partial map"
+refute_i "$(render_in "$old" "${common[@]}" --set gitSync.enabled=false)" 'gitsync' "git-sync rendered from a disabled partial map"
 
 # 4. Minimal enabled render: the expected objects, each selected by kind and name.
 out=$(render "${enabled[@]}")
@@ -171,6 +176,19 @@ refute "$dep" 'claimName: t-mkonnect-data' "git-sync mounts the connector's PVC"
 probe=$(section '          startupProbe:' <<<"$dep")
 check "$probe" '^ *- /mkonnect-gitsync$' "startup probe does not run /mkonnect-gitsync"
 check "$probe" '^ *- --health$' "startup probe does not pass --health"
+check "$probe" '^            failureThreshold: 3$' "startup probe failureThreshold is not 3"
+check "$probe" '^            periodSeconds: 10$' "startup probe periodSeconds is not 10"
+refute "$pvc" 'storageClassName' "git-sync PVC sets a storage class by default"
+check "$(render "${enabled[@]}" --set gitSync.persistence.storageClass=fast-ssd | doc PersistentVolumeClaim "$dep_name-data")" \
+  '^  storageClassName: fast-ssd$' "persistence.storageClass not rendered"
+check "$(env_var PROTOCOL_VERSION <<<"$dep")" 'value: "v1"' "PROTOCOL_VERSION does not default to v1"
+check "$(env_var PROTOCOL_VERSION <<<"$(deployment "${enabled[@]}" --set config.protocolVersion=v2)")" 'value: "v2"' "PROTOCOL_VERSION does not fall back to config.protocolVersion"
+check "$(env_var PROTOCOL_VERSION <<<"$(deployment "${enabled[@]}" --set config.protocolVersion=v2 --set gitSync.config.protocolVersion=v3)")" 'value: "v3"' "gitSync.config.protocolVersion does not override config.protocolVersion"
+# A default can be removed with null (Helm drops the key before the templates see it), which the
+# template defaults must not undo.
+limits=$(section '            limits:' <<<"$(deployment "${enabled[@]}" --set gitSync.resources.limits.cpu=null)")
+check "$limits" '^              memory: 2Gi$' "memory limit lost when the CPU limit was removed"
+refute "$limits" 'cpu' "gitSync.resources.limits.cpu=null did not remove the CPU limit"
 check "$pvc" '^    - ReadWriteOnce$' "git-sync PVC access mode is not ReadWriteOnce"
 refute "$pvc" 'ReadWriteMany|ReadOnlyMany|ReadWriteOncePod' "git-sync PVC has an access mode other than ReadWriteOnce"
 check "$pvc" '^      storage: 20Gi$' "git-sync PVC size does not default to 20Gi"
@@ -200,19 +218,19 @@ expect_failure "must differ from config.connectorId" \
 
 # 6. replicaHost accepts what the connector accepts (host, host:port, IPv4, [IPv6], optional
 #    port) and rejects a scheme, a path, userinfo and other shapes.
-for good in replica.example.invalid replica.example.invalid:8443 replica Replica.Example.invalid \
-  replica.example.invalid. under_score.example 192.0.2.10 192.0.2.10:8443 '[2001:db8::1]' '[2001:db8::1]:8443' \
-  replica.example.invalid:65535; do
-  render "${enabled[@]}" --set "gitSync.config.replicaHost=$good" >/dev/null 2>&1 ||
-    fail "valid replicaHost '$good' was rejected"
-done
-for bad in https://replica.example.invalid replica.example.invalid/path replica.example.invalid/ \
-  user@replica.example.invalid 'replica example' replica.example.invalid: replica.example.invalid:70000 \
-  replica.example.invalid:0 replica.example.invalid:80:80 :443 2001:db8::1 '[2001:db8::1' '[host]:443' \
-  192.0.2 256.1.1.1 0x7f000001 2130706433 a..b 'replica.example.invalid?x' 'replica.example.invalid#x' \
-  'replica%2eexample' user@replica.example.invalid replica.example.invalid/; do
-  expect_failure "gitSync.config.replicaHost" "${enabled[@]}" --set "gitSync.config.replicaHost=$bad"
-done
+#    The table scripts/testdata/gitsync-replica-hosts.txt holds the connector's own verdicts.
+cases=0
+while IFS=$'\t' read -r verdict value; do
+  case $verdict in '#'* | '') continue ;; esac
+  cases=$((cases + 1))
+  if [ "$verdict" = ACCEPT ]; then
+    render "${enabled[@]}" --set "gitSync.config.replicaHost=$value" >/dev/null 2>&1 ||
+      fail "replicaHost '$value' is accepted by the connector but rejected by the chart"
+  else
+    expect_failure "gitSync.config.replicaHost must be a host name" "${enabled[@]}" --set "gitSync.config.replicaHost=$value"
+  fi
+done <"$root/scripts/testdata/gitsync-replica-hosts.txt"
+[ "$cases" -ge 80 ] || fail "replica host table not read (found $cases cases)"
 dep=$(deployment "${enabled[@]}" --set gitSync.config.replicaHost=replica.example.invalid:8443)
 check "$(env_var GIT_SYNC_REPLICA_HOST <<<"$dep")" 'value: "replica.example.invalid:8443"' "replicaHost with a port not rendered verbatim"
 
@@ -340,6 +358,9 @@ check "$np" 'kubernetes.io/metadata.name: "kube-system"' "DNS namespace selector
 np=$(render "${enabled[@]}" --set 'gitSync.networkPolicy.egress.cidrs={203.0.113.0/24}' \
   --set 'gitSync.networkPolicy.egress.ports={443,8443}' | doc NetworkPolicy "$dep_name")
 check "$np" 'port: 8443$' "custom egress port missing"
+np=$(render "${enabled[@]}" --set 'gitSync.networkPolicy.egress.cidrs={203.0.113.0/24}' \
+  --set gitSync.networkPolicy.egress.dnsNamespace=dns-system | doc NetworkPolicy "$dep_name")
+check "$np" 'kubernetes.io/metadata.name: "dns-system"' "custom DNS namespace not rendered"
 
 # 15. No Service and no container port: git-sync accepts no inbound connections.
 out=$(render "${enabled[@]}" --set 'gitSync.networkPolicy.egress.cidrs={203.0.113.0/24}')
@@ -389,14 +410,23 @@ for ((i = 0; i < ${#mounts[@]}; i++)); do
   done
 done
 
-# 18. Proxy settings are exported only when set.
+# 18. Proxy settings are exported only when set, in both cases (libcurl, and so git, reads only
+#     lower-case http_proxy; Go reads either), each from its own value so a mix-up fails.
 dep=$(deployment "${enabled[@]}")
-refute "$dep" 'PROXY' "proxy variables rendered by default"
-dep=$(deployment "${enabled[@]}" --set gitSync.proxy.https=http://proxy.example.invalid:3128 \
-  --set gitSync.proxy.http=http://proxy.example.invalid:3128 --set gitSync.proxy.noProxy=.cluster.local)
-check "$(env_var HTTPS_PROXY <<<"$dep")" 'value: "http://proxy.example.invalid:3128"' "HTTPS_PROXY not rendered"
-check "$(env_var HTTP_PROXY <<<"$dep")" 'value: "http://proxy.example.invalid:3128"' "HTTP_PROXY not rendered"
-check "$(env_var NO_PROXY <<<"$dep")" 'value: ".cluster.local"' "NO_PROXY not rendered"
+refute_i "$dep" 'proxy' "proxy variables rendered by default"
+dep=$(deployment "${enabled[@]}" --set gitSync.proxy.https=http://https-proxy.example.invalid:3128 \
+  --set gitSync.proxy.http=http://http-proxy.example.invalid:3129 --set gitSync.proxy.noProxy=.cluster.local)
+for name in HTTPS_PROXY https_proxy; do
+  check "$(env_var "$name" <<<"$dep")" 'value: "http://https-proxy.example.invalid:3128"' "$name not rendered from proxy.https"
+done
+for name in HTTP_PROXY http_proxy; do
+  check "$(env_var "$name" <<<"$dep")" 'value: "http://http-proxy.example.invalid:3129"' "$name not rendered from proxy.http"
+done
+for name in NO_PROXY no_proxy; do
+  check "$(env_var "$name" <<<"$dep")" 'value: ".cluster.local"' "$name not rendered from proxy.noProxy"
+done
+dep=$(deployment "${enabled[@]}" --set gitSync.proxy.https=http://https-proxy.example.invalid:3128)
+refute "$dep" 'HTTP_PROXY|http_proxy|NO_PROXY|no_proxy' "unset proxy values were rendered"
 
 # 19. Naming overrides and the dedicated ServiceAccount.
 out=$(helm template rel "$chart" "${enabled[@]}" --set fullnameOverride=custom)
@@ -425,6 +455,6 @@ check "$text" 'kubectl -n ns1 exec -i deploy/t-mkonnect-gitsync' "NOTES kubectl 
 check "$text" 'connector config set' "NOTES do not show how to configure a provider"
 text=$(notes "${enabled[@]}" --set gitSync.providerConfig.secretName=my-providers)
 check "$text" 'mounted read-only from the Secret my-providers' "NOTES do not mention the provider config Secret"
-refute "$(notes "${common[@]}")" -i 'git-sync' "NOTES mention git-sync while disabled"
+refute_i "$(notes "${common[@]}")" 'git-sync' "NOTES mention git-sync while disabled"
 
 printf 'chart git-sync tests passed\n'
