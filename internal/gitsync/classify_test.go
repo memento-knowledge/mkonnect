@@ -63,7 +63,7 @@ func TestClassifyGitFailure(t *testing.T) {
 		{"out of memory", originSide, exit, "fatal: Out of memory, malloc failed (tried to allocate 1073741824 bytes)", false, ErrJobOutOfMemory},
 		{"killed with no deadline is oom", replicaSide, errors.New("signal: killed"), "", false, ErrJobOutOfMemory},
 		// A child git process the kernel killed (git prints "<cmd> died of signal 9" and exits 128).
-		{"index-pack killed by signal 9", originSide, exit, "error: index-pack died of signal 9\nfatal: fetch-pack: invalid index-pack output", false, ErrJobOutOfMemory},
+		{"index-pack killed by signal 9", originSide, exit, "error: index-pack died of signal 9", false, ErrJobOutOfMemory},
 		{"pack-objects killed by signal 9", replicaSide, exit, "error: pack-objects died of signal 9\nfatal: the remote end hung up unexpectedly", false, ErrJobOutOfMemory},
 		{"git-remote-https killed by signal 9", replicaSide, exit, "error: git-remote-https died of signal 9", false, ErrJobOutOfMemory},
 		// Only signal 9 is the OOM killer: other signals, and numbers merely starting with 9, are not.
@@ -71,6 +71,11 @@ func TestClassifyGitFailure(t *testing.T) {
 		{"signal 90 is not oom", originSide, exit, "error: index-pack died of signal 90", false, ErrUnclassified},
 		// A "remote:" line is the far end speaking: its child dying is not our memory.
 		{"remote side signal 9 is not local oom", replicaSide, exit, "remote: error: index-pack died of signal 9\n ! [remote rejected] main -> main (unpacker error)", false, ErrReplicaRejected},
+		// Server-supplied text that is not on a "remote:" line (a rejected-ref reason, a relayed error)
+		// can name a dying child too; only git's own "<cmd> died of signal 9" line counts.
+		{"signal 9 in a rejected-ref reason is not local oom", replicaSide, exit, " ! [remote rejected] main -> main (index-pack died of signal 9)", false, ErrReplicaRejected},
+		{"signal 9 in a relayed unpack error is not local oom", replicaSide, exit, "error: remote unpack failed: index-pack died of signal 9\n ! [remote rejected] main -> main (unpacker error)", false, ErrReplicaRejected},
+		{"signal 9 in a server error is not local oom", originSide, exit, "fatal: remote error: index-pack died of signal 9", false, ErrUnclassified},
 
 		{"unrecognized origin", originSide, exit, "fatal: something unexpected went wrong", false, ErrUnclassified},
 		{"unrecognized replica", replicaSide, exit, "fatal: something unexpected went wrong", false, ErrUnclassified},
@@ -119,8 +124,9 @@ func TestClassifyGitFailureIgnoresRefNames(t *testing.T) {
 	}
 }
 
-// A ref name must not steer the OOM classification either: git prints a status line per ref, and a
-// branch named like a kernel message is just a name.
+// A ref name must not steer the OOM classification either. Ref names cannot contain spaces, so this
+// is a cheap guard on the scrubbing; the realistic route for server text is a rejected-ref reason,
+// which TestClassifyGitFailure covers.
 func TestClassifyGitFailureIgnoresSignalNamedRefs(t *testing.T) {
 	exit := errors.New("exit status 128")
 	fetch := "From https://git.example.com/group/repo-a\n" +

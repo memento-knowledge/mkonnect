@@ -58,10 +58,12 @@ var (
 	replicaQuotaMarkers = []string{"size limit", "maximum allowed size", "too large", "quota"}
 	rejectedMarkers     = []string{"remote rejected", "hook declined", "pre-receive hook", "unpacker error"}
 
-	// childKilledRE matches git reporting that one of its child processes (index-pack, pack-objects,
-	// git-remote-https) was SIGKILLed: "error: index-pack died of signal 9". With no deadline that is
-	// the kernel's OOM killer. Only signal 9, and only as a whole number ("signal 90" is not it).
-	childKilledRE = regexp.MustCompile(`\bdied of signal 9\b`)
+	// childKilledRE matches git itself reporting that one of its child processes (index-pack,
+	// pack-objects, git-remote-https) was SIGKILLed: "error: index-pack died of signal 9". With no
+	// deadline that is the kernel's OOM killer. It is anchored to git's own "error:"/"fatal:" prefix
+	// followed directly by the command, so text a server relays ("error: remote unpack failed: ...",
+	// a rejected-ref reason) cannot match; and it is signal 9 as a whole number ("signal 90" is not).
+	childKilledRE = regexp.MustCompile(`(?m)^\s*(?:error|fatal): \S+ died of signal 9\b`)
 )
 
 func containsAny(s string, markers []string) bool {
