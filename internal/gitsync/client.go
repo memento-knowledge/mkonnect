@@ -118,6 +118,9 @@ type Client struct {
 	mgr          *manager
 	drainTimeout time.Duration
 
+	// gc reclaims the disk of mirrors that left the configuration; see gc.go.
+	gc *mirrorGC
+
 	// Completion-triggered statuses are coalesced: see notifyStatus.
 	statusInterval  time.Duration
 	notifyMu        sync.Mutex
@@ -179,6 +182,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		repos:          map[string]repoState{},
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
+		gc:             newMirrorGC(),
 	}
 	c.mgr = newManager(defaultSyncConcurrency,
 		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, now: now},
@@ -201,7 +205,10 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 }
 
 // Run connects and maintains the connection with backoff until ctx is cancelled.
-func (c *Client) Run(ctx context.Context) { c.gw.Run(ctx) }
+func (c *Client) Run(ctx context.Context) {
+	c.startMirrorGC(ctx)
+	c.gw.Run(ctx)
+}
 
 // Connect performs a single connection attempt.
 func (c *Client) Connect(ctx context.Context) error { return c.gw.Connect(ctx) }
@@ -251,7 +258,9 @@ func (c *Client) OnDraining(ctx context.Context) {
 func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string, raw json.RawMessage) {
 	switch typ {
 	case "git_sync_config":
-		if c.applyConfig(raw) {
+		accepted := c.applyConfig(raw)
+		c.gc.configApplied(accepted)
+		if accepted {
 			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
 			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
 			// before the status is built, so the status already reports them as syncing.
@@ -357,7 +366,12 @@ func targetMatches(r repoState, t syncTask) bool {
 // Wait blocks until no sync is in flight or ctx ends. The daemon calls it after cancelling the
 // process-lifetime context, which kills each git, so it can confirm they have stopped before exiting
 // instead of leaving a process that holds a credential behind.
-func (c *Client) Wait(ctx context.Context) { c.mgr.drain(ctx) }
+// It also waits for the mirror cleanup loop, which stops with the same context; a removal already under
+// way finishes first, so the caller bounds the wait with ctx.
+func (c *Client) Wait(ctx context.Context) {
+	c.mgr.drain(ctx)
+	c.gc.wait(ctx)
+}
 
 // handleSyncNow resolves the repositories an immediate-sync request addresses. A request is
 // suppressed entirely while a critical patch is required. The caller starts the syncs.
