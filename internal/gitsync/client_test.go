@@ -132,6 +132,9 @@ func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, n
 	t.Helper()
 	gate := make(chan struct{})
 	defaults := []gitsync.Option{
+		// The replica host every fixture URL uses; a test of the unpinned behaviour overrides it
+		// with WithReplicaHost("").
+		gitsync.WithReplicaHost("replica.example.com"),
 		gitsync.WithMirrorsRoot(t.TempDir()),
 		gitsync.WithStatusInterval(10 * time.Millisecond),
 		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
@@ -390,9 +393,13 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 			c := newTestClient(t, "")
 			s := &stubSender{}
 			c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(raw))
-			// A rejected config emits no status and leaves the connector unconfigured.
-			if n := len(s.messages()); n != 0 {
-				t.Errorf("rejected config emitted %d status messages, want 0", n)
+			// A rejected config leaves the connector unconfigured and reports one status carrying why.
+			msgs := s.messages()
+			if len(msgs) != 1 {
+				t.Fatalf("rejected config emitted %d status messages, want 1", len(msgs))
+			}
+			if ce := lastStatus(t, msgs).ConfigError; ce == nil || ce.Reason == "" {
+				t.Errorf("rejected config status carries no config_error: %+v", ce)
 			}
 			if err := c.OnHeartbeat(context.Background(), s); err != nil {
 				t.Fatalf("OnHeartbeat: %v", err)
@@ -508,14 +515,20 @@ func TestCriticalPatchGateViaHandleMessage(t *testing.T) {
 	}
 }
 
-func TestMalformedMessagesAreIgnored(t *testing.T) {
+func TestMalformedMessagesGetAtMostAConfigError(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(`{"repositories":"nope"}`))
 	c.HandleMessage(context.Background(), s, "git_sync_now", json.RawMessage(`{"repo_id":123}`))
 	c.HandleMessage(context.Background(), s, "something_else", json.RawMessage(`{}`))
-	if n := len(s.messages()); n != 0 {
-		t.Errorf("malformed/unknown messages sent %d replies, want 0", n)
+	// Only the malformed configuration is answered (a status carrying config_error); the malformed
+	// sync request and the unknown type are ignored.
+	msgs := s.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("malformed/unknown messages sent %d replies, want 1", len(msgs))
+	}
+	if ce := lastStatus(t, msgs).ConfigError; ce == nil || ce.Reason != proto.GitSyncConfigErrMalformedMessage {
+		t.Errorf("config_error = %+v, want malformed_message", ce)
 	}
 	// A valid config still applies afterwards.
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
@@ -799,6 +812,7 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local,
 		&fakeProber{result: gitsync.OriginReachable}, fixedNow, "boot-test",
 		gitsync.WithMirrorsRoot(t.TempDir()),
+		gitsync.WithReplicaHost("replica.example.com"),
 		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()

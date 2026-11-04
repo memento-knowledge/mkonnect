@@ -97,7 +97,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local, gitsync.NewGitProber(), nil, bootID)
+	// The replica host is pinned once, here, from the environment: the connector pushes only to that
+	// host and, with no valid pin, rejects every configuration (see gitsync.ReplicaHostEnv). The
+	// client logs the effective pin, or why there is none, without echoing the raw value.
+	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local, gitsync.NewGitProber(), nil, bootID,
+		gitsync.WithReplicaHost(os.Getenv(gitsync.ReplicaHostEnv)))
 	client.Run(ctx)
 
 	// Cancelling ctx kills each running git (its own process group, so a terminal Ctrl-C does not

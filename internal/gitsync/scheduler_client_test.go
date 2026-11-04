@@ -76,7 +76,8 @@ func newSchedEnv(t *testing.T, now func() time.Time) *schedEnv {
 	}
 	cfg := &config.Config{GatewayURL: "ws://127.0.0.1:1", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
 	e.c = NewClient(cfg, auth.NewKeyStore(filepath.Join(dir, "key")), local, nil, now, "boot-test",
-		WithMirrorsRoot(t.TempDir()), WithGitRunner(runner), WithStatusInterval(time.Millisecond))
+		WithMirrorsRoot(t.TempDir()), WithGitRunner(runner), WithStatusInterval(time.Millisecond),
+		WithReplicaHost("replica.example.com"))
 	e.c.sched.hooks.rand = func() float64 { return 0 }
 
 	ctx, cancel := context.WithCancel(context.Background())
