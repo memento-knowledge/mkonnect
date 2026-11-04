@@ -38,7 +38,8 @@ const (
 //
 // ErrReplicaRejected includes a replica refusal over its own size or quota limit. The separate
 // ErrRepositoryOverLimit is reserved for the connector's own repository-size ceiling, a local check
-// that is never inferred from git output (it is not enforced yet).
+// that is never inferred from git output. It is enforced after the fetch, against the mirror's size
+// on disk, when the platform sets max_repository_mb; nothing is pushed for a repository over it.
 const (
 	ErrOriginUnreachable   = "origin_unreachable"
 	ErrOriginAccessDenied  = "origin_access_denied"
@@ -248,7 +249,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	c.limits.Store(&defaults)
 	c.runs = c.runStore.load()
 	c.mgr = newManager(defaultSyncConcurrency,
-		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, runOut: o.runOut, now: now},
+		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, runOut: o.runOut, now: now, limits: c.effectiveLimits},
 		syncHooks{
 			resolve:   c.resolveTask,
 			begin:     c.beginSync,

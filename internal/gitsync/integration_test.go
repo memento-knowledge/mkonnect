@@ -14,8 +14,17 @@ import (
 // git runs the real git binary with an isolated environment and returns its trimmed stdout.
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	return gitStdin(t, dir, "", args...)
+}
+
+// gitStdin is git with the given standard input (for example `update-ref --stdin`).
+func gitStdin(t *testing.T, dir, stdin string, args ...string) string {
+	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + t.TempDir(),

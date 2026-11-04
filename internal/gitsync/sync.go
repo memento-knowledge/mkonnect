@@ -14,7 +14,8 @@ import (
 const (
 	// defaultFetchTimeout and defaultPushTimeout bound a single fetch and a single push, so a
 	// wedged connection cannot hold a sync slot forever. They are generous because the first fetch
-	// of a large repository is legitimately slow. They are not yet configurable per deployment.
+	// of a large repository is legitimately slow. The push timeout is replaced by the platform's
+	// push_timeout_seconds limit when it supplies one; the fetch timeout is not configurable.
 	defaultFetchTimeout = 30 * time.Minute
 	defaultPushTimeout  = 30 * time.Minute
 
@@ -94,15 +95,19 @@ type syncTask struct {
 
 // syncDeps are the seams a sync needs. Zero timeouts use the defaults.
 type syncDeps struct {
+	// limits returns the limits in force. It is read once at the start of each attempt, so a
+	// configuration that arrives mid-sync applies from the next attempt and never mixes two settings
+	// within one. Nil means DefaultLimits.
+	limits  func() Limits
 	mirrors Mirrors
 	run     runFunc
 	// runOut runs git with its standard output streamed, which statistics need (the push's porcelain
-	// report, the newest commit, the origin's default branch). When nil no statistics are collected
-	// and git runs through run alone, exactly as before.
+	// report, the newest commit, the origin's default branch) and so does push batching (it reads the
+	// planning push's report). When nil no statistics are collected, pushes are never batched, and git
+	// runs through run alone, exactly as before.
 	runOut       outRunFunc
 	now          func() time.Time
 	fetchTimeout time.Duration
-	pushTimeout  time.Duration
 }
 
 // syncRepo mirrors one repository: fetch the origin's branches and tags into the local bare mirror
@@ -130,6 +135,7 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 	if d.tokenExpired(t) {
 		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
 	}
+	lim := d.currentLimits()
 
 	if err := d.mirrors.EnsureRoot(); err != nil {
 		return localFault(err)
@@ -140,7 +146,7 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 	}
 	defer cleanup()
 
-	if stderr, err := d.updateMirror(ctx, home, t); err != nil {
+	if stderr, err := d.updateMirror(ctx, home, t, lim); err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
 		}
@@ -152,6 +158,7 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 	// branches or tags (an empty repository, or a transient bad advertisement) leaves the mirror
 	// with no refs, and `push --prune` would then delete every branch and tag on the replica. This
 	// also covers a mirror that was initialised but never fetched into (for example after a crash).
+	// It is the only guard of that kind, and it precedes every push, the planning push included.
 	if stderr, err := d.hasPushableRefs(ctx, home, t); err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
@@ -163,6 +170,19 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
+	// The connector's own repository ceiling: an oversized mirror is not pushed. The mirror is kept, so
+	// the next fetch stays incremental; the result repeats until the origin shrinks or the platform
+	// raises the ceiling.
+	if lim.MaxRepositoryMB > 0 {
+		over, err := mirrorExceeds(d.mirrors.Dir(t.RepoID), int64(lim.MaxRepositoryMB)*mebibyte)
+		if err != nil {
+			return localFault(err)
+		}
+		if over {
+			return syncResult{State: StateError, ErrorType: ErrRepositoryOverLimit}
+		}
+	}
+
 	if d.runOut != nil {
 		// The mirror was just fetched, so this is the origin's newest commit as of this attempt. A
 		// failure to read it costs the statistic, not the sync.
@@ -172,38 +192,7 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 		}
 	}
 
-	// The fetch can outlive the token. Re-check immediately before using it: a token the
-	// platform has declared expired is not used, whether or not the replica would still accept it.
-	// (A token that expires while the push itself is running is the replica's to judge; it is not
-	// cut short by the connector's clock, which may be skewed.)
-	if d.tokenExpired(t) {
-		return syncResult{State: StateError, ErrorType: ErrPushTokenExpired}
-	}
-
-	// --porcelain is always used, so there is one push path whether or not statistics are collected.
-	// It moves git's per-ref report (including each rejection's reason) from stderr to stdout, which
-	// pushCounter reads and hands back to the classifier in the shape it expects.
-	pushArgv := append([]string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "push", "--porcelain", "--prune", "--force", "--", t.ReplicaURL}, mirrorRefspecs...)
-	pushEnv := gitConfigEnv(gitBaseEnv(home), credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken))
-	var counter pushCounter
-	stderr, err := d.runBoundedOut(ctx, d.pushTimeoutOrDefault(), "push", pushArgv, pushEnv, home, &counter)
-	if d.runOut != nil {
-		stats.RefsPushed = new(int)
-		*stats.RefsPushed = counter.Refs()
-	}
-	if err == nil && counter.Rejected() > 0 {
-		// A rejected ref means the replica is not current, whatever the exit status says.
-		err = errPushRejected
-	}
-	if err != nil {
-		if ctx.Err() != nil {
-			return syncResult{State: StatePending}
-		}
-		stderr = append(append([]byte(nil), stderr...), counter.RejectionText()...)
-		// Re-evaluated now: a long fetch can outlive the token, and a 401 then means "expired".
-		typ, detail := classifyGitFailure(replicaSide, err, stderr, d.tokenExpired(t))
-		res := syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
-		d.learnDefaultBranch(ctx, home, t, stats)
+	if res := d.pushStage(ctx, home, t, lim, stats); res.State != StateOK {
 		return res
 	}
 	d.learnDefaultBranch(ctx, home, t, stats)
@@ -261,6 +250,22 @@ func (d syncDeps) originEnv(home string, t syncTask) []string {
 	return gitConfigEnv(gitBaseEnv(home), credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token))
 }
 
+// fetchEnv is originEnv plus the limits that bear on a fetch: the pack settings and, when a size
+// ceiling is set, foreground maintenance so the mirror is measured settled.
+func (d syncDeps) fetchEnv(home string, t syncTask, lim Limits) []string {
+	cfg := credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token)
+	cfg = append(cfg, packConfig(lim)...)
+	cfg = append(cfg, maintenanceConfig(lim)...)
+	return gitConfigEnv(gitBaseEnv(home), cfg)
+}
+
+// replicaEnv is the environment for a push: the locked-down base, the push token scoped to the
+// replica URL, and the pack settings.
+func (d syncDeps) replicaEnv(home string, t syncTask, lim Limits) []string {
+	cfg := credConfig(t.ReplicaURL, replicaAuth, "", t.PushToken)
+	return gitConfigEnv(gitBaseEnv(home), append(cfg, packConfig(lim)...))
+}
+
 // hasPushableRefs reports, as a nil error, that the mirror holds at least one branch or tag.
 // `git show-ref --quiet` exits 1 when nothing matches, which is returned as errNoRefs; any other
 // failure is returned as-is and says nothing about whether the origin is empty.
@@ -285,9 +290,9 @@ func (d syncDeps) hasPushableRefs(ctx context.Context, home string, t syncTask) 
 // namespace the origin has. The fetch below works on them unchanged and neither rewrites nor deletes
 // those extra refs (--prune only touches refs inside the fetched namespaces), so they keep occupying
 // disk until the mirror is rebuilt; nothing here reclaims that space.
-func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask) ([]byte, error) {
+func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask, lim Limits) ([]byte, error) {
 	dir := d.mirrors.Dir(t.RepoID)
-	env := d.originEnv(home, t)
+	env := d.fetchEnv(home, t, lim)
 	fetchArgv := append([]string{"git", "--git-dir=" + dir, "fetch", "--prune", "--force", "--", t.CanonicalURL}, mirrorRefspecs...)
 
 	if d.mirrors.Exists(t.RepoID) {
@@ -356,9 +361,18 @@ func (d syncDeps) fetchTimeoutOrDefault() time.Duration {
 	return defaultFetchTimeout
 }
 
-func (d syncDeps) pushTimeoutOrDefault() time.Duration {
-	if d.pushTimeout > 0 {
-		return d.pushTimeout
+// currentLimits is the limits in force for an attempt that is starting.
+func (d syncDeps) currentLimits() Limits {
+	if d.limits != nil {
+		return d.limits()
+	}
+	return DefaultLimits()
+}
+
+// pushTimeout bounds one push process: the platform's limit when set, else the default.
+func (lim Limits) pushTimeout() time.Duration {
+	if lim.PushTimeout > 0 {
+		return lim.PushTimeout
 	}
 	return defaultPushTimeout
 }

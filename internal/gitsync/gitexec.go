@@ -92,6 +92,33 @@ func credConfig(remoteURL, auth, username string, token Secret) [][2]string {
 	return append(cfg, [2]string{"http." + strings.TrimSuffix(remoteURL, "/") + "/.extraHeader", header})
 }
 
+// packConfig returns the git config pairs for the pack limits: pack.threads (the thread count of
+// index-pack on fetch and pack-objects on push) and pack.windowMemory (the per-thread delta-window
+// memory of pack-objects, which a fetch does not run, in MiB). A zero or negative limit means git's
+// own default and adds nothing. The values are formatted from integers only, so nothing that came
+// from the wire as text can reach git through here.
+func packConfig(l Limits) [][2]string {
+	var cfg [][2]string
+	if l.PackThreads > 0 {
+		cfg = append(cfg, [2]string{"pack.threads", strconv.Itoa(l.PackThreads)})
+	}
+	if l.PackWindowMemoryMB > 0 {
+		cfg = append(cfg, [2]string{"pack.windowMemory", strconv.Itoa(l.PackWindowMemoryMB) + "m"})
+	}
+	return cfg
+}
+
+// maintenanceConfig makes a fetch's automatic repack/gc run in the foreground when a repository
+// ceiling is in force. Detached, it would still be rewriting packs (briefly doubling their apparent
+// size) while the ceiling check measures the mirror, and could report a repository over the limit
+// that is not.
+func maintenanceConfig(l Limits) [][2]string {
+	if l.MaxRepositoryMB <= 0 {
+		return nil
+	}
+	return [][2]string{{"gc.autoDetach", "false"}, {"maintenance.autoDetach", "false"}}
+}
+
 // tempHomePrefix names every directory newTempHome creates; the startup sweep removes only
 // entries carrying it.
 const tempHomePrefix = "gitsync-home-"

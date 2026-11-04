@@ -8,8 +8,8 @@ import (
 )
 
 // defaultSyncConcurrency is how many repositories sync at once. Each sync is a git subprocess that
-// may be memory- and bandwidth-heavy, so the default is deliberately small. It is not yet
-// configurable per deployment.
+// may be memory- and bandwidth-heavy, so the default is deliberately small. The platform can change
+// it with the max_concurrency limit; see manager.resize.
 const defaultSyncConcurrency = 4
 
 // syncHooks connect the manager to the connector's state without the manager knowing about it.
@@ -48,7 +48,7 @@ type syncHooks struct {
 type manager struct {
 	deps  syncDeps
 	hooks syncHooks
-	sem   chan struct{}
+	slots *slotPool
 
 	mu       sync.Mutex
 	inflight map[string]struct{}
@@ -67,12 +67,18 @@ func newManager(limit int, deps syncDeps, hooks syncHooks) *manager {
 	return &manager{
 		deps:     deps,
 		hooks:    hooks,
-		sem:      make(chan struct{}, limit),
+		slots:    newSlotPool(limit),
 		inflight: map[string]struct{}{},
 		rerun:    map[string]bool{},
 		idleCh:   idle,
 	}
 }
+
+// resize changes how many repositories may sync at once. Syncs already running or queued are never
+// dropped: a larger limit starts queued ones at once, and a smaller one only holds back new starts
+// until enough running syncs finish. Because a queued sync still takes its slot before its task is
+// resolved, it runs with the material it has when it starts, whatever the limit was when it queued.
+func (m *manager) resize(limit int) { m.slots.resize(limit) }
 
 // enqueue starts a sync for each repository that is syncable and not already in flight, and marks a
 // trailing rerun for each that is. ctx bounds the syncs it starts: it is the process-lifetime
@@ -152,13 +158,11 @@ func (m *manager) runRepo(ctx context.Context, id string) {
 // runOnce waits for a concurrency slot, then resolves the task and runs one sync. Cancellation
 // while waiting, like cancellation during the sync, is not a failure: nothing is recorded.
 func (m *manager) runOnce(ctx context.Context, id string) {
-	select {
-	case m.sem <- struct{}{}:
-	case <-ctx.Done():
+	if !m.slots.acquire(ctx) {
 		m.hooks.release(id)
 		return
 	}
-	defer func() { <-m.sem }()
+	defer m.slots.release()
 
 	if ctx.Err() != nil {
 		m.hooks.release(id)

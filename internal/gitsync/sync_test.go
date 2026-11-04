@@ -527,7 +527,7 @@ func TestSyncRepoPushDeadlineIsPushTimeout(t *testing.T) {
 // attribute it to the deadline rather than letting it read as an out-of-memory kill.
 func TestSyncRepoPushRunningPastItsDeadlineIsPushTimeout(t *testing.T) {
 	d := newTestDeps(t, &fakeGit{})
-	d.pushTimeout = 20 * time.Millisecond
+	d.limits = func() Limits { return Limits{PushTimeout: 20 * time.Millisecond} }
 	d.run = func(ctx context.Context, argv, env []string, dir string) ([]byte, error) {
 		if (gitCall{argv: argv}).sub() == "push" {
 			<-ctx.Done()

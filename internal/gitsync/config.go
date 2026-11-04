@@ -250,12 +250,15 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	c.configErr = nil
 	// The configuration is a full replace, so limits it leaves out revert to their defaults.
 	c.limits.Store(&limits)
+	c.mgr.resize(limits.MaxConcurrency)
 	runsChanged := c.reconcileRunsLocked(next)
+	// next is c.repos now, which syncs update under mu: count it before letting go of the lock.
+	repoCount := len(next)
 	c.mu.Unlock()
 	if runsChanged {
 		c.markRunsDirty()
 	}
-	slog.Info("git_sync_config accepted", "repo_count", len(next))
+	slog.Info("git_sync_config accepted", "repo_count", repoCount)
 	return true
 }
 
