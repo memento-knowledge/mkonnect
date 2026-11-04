@@ -16,8 +16,6 @@ type binding struct {
 	gen      uint64
 }
 
-func (b binding) bound() bool { return b.provider != "" }
-
 // providerEntry is one provider of a providerSet.
 type providerEntry struct {
 	entry   LocalEntry
