@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -26,6 +27,12 @@ type gitHTTPServer struct {
 	*httptest.Server
 	mu   sync.Mutex
 	seen []string
+
+	// failAdvert, when n > 0, makes the n-th request for the receive-pack ref advertisement (one per
+	// push process, the first thing a push asks for) answer 503, so a test can break a push exactly
+	// between two others.
+	failAdvert  atomic.Int32
+	advertCount atomic.Int32
 }
 
 func (s *gitHTTPServer) authHeaders() []string {
@@ -58,6 +65,12 @@ func newGitHTTPServer(t *testing.T, root, wantAuth string, denyStatus int) *gitH
 		if got != wantAuth {
 			http.Error(w, "denied", denyStatus)
 			return
+		}
+		if r.URL.Query().Get("service") == "git-receive-pack" {
+			if n := s.advertCount.Add(1); n == s.failAdvert.Load() {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
 		}
 		handler.ServeHTTP(w, r)
 	}))

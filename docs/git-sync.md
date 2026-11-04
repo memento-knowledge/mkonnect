@@ -109,7 +109,7 @@ error, the release most likely has no git-sync image.
   files, not the mirrors, so it is much smaller than the data volume. It must be backed by disk,
   not memory. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
   `gitSync.tmp.sizeLimit` if you see `local_disk_exhausted` for `/tmp`.
-- **Concurrency and memory:** up to four repositories sync at once; the others wait their turn
+- **Concurrency and memory:** by default up to four repositories sync at once; the others wait their turn
   (see [Concurrency](#concurrency)). A very large repository, or a large first sync, can exceed the
   default memory limit; the repository is then reported as `job_out_of_memory` (see
   [Troubleshooting](#troubleshooting)).
@@ -517,9 +517,11 @@ The platform sends no timer, so git-sync re-syncs every repository on its own sc
 
 ### Concurrency
 
-Up to four repositories sync at once, and the others wait for a free slot. A repository that is
-waiting is reported as `syncing`, so with many repositories one can show `syncing` for a while
-before git actually starts on it. The number is fixed in this release.
+By default up to four repositories sync at once, and the others wait for a free slot. A repository
+that is waiting is reported as `syncing`, so with many repositories one can show `syncing` for a while
+before git actually starts on it. Memento can change the number (see
+[Limits the platform can send](#limits-the-platform-can-send)); a change takes effect without a
+restart and never interrupts a sync that is already running.
 
 ### Failures and backoff
 
@@ -566,11 +568,29 @@ meantime start spread over up to 2 minutes (less if the interval is shorter), no
 
 ### Limits the platform can send
 
-The configuration may also carry resource limits: concurrency, push batching, pack settings, a
-repository size ceiling, and a push timeout. git-sync checks every value against its accepted range
-and rejects the whole configuration if one is outside it, but **only the interval is applied
-today**. Concurrency stays at four, the push and fetch time limits stay at 30 minutes each, and none of
-the others has an effect yet.
+The configuration may also carry resource limits. git-sync checks every value against its accepted
+range and rejects the whole configuration if one is outside it (see
+[Rejected configuration](#rejected-configuration-config_error)). A limit the configuration leaves out
+goes back to its default. These are applied:
+
+| Limit | Default | Effect |
+|---|---|---|
+| Interval | 15 minutes | How often each repository is synced. |
+| Concurrency | 4 | How many repositories sync at once. Changing it never interrupts a running sync: raising it starts waiting repositories at once, lowering it only holds back new starts until enough syncs finish. |
+| Push timeout | 30 minutes | How long one push to the replica may run before it is reported as `push_timeout`. The fetch from your git server keeps its fixed 30-minute limit. |
+| Pack threads, pack window memory | git's own | Passed to git as `pack.threads` and `pack.windowMemory`, for the fetch and the push, to bound CPU and memory on a small host. |
+| Repository size ceiling | none | After a fetch, a mirror larger than the ceiling is not pushed and the repository is reported as `repository_over_limit`. The check is on the mirror's size on disk, after the fetch: a repository far over the ceiling is still downloaded once, and its mirror is kept so the next fetch is incremental. The error repeats until git has reclaimed enough space or the ceiling is raised. |
+| Push batch size | none | A push that would write more refs than this is made in batches of at most that many refs, so a very large repository is not sent in one request (see below). |
+
+When pushes are batched, git-sync first asks the replica what a push would change (a request that
+sends no data), writes the changed branches and tags in batches, and only after **every batch has
+succeeded** makes one final push that also removes the refs that no longer exist on your git server.
+If a batch fails, the token expires, or git-sync is stopped before that final push, nothing is
+removed from the replica in that run and the next run continues from where the replica stands. The
+batch size bounds the refs written per batch; the final push carries all the removals, and also
+writes the few refs that cannot go in a batch (for example a name that git would find ambiguous next
+to another ref). A repository whose mirror holds no more refs than one batch is pushed as before,
+without the extra request.
 
 ## Data on the volume
 
@@ -786,13 +806,14 @@ clears the error.
 | `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `replica_rejected` | The replica refused the push: a rejected ref, a policy decision, or a size or quota limit. Contact Memento with the repository ID. |
-| `push_timeout` | A push ran past its 30-minute limit, typically a very large first push over a slow link. Check bandwidth to the replica; later syncs push less. |
+| `push_timeout` | A push ran past its time limit (30 minutes unless Memento set another), typically a very large first push over a slow link. Check bandwidth to the replica; later syncs push less. |
+| `repository_over_limit` | The repository's mirror is larger than the size ceiling Memento configured, so nothing was pushed. Raising the ceiling is a Memento-side setting; contact Memento with the repository ID. The mirror stays on the data volume. |
 | `local_disk_exhausted` | The data volume or the `/tmp` scratch space is full. The mirrors are on the data volume: grow `gitSync.persistence.size` (or the Docker volume's backing disk). For `/tmp`, raise `gitSync.tmp.sizeLimit`. See [Sizing](#sizing). |
 | `job_out_of_memory` | git was killed for lack of memory. Raise the memory limit (`gitSync.resources.limits.memory`, or `--memory` with Docker). |
 | `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
 | The status carries a `config_error` (how the portal shows it is up to the platform) | The platform sent a configuration that git-sync rejected as a whole, and the previous configuration stays in effect. See [Rejected configuration](#rejected-configuration-config_error) for each reason, including the two replica-host pin errors, `replica_host_not_pinned` and `replica_host_mismatch`, that you can fix yourself. |
 | The status carries `suspended: critical_update_required`, and the log says `gateway requires a critical security update` | git-sync starts no new sync until it is upgraded. Upgrade to the latest release; see [While syncing is suspended](#while-syncing-is-suspended). |
-| A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time, and a repository waiting for a slot is also reported as `syncing`). Watch `kubectl logs` / `docker logs` for the outcome. |
+| A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time by default, and a repository waiting for a slot is also reported as `syncing`). Watch `kubectl logs` / `docker logs` for the outcome. |
 | A repository is `error` and was not retried for a long time | Failures back off, up to an hour or more, and the three credential failures wait at least an hour from the first one. See [Failures and backoff](#failures-and-backoff). |
 | The last success time is empty (null) for a repository that used to sync | Either it has never succeeded since its origin or replica last changed, or the run state was discarded. Look for `ignoring run state file` in the log; see [Run state](#run-state). It fills in again after the next successful sync. |
 | Disk usage does not drop after a repository was removed in Memento | Mirrors are removed seven days after the repository left the configuration, and not at all while cleanup is off, a configuration was rejected, or no repository is configured. See [Mirror cleanup](#mirror-cleanup). |
