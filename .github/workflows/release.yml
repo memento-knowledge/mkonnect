@@ -46,6 +46,29 @@ jobs:
           git checkout --detach "$RELEASE_TAG^{commit}"
           bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
 
+      # Fail before anything is pushed if the real release ID or chart version could not be
+      # written to release-metadata.json. The digests here are placeholders.
+      - name: Validate release-metadata.json for this release
+        env:
+          RELEASE_ID: ${{ steps.metadata.outputs.release_id }}
+          CHART_VERSION: ${{ steps.metadata.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          placeholder="sha256:$(printf '0%.0s' {1..64})"
+          for git_sync in with without; do
+            args=(
+              --release-id "$RELEASE_ID"
+              --chart-version "$CHART_VERSION"
+              --connector-image-digest "$placeholder"
+              --output "$RUNNER_TEMP/release-metadata-$git_sync.json"
+            )
+            if [ "$git_sync" = with ]; then
+              args+=(--git-sync-image-digest "$placeholder")
+            fi
+            bash scripts/release-metadata-json.sh "${args[@]}"
+            bash scripts/validate-release-metadata.sh "$RUNNER_TEMP/release-metadata-$git_sync.json"
+          done
+
       - name: Run release metadata tests
         run: bash scripts/release-metadata_test.sh
 
@@ -57,6 +80,9 @@ jobs:
 
       - name: Run release-metadata.json tests
         run: bash scripts/validate-release-metadata_test.sh
+
+      - name: Run release-metadata.json reconcile tests
+        run: bash scripts/reconcile-release-metadata_test.sh
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
@@ -124,8 +150,10 @@ jobs:
 
   # The git-sync image is published on a best-effort basis. A failure here (including a failed
   # build) must never block the connector image, the chart, or the GitHub Release, so the job is
-  # marked continue-on-error and the publish job reads its outputs only when it succeeded. Tags
-  # are pushed only after a successful build; see scripts/reconcile-image-tags.sh.
+  # marked continue-on-error with a timeout, and the publish job decides from this job's
+  # validated digest output (not from the job result, which can read "success" for a failed
+  # continue-on-error job) whether the image was published. Tags are pushed only after a
+  # successful build; see scripts/reconcile-image-tags.sh.
   publish-gitsync:
     if: github.event_name == 'push'
     needs: verify
@@ -171,13 +199,12 @@ jobs:
             --dockerfile Dockerfile.gitsync \
             --release-id "$RELEASE_ID" \
             --release-commit "$RELEASE_COMMIT" \
-            --version-tag-last \
             --output "$result"
           cat "$result" >> "$GITHUB_OUTPUT"
 
-      - name: Report that the git-sync image was not published
+      - name: Report the git-sync failure
         if: failure()
-        run: echo "::warning::The git-sync image was not published for release $RELEASE_ID. The connector image, chart, and GitHub Release are not affected."
+        run: echo "::warning::The git-sync job failed for release $RELEASE_ID. The connector image, chart, and GitHub Release are not affected; the release metadata records the git-sync image as published only if this job exported a valid digest."
 
   publish:
     # Run even when the optional git-sync job failed, but not after a cancellation.
@@ -200,17 +227,20 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The git-sync image counts as published only when its job succeeded and reported a digest.
-      # GIT_SYNC_IMAGE and GIT_SYNC_IMAGE_DIGEST stay unset otherwise, and nothing about the
-      # connector release depends on them.
+      # The git-sync image counts as published only when its job exported a well-formed digest
+      # and the expected repository. The job result is logged but does not decide: with job-level
+      # continue-on-error it can read "success" for a failed job. GIT_SYNC_IMAGE and
+      # GIT_SYNC_IMAGE_DIGEST stay unset otherwise, and nothing about the connector release
+      # depends on them.
       - name: Resolve git-sync image publication
         run: |
           set -euo pipefail
-          if [ "$GIT_SYNC_RESULT" = success ] && [[ $GIT_SYNC_OUTPUT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] && [ -n "$GIT_SYNC_OUTPUT_IMAGE" ]; then
+          expected_image="$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/memento-gitsync"
+          if [[ $GIT_SYNC_OUTPUT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] && [ "$GIT_SYNC_OUTPUT_IMAGE" = "$expected_image" ]; then
             printf 'GIT_SYNC_IMAGE=%s\nGIT_SYNC_IMAGE_DIGEST=%s\n' "$GIT_SYNC_OUTPUT_IMAGE" "$GIT_SYNC_OUTPUT_DIGEST" >> "$GITHUB_ENV"
-            echo "git-sync image published: $GIT_SYNC_OUTPUT_IMAGE@$GIT_SYNC_OUTPUT_DIGEST"
+            echo "git-sync image published: $GIT_SYNC_OUTPUT_IMAGE@$GIT_SYNC_OUTPUT_DIGEST (job result: $GIT_SYNC_RESULT)"
           else
-            echo "::warning::The git-sync image was not published for release $RELEASE_ID (job result: $GIT_SYNC_RESULT). Continuing without it."
+            echo "::warning::The git-sync image is treated as not published for release $RELEASE_ID: the git-sync job exported no valid digest for $expected_image (job result: $GIT_SYNC_RESULT). Continuing without it."
           fi
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -349,8 +379,11 @@ jobs:
           printf 'CHART_DIGEST=%s\nCHART_URI=%s\n' "$final_digest" "$chart_uri" >> "$GITHUB_ENV"
 
       # Both image digests and the chart version are known only now, so the metadata file is
-      # generated here rather than in the verify job. An existing asset is never overwritten:
-      # it must be byte-identical to the regenerated file.
+      # generated here rather than in the verify job. An existing asset is kept when it is
+      # identical to the regenerated file. While the release is still a draft it may be replaced
+      # when only the git-sync fields differ (for example after the git-sync job was re-run), so
+      # that re-running all jobs cannot wedge the release; any other difference fails, and a
+      # published release is never changed.
       - name: Create or reconcile release-metadata.json asset
         env:
           GH_TOKEN: ${{ github.token }}
@@ -373,13 +406,17 @@ jobs:
           bash scripts/release-metadata-json.sh "${args[@]}"
           bash scripts/validate-release-metadata.sh "$work/generated/$asset"
 
-          asset_names=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          release_json=$(gh release view "$RELEASE_TAG" --json isDraft,assets)
+          is_draft=$(jq -r '.isDraft' <<<"$release_json")
+          asset_names=$(jq -r '.assets[].name' <<<"$release_json")
           if grep -Fxq "$asset" <<<"$asset_names"; then
             gh release download "$RELEASE_TAG" --pattern "$asset" --dir "$work/existing"
-            if ! cmp -s "$work/existing/$asset" "$work/generated/$asset"; then
-              echo "release asset $asset differs from the metadata regenerated for this run; refusing to overwrite it" >&2
-              diff -u "$work/existing/$asset" "$work/generated/$asset" >&2 || true
-              exit 1
+            # Prints "keep" or "replace", or fails on a conflict (see the script for the rules).
+            action=$(bash scripts/reconcile-release-metadata.sh \
+              --existing "$work/existing/$asset" --generated "$work/generated/$asset" --draft "$is_draft")
+            if [ "$action" = replace ]; then
+              echo "replacing $asset on draft release $RELEASE_TAG: only the git-sync fields differ"
+              gh release upload "$RELEASE_TAG" "$work/generated/$asset" --clobber
             fi
           else
             gh release upload "$RELEASE_TAG" "$work/generated/$asset"

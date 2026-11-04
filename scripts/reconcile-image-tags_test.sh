@@ -144,12 +144,10 @@ EOF
 chmod +x "$tmpdir/bin/aws" "$tmpdir/bin/docker"
 
 test_count=0
-# Extra reconcile.sh arguments for the current case (for example --version-tag-last).
-extra_args=()
 image="$registry/$repository"
 
-# The exact calls the API connector release has always made, in order. aws_call and the push
-# expectations below pin the original behaviour: version tag first, then the commit tag.
+# The exact calls the release has always made, in order. aws_call and the push expectations
+# below pin the original behaviour: version tag first, then the commit tag.
 aws_call() {
   printf 'aws ecr-public describe-images --region us-east-1 --repository-name %s --image-ids imageTag=%s --output json\n' "$repository" "$1"
 }
@@ -180,8 +178,7 @@ run_reconcile() {
     --release-id "$release_id" \
     --release-commit "$release_commit" \
     --output "$case_dir/out.env" \
-    --context "$case_dir" \
-    ${extra_args[@]+"${extra_args[@]}"}
+    --context "$case_dir"
 }
 
 expect_success() {
@@ -218,7 +215,7 @@ grep -qx "image=$registry/$repository" "$case_dir/out.env"
 grep -qx "image_digest=$(registry_digest "$version_tag")" "$case_dir/out.env"
 test "$(grep -c '^build ' "$case_dir/log")" -eq 1
 log_has "^build --file $case_dir/Dockerfile.example --build-arg VERSION=$release_id --build-arg REVISION=$release_commit "
-# Default order, identical to the API connector's original behaviour: the release tag is pushed
+# Original order, unchanged since the first release: the release tag is pushed
 # first, then the commit tag, between the lookups before and after. The whole call sequence is
 # compared, not just the pushes.
 {
@@ -304,9 +301,9 @@ registry_lacks "$commit_tag"
 log_lacks '^push '
 unset FAKE_BUILD_FAIL
 
-# 9. Default order (API connector): the release tag is pushed first, so a failed push of the
+# 9. The release tag is pushed first, so a failed push of the
 # commit tag leaves a complete release tag behind, and a rerun completes the release from it.
-new_case default-order-commit-push-failure
+new_case commit-push-failure
 FAKE_PUSH_FAIL_TAG=$commit_tag expect_failure
 registry_has "$version_tag"
 registry_lacks "$commit_tag"
@@ -318,97 +315,51 @@ test "$(registry_digest "$version_tag")" = "$(registry_digest "$commit_tag")"
 log_lacks '^build '
 log_lacks '^push '
 
-new_case default-order-version-push-failure
+new_case version-push-failure
 FAKE_PUSH_FAIL_TAG=$version_tag expect_failure
 registry_lacks "$version_tag"
 registry_lacks "$commit_tag"
 unset FAKE_PUSH_FAIL_TAG
 
-# 10. --version-tag-last (git-sync image): the commit tag is pushed first and the release tag
-# last, so no push failure can leave a release tag behind.
-extra_args=(--version-tag-last)
-new_case last-order-fresh
+# 10. Recovery from a partial release makes exactly these calls: no build and no push.
+new_case recover-version-only
+seed "$version_tag" sha256:aaaa "$release_id" "$release_commit"
 expect_success
 {
   aws_call "$version_tag"
   aws_call "$commit_tag"
-  build_call
-  printf 'push %s:%s\n' "$image" "$commit_tag"
-  printf 'push %s:%s\n' "$image" "$version_tag"
+  printf 'pull %s:%s\n' "$image" "$version_tag"
+  printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$version_tag"
+  printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$version_tag"
+  printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:aaaa\n' "$image" "$commit_tag" "$image"
   aws_call "$version_tag"
   aws_call "$commit_tag"
 } >"$case_dir/expected-calls"
 cmp "$case_dir/expected-calls" "$case_dir/log"
-grep -qx "image_digest=$(registry_digest "$version_tag")" "$case_dir/out.env"
 
-new_case last-order-commit-push-failure
-FAKE_PUSH_FAIL_TAG=$commit_tag expect_failure
-registry_lacks "$version_tag"
-registry_lacks "$commit_tag"
-log_lacks "^push .*:$version_tag\$"
-unset FAKE_PUSH_FAIL_TAG
-
-new_case last-order-version-push-failure
-FAKE_PUSH_FAIL_TAG=$version_tag expect_failure
-registry_lacks "$version_tag"
-registry_has "$commit_tag"
-unset FAKE_PUSH_FAIL_TAG
-: >"$case_dir/log"
+new_case recover-commit-only
+seed "$commit_tag" sha256:bbbb "$release_id" "$release_commit"
 expect_success
-registry_has "$version_tag"
-test "$(registry_digest "$version_tag")" = "$(registry_digest "$commit_tag")"
-log_lacks '^build '
-log_lacks '^push '
+{
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+  printf 'pull %s:%s\n' "$image" "$commit_tag"
+  printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$commit_tag"
+  printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$commit_tag"
+  printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:bbbb\n' "$image" "$version_tag" "$image"
+  aws_call "$version_tag"
+  aws_call "$commit_tag"
+} >"$case_dir/expected-calls"
+cmp "$case_dir/expected-calls" "$case_dir/log"
 
-new_case last-order-build-failure
-FAKE_BUILD_FAIL=1 expect_failure
-registry_lacks "$version_tag"
-registry_lacks "$commit_tag"
-log_lacks '^push '
-unset FAKE_BUILD_FAIL
-
-# 11. Recovery from a partial or complete release makes the same calls in either order, and
-# never builds or pushes.
-for mode in default last; do
-  if [ "$mode" = last ]; then extra_args=(--version-tag-last); else extra_args=(); fi
-
-  new_case "recover-version-only-$mode"
-  seed "$version_tag" sha256:aaaa "$release_id" "$release_commit"
-  expect_success
-  {
-    aws_call "$version_tag"
-    aws_call "$commit_tag"
-    printf 'pull %s:%s\n' "$image" "$version_tag"
-    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$version_tag"
-    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$version_tag"
-    printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:aaaa\n' "$image" "$commit_tag" "$image"
-    aws_call "$version_tag"
-    aws_call "$commit_tag"
-  } >"$case_dir/expected-calls"
-  cmp "$case_dir/expected-calls" "$case_dir/log"
-
-  new_case "recover-commit-only-$mode"
-  seed "$commit_tag" sha256:bbbb "$release_id" "$release_commit"
-  expect_success
-  {
-    aws_call "$version_tag"
-    aws_call "$commit_tag"
-    printf 'pull %s:%s\n' "$image" "$commit_tag"
-    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.version" }}\n' "$image" "$commit_tag"
-    printf 'inspect %s:%s --format {{ index .Config.Labels "org.opencontainers.image.revision" }}\n' "$image" "$commit_tag"
-    printf 'buildx imagetools create --prefer-index=false --tag %s:%s %s@sha256:bbbb\n' "$image" "$version_tag" "$image"
-    aws_call "$version_tag"
-    aws_call "$commit_tag"
-  } >"$case_dir/expected-calls"
-  cmp "$case_dir/expected-calls" "$case_dir/log"
-
-  new_case "recover-conflict-$mode"
-  seed "$version_tag" sha256:dddd "$release_id" "$release_commit"
-  seed "$commit_tag" sha256:eeee "$release_id" "$release_commit"
-  expect_failure
-  log_lacks '^(build|push|buildx) '
-done
-extra_args=()
+new_case recover-conflict
+seed "$version_tag" sha256:dddd "$release_id" "$release_commit"
+seed "$commit_tag" sha256:eeee "$release_id" "$release_commit"
+expect_failure
+log_lacks '^(build|push|buildx) '
+# Both digests are reported so the conflict can be diagnosed from the log.
+grep -Fq "sha256:dddd" "$case_dir/stderr"
+grep -Fq "sha256:eeee" "$case_dir/stderr"
 
 # 12. A registry error other than "not found" stops the run before anything is built or pushed.
 new_case registry-denied
