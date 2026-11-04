@@ -46,11 +46,43 @@ jobs:
           git checkout --detach "$RELEASE_TAG^{commit}"
           bash scripts/release-metadata.sh --repo . --tag "$RELEASE_TAG" --main-ref origin/main --output "$GITHUB_OUTPUT"
 
+      # Fail before anything is pushed if the real release ID or chart version could not be
+      # written to release-metadata.json. The digests here are placeholders.
+      - name: Validate release-metadata.json for this release
+        env:
+          RELEASE_ID: ${{ steps.metadata.outputs.release_id }}
+          CHART_VERSION: ${{ steps.metadata.outputs.chart_version }}
+        run: |
+          set -euo pipefail
+          placeholder="sha256:$(printf '0%.0s' {1..64})"
+          for git_sync in with without; do
+            args=(
+              --release-id "$RELEASE_ID"
+              --chart-version "$CHART_VERSION"
+              --connector-image-digest "$placeholder"
+              --output "$RUNNER_TEMP/release-metadata-$git_sync.json"
+            )
+            if [ "$git_sync" = with ]; then
+              args+=(--git-sync-image-digest "$placeholder")
+            fi
+            bash scripts/release-metadata-json.sh "${args[@]}"
+            bash scripts/validate-release-metadata.sh "$RUNNER_TEMP/release-metadata-$git_sync.json"
+          done
+
       - name: Run release metadata tests
         run: bash scripts/release-metadata_test.sh
 
       - name: Run ECR Public lookup tests
         run: bash scripts/ecr-public-image-digest_test.sh
+
+      - name: Run image tag reconcile tests
+        run: bash scripts/reconcile-image-tags_test.sh
+
+      - name: Run release-metadata.json tests
+        run: bash scripts/validate-release-metadata_test.sh
+
+      - name: Run release-metadata.json reconcile tests
+        run: bash scripts/reconcile-release-metadata_test.sh
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
@@ -118,10 +150,72 @@ jobs:
           path: dist
           if-no-files-found: error
           retention-days: 7
+          # "Re-run all jobs" creates a new attempt of the same run, whose verify job uploads
+          # the same artifact name again; without this the upload fails on the earlier one.
+          overwrite: true
 
-  publish:
+  # The git-sync image is published on a best-effort basis. A failure here (including a failed
+  # build) must never block the connector image, the chart, or the GitHub Release, so the job is
+  # marked continue-on-error with a timeout, and the publish job decides from this job's
+  # validated digest output (not from the job result, which can read "success" for a failed
+  # continue-on-error job) whether the image was published. Tags are pushed only after a
+  # successful build; see scripts/reconcile-image-tags.sh.
+  publish-gitsync:
     if: github.event_name == 'push'
     needs: verify
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.reconcile.outputs.image }}
+      image_digest: ${{ steps.reconcile.outputs.image_digest }}
+    env:
+      RELEASE_ID: ${{ needs.verify.outputs.release_id }}
+      RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
+      ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Validate registry configuration
+        run: |
+          if [ -z "$ECR_PUBLIC_ALIAS" ]; then
+            echo "ECR_PUBLIC_ALIAS repository variable is required" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker registry
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+
+      - id: reconcile
+        name: Reconcile git-sync image tags
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/gitsync-image.env"
+          bash scripts/reconcile-image-tags.sh \
+            --registry "$ECR_REGISTRY/$ECR_PUBLIC_ALIAS" \
+            --repository memento-gitsync \
+            --dockerfile Dockerfile.gitsync \
+            --release-id "$RELEASE_ID" \
+            --release-commit "$RELEASE_COMMIT" \
+            --output "$result"
+          cat "$result" >> "$GITHUB_OUTPUT"
+
+      - name: Report the git-sync failure
+        if: failure()
+        run: echo "::warning::The git-sync job failed for release $RELEASE_ID. The connector image, chart, and GitHub Release are not affected; the release metadata records the git-sync image as published only if this job exported a valid digest."
+
+  publish:
+    # Run even when the optional git-sync job failed, but not after a cancellation.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && github.event_name == 'push' }}
+    needs: [verify, publish-gitsync]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -133,8 +227,27 @@ jobs:
       ASSET_NAME: ${{ needs.verify.outputs.asset_name }}
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
+      GIT_SYNC_RESULT: ${{ needs.publish-gitsync.result }}
+      GIT_SYNC_OUTPUT_IMAGE: ${{ needs.publish-gitsync.outputs.image }}
+      GIT_SYNC_OUTPUT_DIGEST: ${{ needs.publish-gitsync.outputs.image_digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The git-sync image counts as published only when its job exported a well-formed digest
+      # and the expected repository. The job result is logged but does not decide: with job-level
+      # continue-on-error it can read "success" for a failed job. GIT_SYNC_IMAGE and
+      # GIT_SYNC_IMAGE_DIGEST stay unset otherwise, and nothing about the connector release
+      # depends on them.
+      - name: Resolve git-sync image publication
+        run: |
+          set -euo pipefail
+          expected_image="$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/memento-gitsync"
+          if [[ $GIT_SYNC_OUTPUT_DIGEST =~ ^sha256:[0-9a-f]{64}$ ]] && [ "$GIT_SYNC_OUTPUT_IMAGE" = "$expected_image" ]; then
+            printf 'GIT_SYNC_IMAGE=%s\nGIT_SYNC_IMAGE_DIGEST=%s\n' "$GIT_SYNC_OUTPUT_IMAGE" "$GIT_SYNC_OUTPUT_DIGEST" >> "$GITHUB_ENV"
+            echo "git-sync image published: $GIT_SYNC_OUTPUT_IMAGE@$GIT_SYNC_OUTPUT_DIGEST (job result: $GIT_SYNC_RESULT)"
+          else
+            echo "::warning::The git-sync image is treated as not published for release $RELEASE_ID: the git-sync job exported no valid digest for $expected_image (job result: $GIT_SYNC_RESULT). Continuing without it."
+          fi
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -226,57 +339,17 @@ jobs:
       - name: Reconcile release image tags
         run: |
           set -euo pipefail
-          image="$ECR_REGISTRY/$ECR_PUBLIC_ALIAS/memento-connector"
-          version_tag="$RELEASE_ID"
-          commit_tag="sha-$RELEASE_COMMIT"
-
-          lookup_digest() {
-            bash scripts/ecr-public-image-digest.sh --repository memento-connector --tag "$1"
-          }
-
-          verify_labels() {
-            docker pull "$image:$1" >/dev/null
-            version=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')
-            revision=$(docker inspect "$image:$1" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')
-            [ "$version" = "$RELEASE_ID" ] && [ "$revision" = "$RELEASE_COMMIT" ]
-          }
-
-          if version_digest=$(lookup_digest "$version_tag"); then
-            version_exists=true
-          else
-            status=$?
-            [ "$status" -eq 3 ] || exit "$status"
-            version_exists=false
-            version_digest=
-          fi
-          if commit_digest=$(lookup_digest "$commit_tag"); then
-            commit_exists=true
-          else
-            status=$?
-            [ "$status" -eq 3 ] || exit "$status"
-            commit_exists=false
-            commit_digest=
-          fi
-
-          if ! "$version_exists" && ! "$commit_exists"; then
-            docker build --build-arg VERSION="$RELEASE_ID" --build-arg REVISION="$RELEASE_COMMIT" -t "$image:$version_tag" -t "$image:$commit_tag" .
-            docker push "$image:$version_tag"
-            docker push "$image:$commit_tag"
-          elif "$version_exists" && ! "$commit_exists"; then
-            verify_labels "$version_tag"
-            docker buildx imagetools create --prefer-index=false --tag "$image:$commit_tag" "$image@$version_digest"
-          elif ! "$version_exists" && "$commit_exists"; then
-            verify_labels "$commit_tag"
-            docker buildx imagetools create --prefer-index=false --tag "$image:$version_tag" "$image@$commit_digest"
-          else
-            verify_labels "$version_tag"
-            verify_labels "$commit_tag"
-          fi
-
-          version_digest=$(lookup_digest "$version_tag")
-          commit_digest=$(lookup_digest "$commit_tag")
-          [ -n "$version_digest" ] && [ "$version_digest" = "$commit_digest" ]
-          printf 'IMAGE_DIGEST=%s\nIMAGE=%s\n' "$version_digest" "$image" >> "$GITHUB_ENV"
+          result="$RUNNER_TEMP/connector-image.env"
+          bash scripts/reconcile-image-tags.sh \
+            --registry "$ECR_REGISTRY/$ECR_PUBLIC_ALIAS" \
+            --repository memento-connector \
+            --dockerfile Dockerfile \
+            --release-id "$RELEASE_ID" \
+            --release-commit "$RELEASE_COMMIT" \
+            --output "$result"
+          # shellcheck disable=SC1090
+          source "$result"
+          printf 'IMAGE_DIGEST=%s\nIMAGE=%s\n' "$image_digest" "$image" >> "$GITHUB_ENV"
 
       - name: Reconcile Helm chart
         run: |
@@ -311,6 +384,57 @@ jobs:
           [ -n "$final_digest" ]
           printf 'CHART_DIGEST=%s\nCHART_URI=%s\n' "$final_digest" "$chart_uri" >> "$GITHUB_ENV"
 
+      # Both image digests and the chart version are known only now, so the metadata file is
+      # generated here rather than in the verify job. An existing asset is kept when it is
+      # identical to the regenerated file. While the release is still a draft it may be replaced
+      # when only the git-sync fields differ (for example after the git-sync job was re-run), so
+      # that re-running all jobs cannot wedge the release; any other difference fails, and a
+      # published release is never changed.
+      - name: Create or reconcile release-metadata.json asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset=release-metadata.json
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          mkdir "$work/generated" "$work/existing"
+
+          args=(
+            --release-id "$RELEASE_ID"
+            --chart-version "$CHART_VERSION"
+            --connector-image-digest "$IMAGE_DIGEST"
+            --output "$work/generated/$asset"
+          )
+          if [ -n "${GIT_SYNC_IMAGE_DIGEST-}" ]; then
+            args+=(--git-sync-image-digest "$GIT_SYNC_IMAGE_DIGEST")
+          fi
+          bash scripts/release-metadata-json.sh "${args[@]}"
+          bash scripts/validate-release-metadata.sh "$work/generated/$asset"
+
+          release_json=$(gh release view "$RELEASE_TAG" --json isDraft,assets)
+          is_draft=$(jq -r '.isDraft' <<<"$release_json")
+          asset_names=$(jq -r '.assets[].name' <<<"$release_json")
+          if grep -Fxq "$asset" <<<"$asset_names"; then
+            gh release download "$RELEASE_TAG" --pattern "$asset" --dir "$work/existing"
+            # Prints "keep" or "replace", or fails on a conflict (see the script for the rules).
+            action=$(bash scripts/reconcile-release-metadata.sh \
+              --existing "$work/existing/$asset" --generated "$work/generated/$asset" --draft "$is_draft")
+            case "$action" in
+              keep) ;;
+              replace)
+                echo "replacing $asset on draft release $RELEASE_TAG: only the git-sync fields differ"
+                gh release upload "$RELEASE_TAG" "$work/generated/$asset" --clobber
+                ;;
+              *)
+                echo "unexpected release metadata action: $action" >&2
+                exit 1
+                ;;
+            esac
+          else
+            gh release upload "$RELEASE_TAG" "$work/generated/$asset"
+          fi
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -318,10 +442,12 @@ jobs:
           set -euo pipefail
           package="mkonnect-$CHART_VERSION.tgz"
           checksum="$package.sha256"
+          metadata=release-metadata.json
           verify_dir=$(mktemp -d)
           trap 'rm -rf "$verify_dir"' EXIT
-          gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --dir "$verify_dir"
+          gh release download "$RELEASE_TAG" --pattern "$package" --pattern "$checksum" --pattern "$metadata" --dir "$verify_dir"
           (cd "$verify_dir" && sha256sum -c "$checksum")
+          bash scripts/validate-release-metadata.sh "$verify_dir/$metadata"
 
           generated_notes=$(mktemp)
           gh release view "$RELEASE_TAG" --json body --jq .body >"$generated_notes"
@@ -332,9 +458,17 @@ jobs:
             printf '%s\n' "- Container image: $IMAGE:$RELEASE_ID"
             printf '%s\n' "- Container image digest: $IMAGE_DIGEST"
             printf '%s\n' "- Commit image tag: $IMAGE:sha-$RELEASE_COMMIT"
+            if [ -n "${GIT_SYNC_IMAGE_DIGEST-}" ]; then
+              printf '%s\n' "- Git-sync container image: $GIT_SYNC_IMAGE:$RELEASE_ID"
+              printf '%s\n' "- Git-sync container image digest: $GIT_SYNC_IMAGE_DIGEST"
+              printf '%s\n' "- Git-sync commit image tag: $GIT_SYNC_IMAGE:sha-$RELEASE_COMMIT"
+            else
+              printf '%s\n' '- The git-sync image was not published for this release; the git-sync fields in release-metadata.json are null.'
+            fi
             printf '%s\n' "- Helm chart: $CHART_URI:$CHART_VERSION"
             printf '%s\n' "- Helm chart digest: $CHART_DIGEST"
-            printf '%s\n\n' "- Chart SHA-256: $chart_sha"
+            printf '%s\n' "- Chart SHA-256: $chart_sha"
+            printf '%s\n\n' "- Release metadata: $metadata (attached to this release)"
             printf '%s\n\n' 'Install the chart with:'
             printf '%s\n\n' "    helm install mkonnect $CHART_URI --version $CHART_VERSION -f mkonnect-secrets.yaml --set image.repository=$IMAGE"
             cat "$generated_notes"
