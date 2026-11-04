@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/memento-knowledge/mkonnect/internal/proto"
@@ -64,6 +65,9 @@ type repoState struct {
 	canonicalURL string // validated, re-serialized origin URL the sync dials, "" when unmatched
 	expiresAt    string // push_token_expires_at (RFC3339), "" when none
 	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+	// target fingerprints the origin and replica this repository replicates between (see
+	// targetFingerprint), whether or not it can currently be synced.
+	target string
 
 	replicaURL string // validated, re-serialized https replica URL, "" when unmatched or unusable
 	pushToken  Secret // platform push token for replicaURL; empty exactly when replicaURL is
@@ -71,6 +75,9 @@ type repoState struct {
 	// unusable. A zero State means no outcome yet, which is reported as pending.
 	result  syncResult
 	syncing bool // a sync is queued or running
+	// attemptStartedAt is when the attempt now running began, and zero while none is: a queued
+	// repository has not started one. It is in memory only; only finished attempts are persisted.
+	attemptStartedAt time.Time
 }
 
 // errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
@@ -145,20 +152,25 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		// (loaded at startup, no live reload), so the result is stable until the next config and
 		// need not be recomputed on every status. The origin is parsed once: its canonical host key
 		// selects the provider and its canonical URL is retained for the sync to dial.
-		var provider, canonicalURL string
+		var provider, canonicalURL, originURL string
 		matched := false
-		if c.local != nil {
-			if hostKey, fullURL, err := canonicalRemoteURL(r.OriginURL); err == nil {
+		if hostKey, fullURL, err := canonicalRemoteURL(r.OriginURL); err == nil {
+			originURL = fullURL
+			if c.local != nil {
 				if name, _, ok := c.local.matchByHostKey(hostKey); ok {
 					provider, canonicalURL, matched = name, fullURL, true
 				}
 			}
 		}
-		st := repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
+		replicaURL, replicaOK := validReplicaURL(r.ReplicaPushURL)
+		st := repoState{
+			repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched,
+			target: targetFingerprint(originURL, replicaURL),
+		}
 		if matched {
 			// A bad replica fails this one repository, not the whole message: the others are
 			// independent and halting them all would be disproportionate.
-			if replicaURL, ok := validReplicaURL(r.ReplicaPushURL); ok && validPushToken(r.PushToken) {
+			if replicaOK && validPushToken(r.PushToken) {
 				st.replicaURL, st.pushToken = replicaURL, r.PushToken
 			} else {
 				st.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
@@ -179,15 +191,41 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 				st.result = old.result
 			}
 			st.syncing = old.syncing
+			st.attemptStartedAt = old.attemptStartedAt
 			next[id] = st
 		}
 	}
 	c.repos = next
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
+	runsChanged := c.reconcileRunsLocked(next)
 	c.mu.Unlock()
+	if runsChanged {
+		c.markRunsDirty()
+	}
 	slog.Info("git_sync_config accepted", "repo_count", len(next))
 	return true
+}
+
+// reconcileRunsLocked brings the run records in line with an accepted configuration and reports
+// whether any changed. A record made against a different origin or replica than the repository now
+// has (including one loaded from before a restart) describes a different replication: a success is
+// about the replica that was pushed to, so it is dropped, whether or not the repository can currently
+// be synced. A repository that cannot be synced but whose origin and replica are unchanged (for
+// example its provider was removed locally) keeps its record, since the replica still holds what was
+// last pushed. Records of repositories the configuration no longer lists are pruned, except when it
+// lists none at all: an empty set is far likelier a platform mishap than a decision to forget every
+// success. c.mu must be held.
+func (c *Client) reconcileRunsLocked(next map[string]repoState) bool {
+	changed := false
+	for id, rec := range c.runs {
+		st, listed := next[id]
+		if (len(next) > 0 && !listed) || (listed && rec.Target != st.target) {
+			delete(c.runs, id)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // cloneRaw copies a RawMessage so the stored/echoed value does not alias a decoder's buffer.

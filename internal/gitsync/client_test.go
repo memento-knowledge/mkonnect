@@ -109,7 +109,8 @@ func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, 
 func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time, opts ...gitsync.Option) *gitsync.Client {
 	t.Helper()
 	gate := make(chan struct{})
-	t.Cleanup(func() { close(gate) })
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
 	defaults := []gitsync.Option{
 		gitsync.WithMirrorsRoot(t.TempDir()),
 		gitsync.WithStatusInterval(10 * time.Millisecond),
@@ -133,7 +134,18 @@ func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, n
 		t.Fatalf("load local config: %v", err)
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
-	return gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
+	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
+	// A finishing sync saves the run state under the mirrors root, after the test may already have
+	// returned. This is registered after the temp dirs, so it runs before they are removed: it releases
+	// the default runner and waits for the syncs to end, so nothing writes into a directory being
+	// deleted.
+	t.Cleanup(func() {
+		release()
+		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.Wait(wctx)
+	})
+	return c
 }
 
 // latestOriginCheck returns the origin_check from the most recent status that carried one.

@@ -22,6 +22,10 @@ type syncHooks struct {
 	// begin marks the repository as syncing (queued or running). It runs synchronously inside
 	// enqueue, so a status built right after enqueue returns already reports it.
 	begin func(repoID string)
+	// started records that the attempt for repoID is now running, beginning at the given time. It runs
+	// once a concurrency slot is held, immediately before the sync, so a repository that is merely
+	// queued has no attempt in flight. May be nil.
+	started func(repoID string, t syncTask, at time.Time)
 	// finish records the outcome and clears the syncing mark. A pending result means the sync was
 	// cancelled and nothing should be recorded. The implementation must ignore a task whose target
 	// no longer matches the repository's current configuration.
@@ -134,11 +138,18 @@ func (m *manager) runOnce(ctx context.Context, id string) {
 		m.hooks.changed()
 		return
 	}
-	start := time.Now()
+	// The attempt is timed with the injected clock (which carries the monotonic reading in
+	// production), so its start and duration are what the status reports.
+	start := m.deps.now()
+	if m.hooks.started != nil {
+		m.hooks.started(id, task, start)
+	}
 	res := syncRepo(ctx, m.deps, task)
+	res.Stats.StartedAt = start
+	res.Stats.Duration = m.deps.now().Sub(start)
 	m.hooks.finish(id, task, res)
 	if res.State != StatePending {
-		logOutcome(id, res, time.Since(start))
+		logOutcome(id, res, res.Stats.Duration)
 		m.hooks.changed()
 	}
 }

@@ -13,11 +13,13 @@
     {
       "repo_id": "repo-a",
       "state": "pending",
-      "origin_default_branch": "main"
+      "origin_default_branch": "main",
+      "last_success_at": null
     },
     {
       "repo_id": "repo-b",
       "state": "error",
+      "last_success_at": null,
       "error_type": "origin_access_denied",
       "error_detail": "host not configured locally"
     },
