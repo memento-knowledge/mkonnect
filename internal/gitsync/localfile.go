@@ -34,7 +34,9 @@ var fchmod = func(f *os.File, mode os.FileMode) error { return f.Chmod(mode) }
 // Advisory only (a warning, never a rejection): the file is owned by someone other than the running
 // user or root, or its directory lets other users rename entries within it.
 func readSecureFile(path, what string, maxSize int64) ([]byte, error) {
-	f, err := os.Open(path)
+	// O_NONBLOCK so that opening a FIFO (or a symlink to one) returns at once instead of waiting for
+	// a writer; the regular-file check below then rejects it. It has no effect on a regular file.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}

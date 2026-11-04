@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestForeignOwner(t *testing.T) {
@@ -152,5 +154,35 @@ func TestReadSecureFileWarnsAboutWorldWritableDirectory(t *testing.T) {
 	}
 	if quiet.String() != "" {
 		t.Errorf("a private directory and own file should not warn, got %q", quiet.String())
+	}
+}
+
+// Opening a FIFO for reading blocks until a writer appears; the file must be rejected as not
+// regular without ever waiting for one.
+func TestReadSecureFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(fifo, link); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range []string{fifo, link} {
+		done := make(chan error, 1)
+		go func() {
+			_, err := readSecureFile(p, "test file", 1024)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Errorf("%s: want a not-a-regular-file error, got %v", filepath.Base(p), err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: readSecureFile blocked on a FIFO", filepath.Base(p))
+		}
 	}
 }
