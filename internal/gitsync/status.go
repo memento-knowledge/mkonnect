@@ -15,8 +15,8 @@ const (
 	// statusWriteTimeout bounds the connection-time status write, before the heartbeat exists to
 	// tear down a wedged connection.
 	statusWriteTimeout = 30 * time.Second
-	// dispatchStatusTimeout bounds a status write made from the read loop or a probe goroutine,
-	// whose context is the process-lifetime Connect context.
+	// dispatchStatusTimeout bounds a status write made from the read loop, a sync completion or a
+	// probe goroutine, whose context carries no per-write bound of its own.
 	dispatchStatusTimeout = 10 * time.Second
 	// rfc3339Nano is a fixed-width RFC3339 layout that always carries a sub-second fraction, so
 	// sent_at is stable even when the nanosecond component is zero.

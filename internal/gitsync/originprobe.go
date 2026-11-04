@@ -12,7 +12,7 @@ import (
 // originCheckInterval is the minimum spacing between origin reachability probes once a configuration
 // has been accepted. Before that the probe runs at the gateway health cadence, so setup feedback is
 // quick; afterwards the result only needs to stay fresh, and a probe is a git subprocess talking to
-// the customer's origin.
+// the origin.
 const originCheckInterval = 5 * time.Minute
 
 // maybeProbe launches an origin reachability probe on a goroutine if the connector has at least one
@@ -23,7 +23,8 @@ const originCheckInterval = 5 * time.Minute
 // refresh is not killed the instant OnHeartbeat returns. The throttle applies to every attempt —
 // including failed ones — so a persistent local fault (e.g. git missing) does not exec git on every
 // heartbeat. A probe cancelled by a closing connection is never cached, leaves any earlier result in
-// place, and does not count against the cadence, so the next connection probes again.
+// place, and does not count against the cadence, so the next connection probes at its first
+// opportunity.
 func (c *Client) maybeProbe() {
 	c.mu.Lock()
 	accepted := c.configAccepted
@@ -44,7 +45,11 @@ func (c *Client) maybeProbe() {
 		return
 	}
 	start := c.now().UnixNano()
-	if time.Duration(start-c.lastProbe.Load()) < spacing {
+	// Heartbeats do not arrive at exactly the health interval, so a probe is due a tenth early; a
+	// tick that lands just under the spacing would otherwise push the probe out to the next one.
+	// A negative gap means the clock stepped back, which must not stall the cadence until it
+	// catches up: it counts as elapsed.
+	if since := time.Duration(start - c.lastProbe.Load()); since >= 0 && since < spacing-spacing/10 {
 		c.probing.Store(false)
 		return
 	}

@@ -151,8 +151,8 @@ type GitSyncStatusMsg struct {
 	// one: it is re-checked about every 30 seconds until a configuration is accepted and about every
 	// 5 minutes afterwards, and its checked_at says when. It is absent when no local provider is
 	// configured (there is nothing to check), when the connector could not run the check (for
-	// example git is not installed, which says nothing about the origin), and in the first status
-	// after connecting until the first check finishes.
+	// example git is not installed, which says nothing about the origin), and in the statuses
+	// sent after the connector starts until the first check finishes.
 	OriginCheck *OriginCheck `json:"origin_check,omitempty"`
 	// Repositories is the per-repository state; always a (possibly empty) array, never null.
 	Repositories []GitSyncRepoStatus `json:"repositories"`

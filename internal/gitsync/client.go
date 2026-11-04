@@ -227,9 +227,10 @@ func (c *Client) OnHandshake(info gateway.HandshakeInfo) {
 	}
 }
 
-// OnConnected sends an immediate status (so the platform sees the connector promptly) and starts a
-// origin reachability probe off the connection goroutine; the probe's result arrives in
-// a later status, so the first write is never blocked on the network. The connection context and
+// OnConnected sends an immediate status (so the platform sees the connector promptly) carrying the
+// last origin check, if any, and starts a new origin reachability probe off the connection
+// goroutine if the cadence allows; its result arrives in a later status, so the first write is
+// never blocked on the network. The connection context and
 // sender are captured so a later heartbeat-triggered probe runs under the connection's lifetime.
 func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
 	c.mu.Lock()

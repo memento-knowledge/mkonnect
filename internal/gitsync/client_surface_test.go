@@ -105,6 +105,10 @@ func TestOutOfRangeLimitsRejectTheWholeConfig(t *testing.T) {
 			// Unmatched hosts keep the repositories out of the sync engine.
 			c.HandleMessage(ctx, s, "git_sync_config", withExtras(configJSON("1", [3]string{"repo-a", "https://other.example.com/a", ""}), `"schedule":{"interval_seconds":120}`))
 			before := len(s.messages())
+			previous := c.EffectiveLimitsForTest()
+			if previous.Interval != 2*time.Minute {
+				t.Fatalf("setup: interval = %v, want 2m", previous.Interval)
+			}
 
 			bad := withExtras(configJSON("2", [3]string{"repo-b", "https://other.example.com/b", ""}), extras...)
 			c.HandleMessage(ctx, s, "git_sync_config", bad)
@@ -112,8 +116,8 @@ func TestOutOfRangeLimitsRejectTheWholeConfig(t *testing.T) {
 			if n := len(s.messages()); n != before {
 				t.Errorf("a rejected config sent %d new messages, want none", n-before)
 			}
-			if got := c.EffectiveLimitsForTest().Interval; got != 2*time.Minute {
-				t.Errorf("interval = %v after a rejected config, want the previous 2m", got)
+			if got := c.EffectiveLimitsForTest(); got != previous {
+				t.Errorf("effective limits = %+v after a rejected config, want the previous %+v", got, previous)
 			}
 			if err := c.OnHeartbeat(ctx, s); err != nil {
 				t.Fatalf("OnHeartbeat: %v", err)
@@ -137,6 +141,31 @@ func withExtras(raw json.RawMessage, extras ...string) json.RawMessage {
 		s += "," + e
 	}
 	return json.RawMessage(s + "}")
+}
+
+// Limits belong to the configuration they arrived with: valid limits in a configuration that is
+// rejected for another reason must not take effect alongside the previous repositories.
+func TestLimitsOfAConfigRejectedForAnotherReasonDoNotApply(t *testing.T) {
+	good := func(id string) string {
+		return repoJSON(id, "https://other.example.com/"+id, "", "https://replica.example.com/r/x.git", testPushToken)
+	}
+	for name, raw := range map[string]json.RawMessage{
+		"invalid repo_id": withExtras(configJSONRaw("2", repoJSON("bad id", "https://other.example.com/x", "", "", "")), `"schedule":{"interval_seconds":600}`),
+		"duplicate repo_id": withExtras(configJSONRaw("2", good("repo-b"), good("repo-b")),
+			`"schedule":{"interval_seconds":600}`, `"limits":{"max_concurrency":8}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClient(t, oneProvider)
+			s := &stubSender{}
+			c.HandleMessage(context.Background(), s, "git_sync_config", withExtras(configWithExtras("1"), `"schedule":{"interval_seconds":120}`))
+			previous := c.EffectiveLimitsForTest()
+
+			c.HandleMessage(context.Background(), s, "git_sync_config", raw)
+			if got := c.EffectiveLimitsForTest(); got != previous {
+				t.Errorf("effective limits = %+v after a rejected config, want the previous %+v", got, previous)
+			}
+		})
+	}
 }
 
 func TestSuspendedFollowsTheCriticalUpdateGate(t *testing.T) {
@@ -259,16 +288,18 @@ func TestOriginCheckRefreshedEveryIntervalAfterConfigAccepted(t *testing.T) {
 	if hb := heartbeat(t, c, s); hb.OriginCheck == nil || hb.OriginCheck.Result != "unreachable" {
 		t.Errorf("origin_check = %+v, want the earlier unreachable result", hb.OriginCheck)
 	}
-	// Just short of the interval, still nothing.
-	clk.advance(gitsync.OriginCheckIntervalForTest - gateway.DefaultHeartbeatInterval - 2*time.Second)
+	// Heartbeats arrive a little unevenly, so the interval is met with a tenth to spare; just short
+	// of that, still nothing.
+	due := gitsync.OriginCheckIntervalForTest - gitsync.OriginCheckIntervalForTest/10
+	clk.advance(due - gateway.DefaultHeartbeatInterval - 2*time.Second)
 	heartbeat(t, c, s)
 	waitProbeDone(t, c)
 	if n := prober.calls.Load(); n != 1 {
 		t.Fatalf("probe ran %d times before the interval elapsed, want 1", n)
 	}
 
-	// At the interval it runs again and the new result replaces the old one.
-	clk.advance(time.Second)
+	// Once due it runs again and the new result replaces the old one.
+	clk.advance(2 * time.Second)
 	heartbeat(t, c, s)
 	waitFor(t, func() bool {
 		oc := latestOriginCheck(s.messages())
@@ -303,8 +334,9 @@ func TestOriginCheckAbsentWithoutLocalProvidersAfterConfig(t *testing.T) {
 // A local fault (for example git is not installed) says nothing about the origin, so it is logged
 // and origin_check stays absent, before and after configuration.
 func TestOriginCheckAbsentOnLocalFault(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
 	prober := &scriptedProber{err: errors.New("git not found")}
-	c := newTestClientP(t, oneProvider, prober)
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
 	s := &stubSender{}
 	ctx := context.Background()
 	c.OnConnected(ctx, s)
@@ -313,7 +345,12 @@ func TestOriginCheckAbsentOnLocalFault(t *testing.T) {
 		t.Fatalf("probe ran %d times, want 1", prober.calls.Load())
 	}
 	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
 	heartbeat(t, c, s)
+	waitProbeDone(t, c)
+	if prober.calls.Load() != 2 {
+		t.Fatalf("probe ran %d times, want a second one after configuration", prober.calls.Load())
+	}
 	if oc := latestOriginCheck(s.messages()); oc != nil {
 		t.Errorf("origin_check = %+v after a local fault, want absent", oc)
 	}
@@ -334,11 +371,34 @@ func TestOriginCheckClearedWhenALaterProbeHitsALocalFault(t *testing.T) {
 
 	prober.set("", errors.New("git not found"), nil)
 	clk.advance(gateway.DefaultHeartbeatInterval + time.Second)
+	before := len(s.messages())
 	heartbeat(t, c, s)
 	waitProbeDone(t, c)
-	if hb := heartbeat(t, c, s); hb.OriginCheck != nil {
-		t.Errorf("origin_check = %+v after a probe hit a local fault, want absent", hb.OriginCheck)
+	// The heartbeat's own status, then the one the probe pushes so the platform learns the result is
+	// gone without waiting for the next tick.
+	msgs := s.messages()[before:]
+	if len(msgs) != 2 {
+		t.Fatalf("%d statuses sent, want the heartbeat's and the probe's", len(msgs))
 	}
+	if last := msgs[1].(proto.GitSyncStatusMsg); last.OriginCheck != nil {
+		t.Errorf("origin_check = %+v after a probe hit a local fault, want absent", last.OriginCheck)
+	}
+}
+
+// If the clock steps backwards the cadence must not stall until it catches up again.
+func TestOriginCheckProbesAgainAfterTheClockStepsBack(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &scriptedProber{result: gitsync.OriginReachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	waitProbeDone(t, c)
+	c.HandleMessage(context.Background(), s, "git_sync_config", configWithExtras("1"))
+
+	clk.advance(-2 * time.Hour)
+	heartbeat(t, c, s)
+	waitFor(t, func() bool { return prober.calls.Load() == 2 })
+	waitProbeDone(t, c)
 }
 
 // A probe cancelled by its connection closing proves nothing: it neither replaces the cached result
@@ -383,8 +443,9 @@ func TestCancelledProbeKeepsTheCachedResultAndIsRetried(t *testing.T) {
 	}
 }
 
-// A reconnect must not re-run a probe whose result is still within its cadence: a flapping
-// connection would otherwise exec git against the origin on every attempt.
+// A reconnect must not re-run a probe whose result is still within its cadence, and serves the
+// cached result straight away. (A connection that drops while a probe is still running does retry,
+// see TestCancelledProbeKeepsTheCachedResultAndIsRetried.)
 func TestReconnectWithinTheIntervalDoesNotReprobe(t *testing.T) {
 	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
 	prober := &scriptedProber{result: gitsync.OriginReachable}
