@@ -32,6 +32,12 @@ jobs:
       - name: Run ECR Public lookup tests
         run: bash scripts/ecr-public-image-digest_test.sh
 
+      - name: Run image tag reconcile tests
+        run: bash scripts/reconcile-image-tags_test.sh
+
+      - name: Run release-metadata.json tests
+        run: bash scripts/validate-release-metadata_test.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -122,3 +128,72 @@ jobs:
           docker volume rm ci-data-check
           echo "fresh /data owner uid: $owner"
           test "$owner" = "65532"
+
+  image-gitsync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build git-sync image
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          docker build \
+            --file Dockerfile.gitsync \
+            --build-arg VERSION=ci \
+            --build-arg REVISION="$REVISION" \
+            --tag mkonnect-gitsync:ci \
+            .
+
+      - name: Verify image metadata and health command
+        env:
+          REVISION: ${{ github.sha }}
+        run: |
+          test "$(docker inspect mkonnect-gitsync:ci --format '{{ index .Config.Labels "org.opencontainers.image.title" }}')" = mkonnect-gitsync
+          test "$(docker inspect mkonnect-gitsync:ci --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')" = ci
+          test "$(docker inspect mkonnect-gitsync:ci --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "$REVISION"
+          test "$(docker inspect mkonnect-gitsync:ci --format '{{ .Config.User }}')" = 65532:65532
+          test "$(docker inspect mkonnect-gitsync:ci --format '{{ len .Config.ExposedPorts }}')" = 0
+          docker run --rm mkonnect-gitsync:ci --health
+
+      - name: Verify the image ships git 2.31 or newer
+        run: |
+          version=$(docker run --rm --entrypoint git mkonnect-gitsync:ci --version | awk '{ print $3 }')
+          echo "git version in image: $version"
+          major=${version%%.*}
+          rest=${version#*.}
+          minor=${rest%%.*}
+          if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 31 ]; }; then
+            echo "git >= 2.31 is required" >&2
+            exit 1
+          fi
+
+      - name: Verify a fresh /data volume is writable by the non-root user
+        run: |
+          docker volume create ci-gitsync-data-check
+          # Mounting the image initializes the empty volume from the image's /data
+          # (ownership included); --health exits 0 immediately after that.
+          docker run --rm -v ci-gitsync-data-check:/data mkonnect-gitsync:ci --health
+          owner=$(docker run --rm -v ci-gitsync-data-check:/data alpine stat -c %u:%g /data)
+          docker volume rm ci-gitsync-data-check
+          echo "fresh /data owner uid:gid: $owner"
+          test "$owner" = "65532:65532"
+
+      - name: Smoke-test the operator CLI under a hardened runtime
+        run: |
+          docker volume create ci-gitsync-data
+          docker volume create ci-gitsync-tmp
+          # The read-only root filesystem and dropped capabilities match the recommended
+          # deployment. git-sync creates its scratch directories under /tmp, so /tmp is a real
+          # (disk-backed) volume here rather than the image's read-only layer.
+          run_hardened() {
+            docker run --rm --read-only --user 65532:65532 --cap-drop ALL \
+              -v ci-gitsync-data:/data -v ci-gitsync-tmp:/tmp mkonnect-gitsync:ci "$@"
+          }
+          # The first mount of an empty named volume initializes it from the image's /data.
+          docker run --rm -v ci-gitsync-data:/data mkonnect-gitsync:ci --health
+          run_hardened connector config set ci-smoke --base-url https://source.example.invalid/
+          listing=$(run_hardened connector config list)
+          echo "$listing"
+          echo "$listing" | grep -q 'ci-smoke'
+          docker volume rm ci-gitsync-data ci-gitsync-tmp
