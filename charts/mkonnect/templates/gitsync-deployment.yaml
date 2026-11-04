@@ -1,6 +1,6 @@
-{{- if .Values.gitSync.enabled }}
+{{- if include "mkonnect.gitsync.enabled" . }}
 {{- include "mkonnect.gitsync.validate" . | trim -}}
-{{- $gs := .Values.gitSync }}
+{{- $gs := include "mkonnect.gitsync.values" . | fromYaml }}
 {{- $tokenSecret := "" }}
 {{- $tokenKey := "" }}
 {{- if $gs.config.registrationTokenSecret.name }}
@@ -38,6 +38,11 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+        # Without this the kubelet re-applies group permissions (adds group read/write) to every
+        # file on the volume at each mount, which would loosen the 0600 signing key and make the
+        # connector refuse it. With it the ownership pass runs only when the volume root's
+        # ownership does not already match.
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -85,6 +90,18 @@ spec:
             - name: GIT_SSL_CAINFO
               value: {{ printf "%s/%s" ($gs.caBundle.mountPath | clean) $gs.caBundle.key | quote }}
             {{- end }}
+            {{- if $gs.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ $gs.proxy.https | quote }}
+            {{- end }}
+            {{- if $gs.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ $gs.proxy.http | quote }}
+            {{- end }}
+            {{- if $gs.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ $gs.proxy.noProxy | quote }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /data
@@ -128,7 +145,8 @@ spec:
             secretName: {{ $tokenSecret | quote }}
             # 0440 (r--r-----): the Secret is mounted owned by root with group = the
             # pod's fsGroup (65532), so the non-root connector reads it via the group
-            # bit and no other user can.
+            # bit and no other user can. The connector rejects a token file that is
+            # accessible by others or writable by its group.
             defaultMode: 0440
             items:
               - key: {{ $tokenKey | quote }}

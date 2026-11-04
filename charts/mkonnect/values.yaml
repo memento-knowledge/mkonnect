@@ -73,6 +73,11 @@ serviceAccount:
 # registration token, its own volume. Everything below is ignored unless
 # gitSync.enabled is true, and enabling it leaves the connector resources above
 # unchanged. See docs/git-sync.md and docs/git-sync-security.md.
+#
+# Maintainers: the templates also carry these defaults (templates/_gitsync.tpl,
+# "mkonnect.gitsync.defaults") so they render under `helm upgrade --reuse-values`
+# on Helm 3, which does not apply a new chart's defaults. Change both together;
+# scripts/chart-gitsync_test.sh fails if they differ.
 gitSync:
   enabled: false
 
@@ -81,10 +86,14 @@ gitSync:
     # public.ecr.aws/<alias>/memento-gitsync
     repository: ""
     pullPolicy: IfNotPresent
-    # Set an explicit stable release ID in production. Defaults to Chart.appVersion.
+    # Defaults to Chart.appVersion. The git-sync image is published separately
+    # from the chart and may be missing for a given release: check that the
+    # release's release-metadata.json has a non-null git_sync_release_id before
+    # enabling or upgrading.
     tag: ""
-    # Optional immutable image digest ("sha256:..."). When set, the image is
-    # referenced as <repository>@<digest> and the tag is ignored.
+    # Recommended: pin the immutable image digest ("sha256:...", git_sync_image_digest
+    # in release-metadata.json). When set, the image is <repository>@<digest> and the
+    # tag is ignored.
     digest: ""
 
   config:
@@ -95,9 +104,11 @@ gitSync:
     connectorId: ""
     # Defaults to the top-level config.protocolVersion.
     protocolVersion: ""
-    # required when enabled: the replica host the connector may push to, as shown
-    # in the portal install page: a host name, optionally with :port. No scheme and
-    # no path. The connector rejects any configuration naming a different replica host.
+    # required when enabled: the replica host the connector may push to, from the
+    # installation instructions you were given for your tenant: a host name (or IP
+    # address, or [IPv6]), optionally with :port. No scheme and no path. The port
+    # defaults to 443. The connector rejects any configuration naming a different
+    # replica host or port.
     replicaHost: ""
     # Path of the signing key inside the container. Must be under /data (the
     # persistent volume): the rest of the root filesystem is read-only.
@@ -145,14 +156,17 @@ gitSync:
 
   # The git-sync volume. It is its own PersistentVolumeClaim (never the
   # connector's) and holds the signing key and the bare mirror of every
-  # repository. Size it at roughly 1.2x the sum of your mirrored repositories.
+  # repository. Fetched objects are written into the mirrors here (and
+  # repacked there), so this is where headroom matters: size it at roughly
+  # 1.2x the sum of your mirrored repositories, plus growth.
   persistence:
     size: 20Gi
     storageClass: ""
 
-  # Scratch space for git (/tmp) is a disk-backed emptyDir, not memory. Git
-  # unpacks and repacks objects here, so size it for your largest repository's
-  # working set; the kubelet evicts the pod if the limit is exceeded.
+  # Scratch space (/tmp) is a disk-backed emptyDir, not memory. It holds only
+  # each sync's empty home directory and git's own temporary files, not the
+  # mirrors, so it is much smaller than the data volume. The kubelet evicts the
+  # pod if the limit is exceeded.
   tmp:
     sizeLimit: 5Gi
 
@@ -163,6 +177,15 @@ gitSync:
     limits:
       cpu: "1"
       memory: 2Gi
+
+  # Optional outbound proxy, exported as HTTPS_PROXY / HTTP_PROXY / NO_PROXY. Both
+  # git (fetch and push) and the connector's gateway connection (Go's default HTTP
+  # transport) read these standard variables. Do not embed credentials in a proxy
+  # URL here: values are visible in the Deployment spec.
+  proxy:
+    https: ""                 # e.g. http://proxy.example.com:3128
+    http: ""
+    noProxy: ""               # e.g. .cluster.local,10.0.0.0/8
 
   # A dedicated ServiceAccount whose token is never mounted into the pod.
   serviceAccount:
@@ -178,7 +201,10 @@ gitSync:
     # When cidrs is set, egress is limited to those CIDRs on `ports` (TCP) plus DNS
     # (port 53) to the dnsNamespace. A NetworkPolicy matches addresses, not host
     # names, so the list must cover the gateway, the replica and every origin git
-    # host, and must be kept current if their addresses change.
+    # host, and must be kept current if their addresses change. Add any
+    # non-443 port (for example a replica host pinned as host:8443, or a git
+    # server on another port) to `ports`. The DNS rule targets the cluster DNS
+    # pods through dnsNamespace; it does not match a node-local DNS cache.
     egress:
       cidrs: []               # e.g. ["203.0.113.0/24", "198.51.100.10/32"]
       ports: [443]
