@@ -184,6 +184,9 @@ func runConfigRemove(args []string, w io.Writer) error {
 }
 
 func runStatus(w io.Writer) error {
+	// The replica host pin comes first and does not depend on the provider config loading: without
+	// it the connector rejects every configuration, which is the first thing an operator must know.
+	printReplicaHostPin(w)
 	store, err := gitsync.New(gitsync.DefaultConfigPath())
 	if err != nil {
 		return err
@@ -201,6 +204,28 @@ func runStatus(w io.Writer) error {
 	// per-repository sync state are shown in the portal, not here.
 	fmt.Fprintln(w, "\nEnrollment and repository sync status are visible in the Memento portal.")
 	return nil
+}
+
+// printReplicaHostPin shows the replica host the connector is pinned to, as read from THIS
+// process's environment (the daemon reads the same variable once at startup, so a container started
+// with a different value is not reflected here). An unset or invalid value is flagged loudly: the
+// connector then rejects every configuration and never syncs. The value is never echoed when
+// invalid.
+func printReplicaHostPin(w io.Writer) {
+	fmt.Fprintln(w, "=== Replica host pin ===")
+	host, err := gitsync.ReplicaHostFromEnv()
+	switch {
+	case err == nil:
+		fmt.Fprintf(w, "  %s=%s (from this process's environment)\n", gitsync.ReplicaHostEnv, host)
+		fmt.Fprintln(w, "  The connector pushes only to this host and rejects any configuration naming another.")
+	case errors.Is(err, gitsync.ErrReplicaHostNotSet):
+		fmt.Fprintf(w, "  %s: NOT SET - the connector will reject every configuration and will not sync.\n", gitsync.ReplicaHostEnv)
+		fmt.Fprintf(w, "  Set it to the replica host (host or host:port) and restart the connector.\n")
+	default:
+		fmt.Fprintf(w, "  %s: INVALID - the connector will reject every configuration and will not sync.\n", gitsync.ReplicaHostEnv)
+		fmt.Fprintf(w, "  %v\n", err)
+	}
+	fmt.Fprintln(w)
 }
 
 // maskedAuth describes the authentication mode without ever printing the token.

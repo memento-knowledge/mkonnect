@@ -429,12 +429,14 @@ func TestApplyConfigRetainsReplicaMaterialForMatched(t *testing.T) {
 	}
 }
 
+// A replica on another host or scheme (plain http included) is a whole-config rejection, covered by
+// TestMismatchRejectsWholeConfigAndNothingSyncs; only an unusable replica on the pinned host is
+// per-repository.
 func TestApplyConfigMalformedReplicaMarksRepoNotWholeConfig(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSONRaw("5",
 		repoJSON("good", "https://git.example.com/g.git", "", "https://replica.example.com/r/g.git", testPushToken),
-		repoJSON("plain-http", "https://git.example.com/h.git", "", "http://replica.example.com/r/h.git", testPushToken),
 		repoJSON("no-replica", "https://git.example.com/n.git", "", "", testPushToken),
 		repoJSON("no-token", "https://git.example.com/t.git", "", "https://replica.example.com/r/t.git", ""),
 		repoJSON("userinfo", "https://git.example.com/u.git", "", "https://user:pw@replica.example.com/r/u.git", testPushToken),
@@ -449,7 +451,7 @@ func TestApplyConfigMalformedReplicaMarksRepoNotWholeConfig(t *testing.T) {
 	if rs["good"].State != gitsync.StateSyncing {
 		t.Errorf("good = %+v, want syncing", rs["good"])
 	}
-	for _, id := range []string{"plain-http", "no-replica", "no-token", "userinfo", "ctl-token"} {
+	for _, id := range []string{"no-replica", "no-token", "userinfo", "ctl-token"} {
 		r := rs[id]
 		if r.State != gitsync.StateError || r.ErrorType != gitsync.ErrUnclassified || r.ErrorDetail != "invalid replica configuration" {
 			t.Errorf("%s = %+v, want error/unclassified/invalid replica configuration", id, r)

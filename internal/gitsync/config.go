@@ -65,7 +65,7 @@ type repoState struct {
 	expiresAt    string // push_token_expires_at (RFC3339), "" when none
 	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
 
-	replicaURL string // validated, re-serialized https replica URL, "" when unmatched or unusable
+	replicaURL string // validated, re-serialized https replica URL on the pinned host, "" when unmatched or unusable
 	pushToken  Secret // platform push token for replicaURL; empty exactly when replicaURL is
 	// result is the recorded outcome of the last sync attempt, or the reason the configuration is
 	// unusable. A zero State means no outcome yet, which is reported as pending.
@@ -74,19 +74,9 @@ type repoState struct {
 }
 
 // errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
-// is unusable. It is deliberately generic: the status must never echo the platform-supplied URL.
+// is unusable (missing, or on the pinned host but carrying userinfo, a query or a fragment). It is
+// deliberately generic: the status must never echo the platform-supplied URL.
 const errInvalidReplica = "invalid replica configuration"
-
-// validReplicaURL validates a platform-supplied replica push URL and returns its re-serialized
-// canonical form. The push token travels to this URL, so it must be https; it gets the same host
-// validation as an origin so the host that is validated is the host that is dialled.
-func validReplicaURL(raw string) (string, bool) {
-	_, full, err := canonicalRemoteURL(raw)
-	if err != nil || !strings.HasPrefix(full, "https://") {
-		return "", false
-	}
-	return full, true
-}
 
 // validPushToken reports whether a platform-supplied push token is usable. It becomes an
 // Authorization header value in a subprocess environment, so it must be non-empty and free of
@@ -106,39 +96,86 @@ func sameSyncIdentity(a, b repoState) bool {
 		a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
 }
 
+// rejectConfig records that the most recent git_sync_config was rejected as a whole, so the status
+// carries config_error{config_version, reason} until a later configuration is accepted. reason is
+// one of the proto.GitSyncConfigErr* values. version is the rejected message's config_version; it is
+// echoed only when it is a bounded JSON scalar and is otherwise reported as null, so a hostile value
+// cannot ride back to the platform. Exactly one line is logged, carrying the reason and nothing
+// taken from the message. The caller leaves the previous configuration untouched.
+func (c *Client) rejectConfig(version json.RawMessage, reason string) {
+	if len(version) > maxConfigVersionSize || !isScalarJSON(version) {
+		version = nil
+	}
+	c.mu.Lock()
+	c.configErr = &proto.GitSyncConfigError{ConfigVersion: cloneRaw(version), Reason: reason}
+	c.mu.Unlock()
+	slog.Warn("git_sync_config rejected; leaving configuration unchanged", "reason", reason)
+}
+
+// replicaCheck is the outcome of checking one repository's replica_push_url against the pin.
+type replicaCheck struct {
+	url     string // the canonical URL to dial; set only for replicaOK
+	verdict replicaVerdict
+}
+
 // applyConfig validates an inbound git_sync_config and, only if the whole message is acceptable,
 // swaps in the new desired set and config version. A rejected message leaves the previous
-// configuration untouched and does not advance the version. It returns whether the config was
-// accepted (and a status should follow). It never logs a credential or push token.
+// configuration untouched, does not advance the version, and is reported in the status as
+// config_error (see rejectConfig). It returns whether the config was accepted (and syncs should
+// follow). It never logs a credential, push token, or value taken from the message.
+//
+// The replica host pin is enforced first and for every repository, whether or not its origin
+// host-matches a local provider: with no valid pin every configuration is rejected
+// (replica_host_not_pinned), and with one, a configuration in which any replica_push_url names a
+// different host and port is rejected whole (replica_host_mismatch). Nothing is built from a
+// configuration before that check has passed.
 func (c *Client) applyConfig(raw json.RawMessage) bool {
-	var msg proto.GitSyncConfigMsg
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		slog.Warn("malformed git_sync_config message", "err", err)
+	// The version is read separately so a rejection can echo it even when the rest of the message
+	// does not decode.
+	var head struct {
+		ConfigVersion json.RawMessage `json:"config_version"`
+	}
+	_ = json.Unmarshal(raw, &head)
+	version := head.ConfigVersion
+
+	if c.replicaHost == "" {
+		c.rejectConfig(version, proto.GitSyncConfigErrReplicaHostNotPinned)
 		return false
 	}
-	if msg.Repositories == nil {
-		slog.Warn("git_sync_config has no repositories field; leaving configuration unchanged")
+	var msg proto.GitSyncConfigMsg
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Repositories == nil {
+		c.rejectConfig(version, proto.GitSyncConfigErrMalformedMessage)
 		return false
 	}
 	if len(msg.Repositories) > maxConfigRepos {
-		slog.Warn("git_sync_config exceeds the repository cap; ignoring", "count", len(msg.Repositories), "cap", maxConfigRepos)
+		c.rejectConfig(version, proto.GitSyncConfigErrTooManyRepositories)
 		return false
 	}
+	// Check every replica URL before any per-repo state is built, so a hostile URL is reported as such
+	// rather than hidden behind a later structural error.
+	replicas := make([]replicaCheck, len(msg.Repositories))
+	for i, r := range msg.Repositories {
+		canonical, verdict := checkReplicaURL(r.ReplicaPushURL, c.replicaHost)
+		if verdict == replicaMismatch {
+			c.rejectConfig(version, proto.GitSyncConfigErrReplicaHostMismatch)
+			return false
+		}
+		replicas[i] = replicaCheck{url: canonical, verdict: verdict}
+	}
 	if msg.ConfigVersion != nil && (len(msg.ConfigVersion) > maxConfigVersionSize || !isScalarJSON(msg.ConfigVersion)) {
-		slog.Warn("git_sync_config has an invalid config_version; leaving configuration unchanged")
+		c.rejectConfig(version, proto.GitSyncConfigErrInvalidConfigVersion)
 		return false
 	}
 	next := make(map[string]repoState, len(msg.Repositories))
-	for _, r := range msg.Repositories {
+	for i, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
 			// A value outside the contract charset (or a "." / ".." traversal component) is rejected
-			// here rather than carried into logs and statuses. Not logged verbatim: a hostile id
-			// could carry log-injection bytes.
-			slog.Warn("git_sync_config has an entry with an invalid repo_id; leaving configuration unchanged")
+			// here rather than carried into logs and statuses.
+			c.rejectConfig(version, proto.GitSyncConfigErrInvalidRepoID)
 			return false
 		}
 		if _, dup := next[r.RepoID]; dup {
-			slog.Warn("git_sync_config has a duplicate repo_id; leaving configuration unchanged", "repo_id", r.RepoID)
+			c.rejectConfig(version, proto.GitSyncConfigErrDuplicateRepoID)
 			return false
 		}
 		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
@@ -156,10 +193,11 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		}
 		st := repoState{repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched}
 		if matched {
-			// A bad replica fails this one repository, not the whole message: the others are
-			// independent and halting them all would be disproportionate.
-			if replicaURL, ok := validReplicaURL(r.ReplicaPushURL); ok && validPushToken(r.PushToken) {
-				st.replicaURL, st.pushToken = replicaURL, r.PushToken
+			// An unusable replica fails this one repository, not the whole message: the others are
+			// independent and halting them all would be disproportionate. (A replica on another host
+			// has already rejected the whole message above.)
+			if replicas[i].verdict == replicaOK && validPushToken(r.PushToken) {
+				st.replicaURL, st.pushToken = replicas[i].url, r.PushToken
 			} else {
 				st.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
 			}
@@ -185,6 +223,7 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	c.repos = next
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
+	c.configErr = nil
 	c.mu.Unlock()
 	slog.Info("git_sync_config accepted", "repo_count", len(next))
 	return true
