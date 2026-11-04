@@ -1,7 +1,10 @@
 package gitsync
 
 import (
+	"context"
+	"io"
 	"os"
+	"time"
 
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
@@ -73,4 +76,18 @@ func SetChmodForTest(fn func(string, os.FileMode) error) func() {
 	prev := chmod
 	chmod = fn
 	return func() { chmod = prev }
+}
+
+// WithGitOutputRunnerForTest replaces how git is executed when its standard output is needed, which
+// is what turns sync statistics on for a client whose plain runner was replaced by WithGitRunner.
+func WithGitOutputRunnerForTest(run func(ctx context.Context, argv, env []string, dir string, stdout io.Writer) ([]byte, error)) Option {
+	return func(o *clientOptions) { o.runOut = run }
+}
+
+// IdleForTest reports whether no sync is in flight.
+func (c *Client) IdleForTest() bool { return c.mgr.idle() }
+
+// WithRunSaveIntervalForTest sets the minimum spacing between writes of the run state.
+func WithRunSaveIntervalForTest(d time.Duration) Option {
+	return func(o *clientOptions) { o.runSaveInterval = d }
 }

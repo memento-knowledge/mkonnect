@@ -3,6 +3,7 @@ package gitsync
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -78,6 +79,7 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	for _, r := range c.repos {
 		snapshot = append(snapshot, r)
 	}
+	runs := maps.Clone(c.runs)
 	c.mu.Unlock()
 
 	slices.SortFunc(snapshot, func(a, b repoState) int { return strings.Compare(a.repoID, b.repoID) })
@@ -85,7 +87,7 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	repos := make([]proto.GitSyncRepoStatus, 0, len(snapshot))
 	var earliest *time.Time
 	for _, r := range snapshot {
-		st := proto.GitSyncRepoStatus{RepoID: r.repoID}
+		st := runStatus(r.repoID, runs[r.repoID], r.attemptStartedAt)
 		switch {
 		case !r.matched:
 			st.State = StateError
@@ -128,6 +130,40 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 		}
 	}
 	return status
+}
+
+// runStatus fills a repository's status from its run record: when it last tried and last succeeded,
+// how the last finished attempt went, and what the origin looked like then. While an attempt is in
+// flight its start replaces last_attempt_at and everything else keeps describing the previous
+// finished attempt. last_success_at is always a present field, null until the first success, so the
+// platform can tell "never succeeded" from "not reported".
+func runStatus(repoID string, rec runRecord, inFlightSince time.Time) proto.GitSyncRepoStatus {
+	st := proto.GitSyncRepoStatus{RepoID: repoID, OriginDefaultBranch: rec.OriginDefaultBranch}
+	attempt := rec.LastAttemptAt
+	if !inFlightSince.IsZero() {
+		attempt = inFlightSince
+	}
+	st.LastAttemptAt = rfc3339Seconds(attempt)
+	st.LastSuccessAt = rfc3339Seconds(rec.LastSuccessAt)
+	st.NewestOriginCommitAt = rfc3339Seconds(rec.NewestOriginCommitAt)
+	if rec.DurationMS != nil {
+		d := *rec.DurationMS
+		st.DurationMS = &d
+	}
+	if rec.RefsPushed != nil {
+		n := *rec.RefsPushed
+		st.RefsPushed = &n
+	}
+	return st
+}
+
+// rfc3339Seconds renders t as RFC3339 UTC, or nil for the zero time.
+func rfc3339Seconds(t time.Time) *string {
+	if t.IsZero() {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
 }
 
 // sendStatus builds and sends the current status under statusMu, so concurrent heartbeat and read

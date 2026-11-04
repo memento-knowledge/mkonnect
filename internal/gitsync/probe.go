@@ -172,16 +172,22 @@ func classifyLsRemote(err error, stderr []byte) OriginResult {
 	return OriginUnreachable
 }
 
-// runGit executes git with a discarded stdout and a size-capped stderr, in its own process group so
-// a lingering git-remote-https helper is killed with the parent rather than outliving the timeout.
-// dir is the working directory (an empty temp dir), so git cannot pick up an ambient repository's
-// configuration from the daemon's cwd.
+// runGit executes git with a discarded stdout and a size-capped stderr; see runGitOut.
 func runGit(ctx context.Context, argv, env []string, dir string) ([]byte, error) {
+	return runGitOut(ctx, argv, env, dir, io.Discard)
+}
+
+// runGitOut executes git with its standard output streamed to stdout (which must consume everything
+// it is given without blocking, as the writers in syncstats.go do) and a size-capped stderr, in its
+// own process group so a lingering git-remote-https helper is killed with the parent rather than
+// outliving the timeout. dir is the working directory (an empty temp dir), so git cannot pick up an
+// ambient repository's configuration from the daemon's cwd.
+func runGitOut(ctx context.Context, argv, env []string, dir string, stdout io.Writer) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.Dir = dir
 	cmd.Stdin = nil
-	cmd.Stdout = io.Discard
+	cmd.Stdout = stdout
 	stderr := &limitedBuffer{max: maxGitStderr}
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
