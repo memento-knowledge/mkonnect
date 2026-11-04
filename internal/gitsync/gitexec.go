@@ -2,10 +2,14 @@ package gitsync
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // This file is the connector's single place for building a git subprocess environment. Every git
@@ -15,12 +19,17 @@ import (
 // gitBaseEnv builds a minimal, explicit environment for git. It never copies os.Environ()
 // wholesale: an inherited GIT_SSL_NO_VERIFY, url.*.insteadOf, http.proxy, GIT_TRACE, or a credential
 // helper could weaken TLS, redirect the target, or dump the Authorization header. Only PATH, an
-// empty HOME, locale, and explicitly chosen proxy/CA variables are passed through. It carries no
-// credential; see credConfig.
+// empty HOME, locale, a temp directory, and explicitly chosen proxy/CA variables are passed
+// through. It carries no credential; see credConfig.
+//
+// TMPDIR is home itself, not the inherited value, so git's own temporary files land in a private
+// (0700) writable directory that cleanup removes and the startup sweep covers, rather than
+// falling back to /tmp, which may be read-only.
 func gitBaseEnv(home string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + home,
+		"TMPDIR=" + home,
 		"LC_ALL=C",
 		"LANGUAGE=",
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -83,12 +92,117 @@ func credConfig(remoteURL, auth, username string, token Secret) [][2]string {
 	return append(cfg, [2]string{"http." + strings.TrimSuffix(remoteURL, "/") + "/.extraHeader", header})
 }
 
-// newTempHome creates an empty directory to use as git's HOME, so git cannot read the invoking
-// user's ~/.gitconfig or credential store, and returns it with its cleanup function.
+// tempHomePrefix names every directory newTempHome creates; the startup sweep removes only
+// entries carrying it.
+const tempHomePrefix = "gitsync-home-"
+
+// TempRoot returns the directory under which per-operation temp homes are created, creating it
+// (mode 0700) if missing, and verifies it is writable by creating and removing a probe directory,
+// so an unusable location (for example an existing read-only mount) fails at startup rather than
+// on the first sync. It is GIT_SYNC_TMP_DIR when set, otherwise os.TempDir(), which honours
+// TMPDIR. Whichever source is used, the result must be an absolute path: a relative one is an
+// error, never a silent fallback. A deployment with a read-only root filesystem points it at a
+// writable volume.
+func TempRoot() (string, error) {
+	root, err := resolveTempRoot()
+	if err != nil {
+		return "", err
+	}
+	probe, err := os.MkdirTemp(root, tempHomePrefix)
+	if err != nil {
+		return "", fmt.Errorf("temp directory %q is not writable (set GIT_SYNC_TMP_DIR or TMPDIR to a writable absolute path): %w", root, err)
+	}
+	if err := os.Remove(probe); err != nil {
+		return "", fmt.Errorf("temp directory %q is not usable: %w", root, err)
+	}
+	return root, nil
+}
+
+// resolveTempRoot picks the temp root from the environment, checks it is absolute, and creates it.
+func resolveTempRoot() (string, error) {
+	root, source := os.TempDir(), "TMPDIR"
+	if v := os.Getenv("GIT_SYNC_TMP_DIR"); v != "" {
+		root, source = v, "GIT_SYNC_TMP_DIR"
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("%s must be an absolute path, got %q", source, root)
+	}
+	root = filepath.Clean(root)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", fmt.Errorf("temp directory %q (from %s) is not usable: %w", root, source, err)
+	}
+	return root, nil
+}
+
+// newTempHome creates an empty directory under the temp root to use as git's HOME, so git cannot
+// read the invoking user's ~/.gitconfig or credential store, and returns it with its cleanup
+// function. git is also told (via gitBaseEnv) to use that directory for its own temporary files.
 func newTempHome() (string, func(), error) {
-	home, err := os.MkdirTemp("", "gitsync-home-")
+	root, err := resolveTempRoot()
+	if err != nil {
+		return "", nil, fmt.Errorf("git home setup failed: %w", err)
+	}
+	home, err := os.MkdirTemp(root, tempHomePrefix)
 	if err != nil {
 		return "", nil, fmt.Errorf("git home setup failed: %w", err)
 	}
 	return home, func() { _ = os.RemoveAll(home) }, nil
+}
+
+// SweepStaleTempHomes removes leftover temp homes (a crash or kill skips newTempHome's cleanup)
+// from root, so they do not accumulate when the temp directory is on a persistent volume. Call it
+// once at startup. It is deliberately conservative:
+//   - only direct children of root whose name starts with the temp-home prefix are considered;
+//   - only real directories are removed (checked with Lstat, so a symlink with a matching name is
+//     left alone and never followed; os.RemoveAll does not follow symlinks inside a tree either);
+//   - only entries last modified more than olderThan ago, which spares directories created
+//     moments ago.
+//
+// The temp root must not be shared between running instances: a directory's mtime reflects the
+// last entry added or removed in it, not liveness, so this cannot tell an orphaned home from one
+// in use by another running process. One instance per volume or container is the supported setup.
+// The daemon calls this before it starts any operation of its own.
+//
+// It is best effort: it keeps going after a failure and returns how many directories it removed
+// together with the first error encountered. A missing root is not an error.
+func SweepStaleTempHomes(root string, olderThan time.Duration) (removed int, err error) {
+	if !filepath.IsAbs(root) {
+		return 0, fmt.Errorf("temp root must be an absolute path, got %q", root)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var first error
+	note := func(e error) {
+		if first == nil {
+			first = e
+		}
+	}
+	cutoff := time.Now().Add(-olderThan)
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), tempHomePrefix) {
+			continue
+		}
+		path := filepath.Join(root, e.Name())
+		fi, lerr := os.Lstat(path)
+		if lerr != nil {
+			if !errors.Is(lerr, fs.ErrNotExist) {
+				note(lerr)
+			}
+			continue
+		}
+		if !fi.Mode().IsDir() || fi.ModTime().After(cutoff) {
+			continue
+		}
+		if rerr := os.RemoveAll(path); rerr != nil {
+			note(rerr)
+			continue
+		}
+		removed++
+	}
+	return removed, first
 }

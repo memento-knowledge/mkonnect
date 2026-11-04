@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"math/rand/v2"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -116,10 +117,16 @@ type Client struct {
 	bootID string
 
 	mgr          *manager
+	sched        *scheduler
 	drainTimeout time.Duration
 
 	// gc reclaims the disk of mirrors that left the configuration; see gc.go.
 	gc *mirrorGC
+
+	// limits holds the effective schedule and resource limits. It starts as DefaultLimits and is
+	// replaced as a whole by whatever resolves a configuration's limits (ResolveLimits); until that
+	// is wired in, the defaults apply. Read it through effectiveLimits.
+	limits atomic.Pointer[Limits]
 
 	// Completion-triggered statuses are coalesced: see notifyStatus.
 	statusInterval  time.Duration
@@ -189,11 +196,21 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		syncHooks{
 			resolve:   c.resolveTask,
 			begin:     c.beginSync,
-			finish:    c.finishSync,
+			finish:    c.finishAndReschedule,
 			release:   c.releaseSync,
 			suspended: c.criticalPatchRequired.Load,
 			changed:   c.notifyStatus,
 		})
+	defaults := DefaultLimits()
+	c.limits.Store(&defaults)
+	c.sched = newScheduler(schedHooks{
+		repos:     c.schedulableTargets,
+		enqueue:   c.mgr.enqueueScheduled,
+		suspended: c.criticalPatchRequired.Load,
+		limits:    c.effectiveLimits,
+		now:       now,
+		rand:      rand.Float64,
+	})
 	c.gw = gateway.NewClient(gateway.Config{
 		GatewayURL:        cfg.GatewayURL,
 		ConnectorID:       cfg.ConnectorID,
@@ -204,11 +221,18 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	return c
 }
 
-// Run connects and maintains the connection with backoff until ctx is cancelled.
+// Run connects and maintains the connection with backoff until ctx is cancelled. It also runs the
+// periodic resync scheduler for as long as it runs, and returns only after that has stopped. The
+// mirror cleanup loop runs alongside; Wait confirms it has stopped.
 func (c *Client) Run(ctx context.Context) {
+	stop := c.sched.start(ctx)
+	defer stop()
 	c.startMirrorGC(ctx)
 	c.gw.Run(ctx)
 }
+
+// effectiveLimits returns the limits in force: the defaults until a configuration supplies others.
+func (c *Client) effectiveLimits() Limits { return *c.limits.Load() }
 
 // Connect performs a single connection attempt.
 func (c *Client) Connect(ctx context.Context) error { return c.gw.Connect(ctx) }
@@ -261,6 +285,9 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 		accepted := c.applyConfig(raw)
 		c.noteConfigApplied(accepted)
 		if accepted {
+			// The schedule is brought up to date first, so the outcome of the sync started below,
+			// even a failed one, is recorded against it.
+			c.sched.reconcile()
 			// Every accepted configuration syncs the syncable set: the platform re-sends it on a
 			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
 			// before the status is built, so the status already reports them as syncing.
@@ -356,6 +383,41 @@ func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
 		r.result = res
 	}
 	c.repos[repoID] = r
+}
+
+// finishAndReschedule records a sync's outcome, then lets the scheduler plan the repository's next
+// run from it.
+func (c *Client) finishAndReschedule(repoID string, t syncTask, res syncResult) {
+	c.finishSync(repoID, t, res)
+	c.sched.completed(repoID, t, res)
+}
+
+// schedulableTargets returns the sync target of every repository the scheduler may start: exactly
+// those resolveTask would accept. It copies no secret.
+func (c *Client) schedulableTargets() map[string]targetKey {
+	type candidate struct {
+		id, provider string
+		key          targetKey
+	}
+	c.mu.Lock()
+	candidates := make([]candidate, 0, len(c.repos))
+	for id, r := range c.repos {
+		if r.matched && r.replicaURL != "" {
+			candidates = append(candidates, candidate{id, r.provider, targetKey{r.canonicalURL, r.replicaURL}})
+		}
+	}
+	c.mu.Unlock()
+
+	out := make(map[string]targetKey, len(candidates))
+	if c.local == nil {
+		return out
+	}
+	for _, cand := range candidates {
+		if _, ok := c.local.Get(cand.provider); ok {
+			out[cand.id] = cand.key
+		}
+	}
+	return out
 }
 
 // targetMatches reports whether t was resolved from r's current sync target.

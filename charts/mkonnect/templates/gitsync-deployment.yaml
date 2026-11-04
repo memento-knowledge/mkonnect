@@ -1,0 +1,183 @@
+{{- if include "mkonnect.gitsync.enabled" . }}
+{{- include "mkonnect.gitsync.validate" . | trim -}}
+{{- $gs := include "mkonnect.gitsync.values" . | fromYaml }}
+{{- $tokenSecret := "" }}
+{{- $tokenKey := "" }}
+{{- if $gs.config.registrationTokenSecret.name }}
+{{- $tokenSecret = $gs.config.registrationTokenSecret.name }}
+{{- $tokenKey = $gs.config.registrationTokenSecret.key }}
+{{- else if $gs.config.registrationToken }}
+{{- $tokenSecret = printf "%s-registration" (include "mkonnect.gitsync.fullname" .) }}
+{{- $tokenKey = "registration-token" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mkonnect.gitsync.fullname" . }}
+  labels:
+    {{- include "mkonnect.gitsync.labels" . | nindent 4 }}
+spec:
+  # One replica on a ReadWriteOnce volume: Recreate stops the old pod before the new
+  # one mounts the volume, so two git-sync pods never share a key or a mirror.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mkonnect.gitsync.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mkonnect.gitsync.labels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "mkonnect.gitsync.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        # Without this the kubelet re-applies group permissions (adds group read/write) to every
+        # file on the volume at each mount, which would loosen the 0600 signing key and make the
+        # connector refuse it. With it the ownership pass runs only when the volume root's
+        # ownership does not already match.
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gitsync
+          image: {{ include "mkonnect.gitsync.image" . | quote }}
+          imagePullPolicy: {{ $gs.image.pullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: GATEWAY_URL
+              value: {{ default .Values.config.gatewayUrl $gs.config.gatewayUrl | quote }}
+            - name: CONNECTOR_ID
+              value: {{ $gs.config.connectorId | quote }}
+            - name: PROTOCOL_VERSION
+              value: {{ default .Values.config.protocolVersion $gs.config.protocolVersion | quote }}
+            - name: GIT_SYNC_REPLICA_HOST
+              value: {{ $gs.config.replicaHost | quote }}
+            - name: KEY_FILE
+              value: {{ $gs.config.keyFile | clean | quote }}
+            # Mirrors live on the data volume, never beside the (read-only) provider config.
+            - name: GIT_SYNC_MIRRORS_DIR
+              value: "/data/mirrors"
+            - name: GIT_SYNC_CONFIG_FILE
+              {{- if $gs.providerConfig.secretName }}
+              value: {{ printf "/etc/mkonnect-gitsync-providers/%s" $gs.providerConfig.key | quote }}
+              {{- else }}
+              value: "/data/git-sync.json"
+              {{- end }}
+            - name: TMPDIR
+              value: "/tmp"
+            - name: GIT_SYNC_TMP_DIR
+              value: "/tmp"
+            {{- if $tokenSecret }}
+            - name: REGISTRATION_TOKEN_FILE
+              value: {{ printf "/etc/mkonnect-gitsync/registration-token/%s" $tokenKey | quote }}
+            {{- end }}
+            {{- if $gs.caBundle.secretName }}
+            - name: GIT_SSL_CAINFO
+              value: {{ printf "%s/%s" ($gs.caBundle.mountPath | clean) $gs.caBundle.key | quote }}
+            {{- end }}
+            {{- /* Both cases are exported: libcurl (git) reads only lower-case http_proxy, Go reads either. */}}
+            {{- if $gs.proxy.https }}
+            - name: HTTPS_PROXY
+              value: {{ $gs.proxy.https | quote }}
+            - name: https_proxy
+              value: {{ $gs.proxy.https | quote }}
+            {{- end }}
+            {{- if $gs.proxy.http }}
+            - name: HTTP_PROXY
+              value: {{ $gs.proxy.http | quote }}
+            - name: http_proxy
+              value: {{ $gs.proxy.http | quote }}
+            {{- end }}
+            {{- if $gs.proxy.noProxy }}
+            - name: NO_PROXY
+              value: {{ $gs.proxy.noProxy | quote }}
+            - name: no_proxy
+              value: {{ $gs.proxy.noProxy | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            {{- if $tokenSecret }}
+            - name: registration-token
+              mountPath: /etc/mkonnect-gitsync/registration-token
+              readOnly: true
+            {{- end }}
+            {{- if $gs.providerConfig.secretName }}
+            - name: provider-config
+              mountPath: /etc/mkonnect-gitsync-providers
+              readOnly: true
+            {{- end }}
+            {{- if $gs.caBundle.secretName }}
+            - name: ca-bundle
+              mountPath: {{ $gs.caBundle.mountPath | clean | quote }}
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml $gs.resources | nindent 12 }}
+          startupProbe:
+            exec:
+              command:
+                - /mkonnect-gitsync
+                - --health
+            failureThreshold: 3
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "mkonnect.gitsync.fullname" . }}-data
+        # Disk-backed scratch space (not memory) for git's temporary files.
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ $gs.tmp.sizeLimit | quote }}
+        {{- if $tokenSecret }}
+        - name: registration-token
+          secret:
+            secretName: {{ $tokenSecret | quote }}
+            # 0440 (r--r-----): the Secret is mounted owned by root with group = the
+            # pod's fsGroup (65532), so the non-root connector reads it via the group
+            # bit and no other user can. The connector rejects a token file that is
+            # accessible by others or writable by its group.
+            defaultMode: 0440
+            items:
+              - key: {{ $tokenKey | quote }}
+                path: {{ $tokenKey | quote }}
+        {{- end }}
+        {{- if $gs.providerConfig.secretName }}
+        - name: provider-config
+          secret:
+            secretName: {{ $gs.providerConfig.secretName | quote }}
+            # 0440: holds origin credentials. The connector accepts owner+group-read
+            # but rejects any world access, so do not widen this.
+            defaultMode: 0440
+            items:
+              - key: {{ $gs.providerConfig.key | quote }}
+                path: {{ $gs.providerConfig.key | quote }}
+        {{- end }}
+        {{- if $gs.caBundle.secretName }}
+        - name: ca-bundle
+          secret:
+            secretName: {{ $gs.caBundle.secretName | quote }}
+            # 0444: CA certificates are public data.
+            defaultMode: 0444
+            items:
+              - key: {{ $gs.caBundle.key | quote }}
+                path: {{ $gs.caBundle.key | quote }}
+        {{- end }}
+{{- end }}
