@@ -90,6 +90,9 @@ jobs:
       - name: Run release asset bundle tests
         run: bash scripts/release-asset-bundle_test.sh
 
+      - name: Run chart git-sync render tests
+        run: bash scripts/chart-gitsync_test.sh
+
       - name: Lint and package chart
         env:
           CHART_VERSION: ${{ steps.metadata.outputs.chart_version }}

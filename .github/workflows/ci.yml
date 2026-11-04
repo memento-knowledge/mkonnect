@@ -86,6 +86,9 @@ jobs:
       - name: Run chart CA-bundle render tests
         run: bash scripts/chart-ca-bundle_test.sh
 
+      - name: Run chart git-sync render tests
+        run: bash scripts/chart-gitsync_test.sh
+
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
 

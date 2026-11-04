@@ -66,3 +66,160 @@ resources:
 serviceAccount:
   create: true
   name: ""
+
+# Optional git-sync add-on: a second workload that mirrors your internal git
+# repositories (read-only) to the Memento replica over an outbound-only tunnel.
+# It is a SEPARATE connector: its own image, its own connector ID, its own
+# registration token, its own volume. Everything below is ignored unless
+# gitSync.enabled is true, and enabling it leaves the connector resources above
+# unchanged. See docs/git-sync.md and docs/git-sync-security.md.
+#
+# Always quote values that look like numbers in a values file, for example
+# tag: "20261022.0" or sizeLimit: "21474836480". An unquoted YAML number is read as
+# a floating-point number and can be printed in exponent form (2.0261022e+07), and
+# Helm also keeps `--set` integers as floats in the release history. A quoted
+# string is never reformatted.
+#
+# Maintainers: the templates also carry these defaults (templates/_gitsync.tpl,
+# "mkonnect.gitsync.defaults") so they render under `helm upgrade --reuse-values`
+# on Helm 3, which does not apply a new chart's defaults. Change both together;
+# scripts/chart-gitsync_test.sh fails if they differ.
+gitSync:
+  enabled: false
+
+  image:
+    # required when enabled: the git-sync image repository, e.g.
+    # public.ecr.aws/<alias>/memento-gitsync
+    repository: ""
+    pullPolicy: IfNotPresent
+    # Defaults to Chart.appVersion. The git-sync image is published separately
+    # from the chart and may be missing for a given release: check that the
+    # release's release-metadata.json has a non-null git_sync_release_id before
+    # enabling or upgrading.
+    tag: ""
+    # Recommended: pin the immutable image digest ("sha256:...", git_sync_image_digest
+    # in release-metadata.json). When set, the image is <repository>@<digest> and the
+    # tag is ignored.
+    digest: ""
+
+  config:
+    # Defaults to the top-level config.gatewayUrl. Copy it exactly from the portal.
+    gatewayUrl: ""
+    # required when enabled: the connector ID issued for THIS git-sync connector.
+    # It must differ from the connector's own config.connectorId.
+    connectorId: ""
+    # Defaults to the top-level config.protocolVersion.
+    protocolVersion: ""
+    # required when enabled: the replica host the connector may push to, from the
+    # installation instructions you were given for your tenant: a host name (or IP
+    # address, or [IPv6]), optionally with :port. No scheme and no path. The port
+    # defaults to 443. The connector rejects any configuration naming a different
+    # replica host or port.
+    replicaHost: ""
+    # Path of the signing key inside the container. Must be under /data (the
+    # persistent volume): the rest of the root filesystem is read-only.
+    keyFile: "/data/gitsync-key"
+
+    # One-time registration token, delivered to the pod as a mounted file
+    # (REGISTRATION_TOKEN_FILE), never as an environment variable. It is only
+    # needed on first start; once the connector has registered it can be removed.
+    #
+    # Preferred: reference an existing Secret you manage.
+    registrationTokenSecret:
+      name: ""                # name of an existing Secret; empty = not used
+      key: "registration-token"
+    # Alternative: let the chart create a Secret from this value. Prefer
+    # `--set-file gitSync.config.registrationToken=<file>` over `--set` so the
+    # token does not land in your shell history. Ignored when
+    # registrationTokenSecret.name is set. With neither, no token is mounted.
+    registrationToken: ""
+
+  # Optionally mount a pre-created Secret as the git-sync provider config (the
+  # origin base URL and credential per git host), instead of writing it at
+  # runtime with `connector config set`. The Secret holds the JSON under `key`:
+  #   { "internal-git": { "base_url": "https://git.example.com",
+  #                       "auth": "bearer", "token": "<access-token>" } }
+  # It is mounted read-only OUTSIDE the data volume, so `connector config set`
+  # cannot write to it; manage it by updating the Secret and restarting the pod.
+  # When secretName is empty the connector uses a writable /data/git-sync.json
+  # that you manage with `connector config set`.
+  # Mirrors are always stored under /data/mirrors (GIT_SYNC_MIRRORS_DIR is set
+  # explicitly), never beside the read-only Secret mount.
+  providerConfig:
+    secretName: ""
+    key: "git-sync.json"
+
+  # Optionally mount a Secret holding a PEM bundle for git to trust (for example
+  # an internal CA that signs your git server's certificate). It is exported as
+  # GIT_SSL_CAINFO. Git then uses THIS bundle INSTEAD of the system trust store
+  # for every connection it makes, including the push to the replica, so the
+  # bundle must also contain the public root(s) that sign the replica's
+  # certificate. The mount path must not overlap any other mount of the pod.
+  caBundle:
+    secretName: ""            # name of an existing Secret holding the PEM bundle; empty disables
+    key: "ca-bundle.pem"
+    mountPath: "/etc/mkonnect-gitsync-ca"
+
+  # The git-sync volume. It is its own PersistentVolumeClaim (never the
+  # connector's) and holds the signing key and the bare mirror of every
+  # repository. Fetched objects are written into the mirrors here (and
+  # repacked there), so this is where headroom matters: size it at roughly
+  # 1.2x the sum of your mirrored repositories, plus growth.
+  persistence:
+    size: 20Gi
+    storageClass: ""
+
+  # Scratch space (/tmp) is a disk-backed emptyDir, not memory. It holds only
+  # each sync's empty home directory and git's own temporary files, not the
+  # mirrors, so it is much smaller than the data volume. The kubelet evicts the
+  # pod if the limit is exceeded.
+  tmp:
+    sizeLimit: 5Gi
+
+  # To remove a default, such as the CPU limit, set it to null:
+  #   --set gitSync.resources.limits.cpu=null
+  # (Helm drops the key before rendering). Setting it to an empty value does not
+  # remove it.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  # Optional outbound proxy. Each value is exported in upper and lower case
+  # (HTTPS_PROXY and https_proxy, HTTP_PROXY and http_proxy, NO_PROXY and no_proxy)
+  # because git's HTTP library reads only the lower-case http_proxy, while Go reads
+  # either. git-sync passes exactly these variables to git (fetch and push), and the
+  # connector's own gateway connection (Go's default HTTP transport) reads them too.
+  # Do not embed credentials in a proxy URL here: values are visible in the
+  # Deployment spec.
+  proxy:
+    https: ""                 # e.g. http://proxy.example.com:3128
+    http: ""
+    noProxy: ""               # e.g. .cluster.local,10.0.0.0/8
+
+  # A dedicated ServiceAccount whose token is never mounted into the pod.
+  serviceAccount:
+    create: true
+    name: ""
+
+  networkPolicy:
+    # Rendered only while gitSync.enabled is true. Denies ALL ingress to the
+    # git-sync pods (the connector only dials out). Requires a CNI that enforces
+    # NetworkPolicy.
+    enabled: true
+    # Optional egress allow-list; empty (the default) leaves egress unrestricted.
+    # When cidrs is set, egress is limited to those CIDRs on `ports` (TCP) plus DNS
+    # (port 53) to the dnsNamespace. A NetworkPolicy matches addresses, not host
+    # names, so the list must cover the gateway, the replica and every origin git
+    # host, and must be kept current if their addresses change. Add any
+    # non-443 port (for example a replica host pinned as host:8443, or a git
+    # server on another port) to `ports`. The DNS rule targets the cluster DNS
+    # pods through dnsNamespace; it does not match a node-local DNS cache.
+    egress:
+      cidrs: []               # e.g. ["203.0.113.0/24", "198.51.100.10/32"]
+      ports: [443]
+      # Namespace that runs the cluster DNS service.
+      dnsNamespace: kube-system
