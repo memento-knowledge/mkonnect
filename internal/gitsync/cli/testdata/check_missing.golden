@@ -1,0 +1,7 @@
+=== git-sync provider config ===
+  File: <config> (from GIT_SYNC_CONFIG_FILE)
+  Checked as uid N; the connector must run as a user that can read this file.
+  The file does not exist. The connector starts with no providers, so every repository is reported as not host-matched.
+
+=== Providers ===
+  (none)

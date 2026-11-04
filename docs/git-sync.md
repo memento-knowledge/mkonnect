@@ -401,6 +401,38 @@ Each entry has `base_url` (required), `auth` (`bearer`, `basic`, or omitted for 
 outside the data volume, so `connector config set` cannot modify it: change it by updating the
 Secret. The mirrors stay on the data volume under `/data/mirrors`.
 
+**Check the file before you restart.** `connector config check` loads the provider configuration
+the way git-sync does at startup and reports every problem in it at once, instead of the first one
+the connector would stop at. It contacts no server and never prints a credential, or any value from
+the file: for each valid provider it shows the name, the canonical host key a repository's origin
+URL must resolve to, the authentication mode, and where the credential comes from (today: `inline
+token`, stored in the file).
+
+```bash
+docker exec -i mkonnect-gitsync /mkonnect-gitsync connector config check
+```
+
+```text
+=== Providers ===
+  NAME      HOST KEY                      AUTH    CREDENTIAL
+  internal  https://git.example.com:443   bearer  inline token
+
+=== Errors ===
+  [credentials] provider "other" (field token): token must be at least 16 characters
+```
+
+Each error starts with a class: `file` (cannot be read, is not a regular file, is too large, or has
+unsafe permissions), `syntax` (not one JSON value), `schema` (an unknown field, or a setting that is
+not a string), `provider_name`, `base_url`, `credentials`, or `duplicate_host`, followed by the
+provider and the field at fault. A provider name or field that is not valid is described by its
+position or length, never repeated. The command exits non-zero if the connector would refuse the
+file. It checks the file named by `GIT_SYNC_CONFIG_FILE`, else `/data/git-sync.json` (there is no
+path option, so it cannot read a different file from the one git-sync reads); a missing file at the
+default path is only reported, since git-sync then starts with no providers, but a missing file that
+`GIT_SYNC_CONFIG_FILE` names is an error. Run it as the user git-sync runs as and with the same
+environment: like git-sync, it tightens the file to owner-only (`0600`) where it is allowed to, and
+it warns when the file was wider than that.
+
 **Changes need a restart.** git-sync reads its provider configuration once, at startup; there is
 no reload signal. After any change, including rotating or revoking a credential:
 
@@ -810,7 +842,7 @@ clears the error.
 | `repository_over_limit` | The repository's mirror is larger than the size ceiling Memento configured, so nothing was pushed. Raising the ceiling is a Memento-side setting; contact Memento with the repository ID. The mirror stays on the data volume. |
 | `local_disk_exhausted` | The data volume or the `/tmp` scratch space is full. The mirrors are on the data volume: grow `gitSync.persistence.size` (or the Docker volume's backing disk). For `/tmp`, raise `gitSync.tmp.sizeLimit`. See [Sizing](#sizing). |
 | `job_out_of_memory` | git was killed for lack of memory. Raise the memory limit (`gitSync.resources.limits.memory`, or `--memory` with Docker). |
-| `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
+| `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. Text a server sent in its own error (git's `remote error:` and `remote:` lines) is replaced by a fixed note, and any credential git-sync held for the sync is removed from git's output before it is read. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
 | The status carries a `config_error` (how the portal shows it is up to the platform) | The platform sent a configuration that git-sync rejected as a whole, and the previous configuration stays in effect. See [Rejected configuration](#rejected-configuration-config_error) for each reason, including the two replica-host pin errors, `replica_host_not_pinned` and `replica_host_mismatch`, that you can fix yourself. |
 | The status carries `suspended: critical_update_required`, and the log says `gateway requires a critical security update` | git-sync starts no new sync until it is upgraded. Upgrade to the latest release; see [While syncing is suspended](#while-syncing-is-suspended). |
 | A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time by default, and a repository waiting for a slot is also reported as `syncing`). Watch `kubectl logs` / `docker logs` for the outcome. |
@@ -820,7 +852,7 @@ clears the error.
 | Log warns `mirror cleanup skipped: the system clock reads an implausibly early time` | The host clock is before 2025. Fix the clock (NTP); cleanup resumes by itself. |
 | Container exits at start with `configuration error: GATEWAY_URL …` or `CONNECTOR_ID is required` | `GATEWAY_URL` must be an absolute `wss://` URL, and `CONNECTOR_ID` must be set. |
 | Container exits at start with `configuration error: REGISTRATION_TOKEN_FILE: …` | The registration token file could not be used. The message says which: `must be an absolute path`; `opening <path>: …` (the file is missing or unreadable: the volume or Secret is not mounted, or the Secret or key name is wrong); `<path> is not a regular file`; `<path> has unsafe permissions` (accessible by others or writable by group: use mode `0600`, `0640`, `0440`, or `0400`; in Docker re-create it as described in [Option A](#option-a-docker)); `<path> is larger than 4096 bytes` (you pointed it at the wrong file); `<path> is empty`. After registration, either keep the file or remove `REGISTRATION_TOKEN_FILE` together with it. |
-| Start fails with `local config load failed` | The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file readable by others. The message names the cause; it never includes a credential. |
+| Start fails with `local config load failed` | Run `connector config check` to see every problem at once. The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file readable by others. The message names the cause; it never includes a credential. |
 | Start fails with `temp directory … is not writable` | `/tmp` is not writable by uid 65532. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |

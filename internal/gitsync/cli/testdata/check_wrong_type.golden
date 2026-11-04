@@ -1,0 +1,9 @@
+=== git-sync provider config ===
+  File: <config> (from GIT_SYNC_CONFIG_FILE)
+  Checked as uid N; the connector must run as a user that can read this file.
+
+=== Providers ===
+  (none)
+
+=== Errors ===
+  [schema] the config file has a token setting that is not a string (at byte offset 82)

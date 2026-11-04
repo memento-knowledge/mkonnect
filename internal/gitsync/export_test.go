@@ -101,3 +101,12 @@ func (c *Client) IdleForTest() bool { return c.mgr.idle() }
 func WithRunSaveIntervalForTest(d time.Duration) Option {
 	return func(o *clientOptions) { o.runSaveInterval = d }
 }
+
+// RealGitRunnersForTest returns the runners the daemon uses to execute git, so a test can wrap them to
+// record exactly what the connector hands to git while still running the real binary.
+func RealGitRunnersForTest() (
+	run func(ctx context.Context, argv, env []string, dir string) ([]byte, error),
+	runOut func(ctx context.Context, argv, env []string, dir string, stdout io.Writer) ([]byte, error),
+) {
+	return runGit, runGitOut
+}

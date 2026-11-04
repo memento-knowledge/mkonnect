@@ -1,7 +1,6 @@
 package gitsync
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -37,40 +36,40 @@ type LocalEntry struct {
 func (e LocalEntry) Validate() error {
 	u, err := validateRemoteURL(e.BaseURL)
 	if err != nil {
-		return fmt.Errorf("base_url %w", err)
+		return fieldErr("base_url", "base_url "+err.Error())
 	}
 	token := e.Token.Reveal()
 	switch e.Auth {
 	case "":
 		if e.Username != "" || token != "" {
-			return errors.New("credentials require an authentication mode")
+			return fieldErr("auth", "credentials require an authentication mode")
 		}
 		return nil
 	case "bearer":
 		if e.Username != "" {
-			return errors.New("bearer authentication must not include a username")
+			return fieldErr("username", "bearer authentication must not include a username")
 		}
 	case "basic":
 		if e.Username == "" {
-			return errors.New("basic authentication requires a username")
+			return fieldErr("username", "basic authentication requires a username")
 		}
 		if strings.ContainsRune(e.Username, ':') {
-			return errors.New("basic authentication username must not contain ':'")
+			return fieldErr("username", "basic authentication username must not contain ':'")
 		}
 	default:
-		return errors.New("unsupported authentication mode")
+		return fieldErr("auth", "unsupported authentication mode")
 	}
 	if utf8.RuneCountInString(token) < minTokenLength {
-		return fmt.Errorf("token must be at least %d characters", minTokenLength)
+		return fieldErr("token", fmt.Sprintf("token must be at least %d characters", minTokenLength))
 	}
 	// Control characters are rejected because the token becomes an Authorization header value in a
 	// subprocess environment (the reachability probe and the mirror fetch); CR/LF/NUL there is an
 	// injection vector.
 	if strings.ContainsFunc(token, func(r rune) bool { return unicode.IsControl(r) }) {
-		return errors.New("token must not contain control characters")
+		return fieldErr("token", "token must not contain control characters")
 	}
 	if u.Scheme != "https" {
-		return errors.New("base_url must use https when an authentication mode is set")
+		return fieldErr("base_url", "base_url must use https when an authentication mode is set")
 	}
 	return nil
 }
