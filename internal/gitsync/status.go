@@ -16,8 +16,8 @@ const (
 	// statusWriteTimeout bounds the connection-time status write, before the heartbeat exists to
 	// tear down a wedged connection.
 	statusWriteTimeout = 30 * time.Second
-	// dispatchStatusTimeout bounds a status write made from the read loop or a probe goroutine,
-	// whose context is the process-lifetime Connect context.
+	// dispatchStatusTimeout bounds a status write made from the read loop, a sync completion or a
+	// probe goroutine, whose context carries no per-write bound of its own.
 	dispatchStatusTimeout = 10 * time.Second
 	// rfc3339Nano is a fixed-width RFC3339 layout that always carries a sub-second fraction, so
 	// sent_at is stable even when the nanosecond component is zero.
@@ -70,7 +70,6 @@ func (c *Client) sendCurrentStatus() {
 func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	c.mu.Lock()
 	cv := cloneRaw(c.configVersion)
-	accepted := c.configAccepted
 	var configErr *proto.GitSyncConfigError
 	if c.configErr != nil {
 		configErr = &proto.GitSyncConfigError{ConfigVersion: cloneRaw(c.configErr.ConfigVersion), Reason: c.configErr.Reason}
@@ -123,11 +122,16 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 		s := earliest.UTC().Format(time.RFC3339)
 		status.EarliestPushTokenExpiresAt = &s
 	}
-	// origin_check is a connector-level, pre-configuration signal only.
-	if !accepted {
-		if oc := c.originCheck.Load(); oc != nil {
-			status.OriginCheck = oc
-		}
+	// origin_check is a connector-level signal carried by every status for as long as the latest
+	// probe produced a result; it is nil when there are no local providers to probe or the probe
+	// could not run. The platform re-reads it on each status, so it is never latched.
+	if oc := c.originCheck.Load(); oc != nil {
+		status.OriginCheck = oc
+	}
+	// suspended follows the critical-update gate, so it clears by itself once the gateway stops
+	// requiring the update.
+	if c.criticalPatchRequired.Load() {
+		status.Suspended = proto.GitSyncSuspendedCriticalUpdate
 	}
 	return status
 }

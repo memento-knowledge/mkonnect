@@ -19,6 +19,16 @@ func (c *Client) HandleSyncNowForTest(msg proto.GitSyncNowMsg) []string { return
 // SetCriticalPatchForTest sets the critical-patch gate without a handshake.
 func (c *Client) SetCriticalPatchForTest(v bool) { c.criticalPatchRequired.Store(v) }
 
+// EffectiveLimitsForTest exposes effectiveLimits.
+func (c *Client) EffectiveLimitsForTest() Limits { return c.effectiveLimits() }
+
+// ProbeInFlightForTest reports whether an origin probe goroutine is running, so a test can wait for
+// it to stop before asserting that something did not happen.
+func (c *Client) ProbeInFlightForTest() bool { return c.probing.Load() }
+
+// OriginCheckIntervalForTest is the probe spacing once a configuration has been accepted.
+const OriginCheckIntervalForTest = originCheckInterval
+
 // CanonicalHostKeyForTest exposes the host-canonicalization used by the match guard so a test can
 // assert that a bad host is rejected (an error), not merely that it fails to match a provider.
 func CanonicalHostKeyForTest(raw string) (string, error) { return canonicalHostKey(raw) }

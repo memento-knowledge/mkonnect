@@ -9,47 +9,91 @@ import (
 	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
-// maybeProbe launches a pre-config origin reachability probe on a goroutine if the connector has no
-// accepted configuration, has at least one local provider, is not already probing, and has not
-// probed within the health cadence. The probe and its status send run under the CONNECTION context
-// captured in OnConnected (not a per-heartbeat context, which the gateway cancels on return), so a
-// heartbeat-triggered refresh is not killed the instant OnHeartbeat returns. The throttle applies to
-// every attempt — including failed ones — so a persistent local fault (e.g. git missing) does not
-// exec git on every heartbeat. A probe cancelled by a closing connection is never cached.
+// originCheckInterval is the minimum spacing between origin reachability probes once a configuration
+// has been accepted. Before that the probe runs at the gateway health cadence, so setup feedback is
+// quick; afterwards the result only needs to stay fresh, and a probe is a git subprocess talking to
+// the origin.
+const originCheckInterval = 5 * time.Minute
+
+// maybeProbe launches an origin reachability probe on a goroutine if the connector has at least one
+// local provider, is not already probing, and the previous probe started long enough ago: the
+// gateway health cadence while no configuration has been accepted (setup feedback), originCheckInterval
+// afterwards. The probe and its status send run under the CONNECTION context captured in OnConnected
+// (not a per-heartbeat context, which the gateway cancels on return), so a heartbeat-triggered
+// refresh is not killed the instant OnHeartbeat returns. The throttle applies to every attempt —
+// including failed ones — so a persistent local fault (e.g. git missing) does not exec git on every
+// heartbeat. A probe is committed only while its connection is still the current one and still open
+// (checked together under mu, with the store): one cut short by its connection closing, or
+// overtaken by a newer connection, never caches a result, clears one, or sends a status, and it
+// does not count against the cadence, so the next connection probes at its first opportunity.
+// Cancellation comes from outside this package, so a connection can still close an instant after
+// the check; a probe that ran to completion is a true observation of the origin and may be kept
+// then. What must never happen is a killed git being read as "unreachable".
 func (c *Client) maybeProbe() {
 	c.mu.Lock()
 	accepted := c.configAccepted
 	ctx := c.connCtx
 	s := c.connSender
+	gen := c.connGen
 	c.mu.Unlock()
-	if accepted || ctx == nil || s == nil || ctx.Err() != nil {
+	if ctx == nil || s == nil || ctx.Err() != nil {
 		return
 	}
 	if c.local == nil || len(c.local.Names()) == 0 {
 		return
 	}
+	spacing := gateway.DefaultHeartbeatInterval
+	if accepted {
+		spacing = originCheckInterval
+	}
 	if !c.probing.CompareAndSwap(false, true) {
 		return
 	}
-	if c.now().Sub(time.Unix(0, c.lastProbe.Load())) < gateway.DefaultHeartbeatInterval {
+	start := c.now().UnixNano()
+	// Heartbeats do not arrive at exactly the health interval, so a probe is due a tenth early; a
+	// tick that lands just under the spacing would otherwise push the probe out to the next one.
+	// A negative gap means the clock stepped back, which must not stall the cadence until it
+	// catches up: it counts as elapsed.
+	if since := time.Duration(start - c.lastProbe.Load()); since >= 0 && since < spacing-spacing/10 {
 		c.probing.Store(false)
 		return
 	}
-	c.lastProbe.Store(c.now().UnixNano())
+	c.lastProbe.Store(start)
 	go func() {
 		defer c.probing.Store(false)
 		res, ok := c.runProbe(ctx)
-		if !ok || ctx.Err() != nil {
+		// Commit only while this probe's connection is still the current one and still open. A probe
+		// cut short by its connection closing, or one overtaken by a newer connection, changes
+		// nothing and gives its cadence slot back, so the next probe is not held off by it.
+		c.mu.Lock()
+		live := c.connGen == gen && ctx.Err() == nil
+		changed := false
+		if live {
+			if ok {
+				c.originCheck.Store(&proto.OriginCheck{Result: string(res), CheckedAt: c.now().UTC().Format(rfc3339Nano)})
+				changed = true
+			} else {
+				// A local fault says nothing about the origin, so the previous result can no longer
+				// be vouched for: drop it rather than keep reporting it as current.
+				changed = c.originCheck.Swap(nil) != nil
+			}
+		}
+		c.mu.Unlock()
+		if !live {
+			c.lastProbe.CompareAndSwap(start, 0)
 			return
 		}
-		c.originCheck.Store(&proto.OriginCheck{Result: string(res), CheckedAt: c.now().UTC().Format(rfc3339Nano)})
-		c.emitStatus(ctx, s, dispatchStatusTimeout)
+		if changed {
+			c.emitStatus(ctx, s, dispatchStatusTimeout)
+		}
 	}()
 }
 
 // runProbe probes every configured provider and aggregates worst-to-best (access_denied over
 // unreachable over reachable). ok is false when no provider yielded a usable result (for example
-// git is not installed), in which case origin_check is left absent.
+// git is not installed): a local fault, which maybeProbe logs through here and answers by leaving
+// origin_check absent. A provider that faults while another yields a result is skipped, so the
+// aggregate covers only the providers that could be checked.
 func (c *Client) runProbe(ctx context.Context) (OriginResult, bool) {
 	rank := map[OriginResult]int{OriginReachable: 0, OriginUnreachable: 1, OriginAccessDenied: 2}
 	worst := OriginReachable

@@ -176,6 +176,13 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		c.rejectConfig(version, proto.GitSyncConfigErrInvalidConfigVersion)
 		return false
 	}
+	limits, err := ResolveLimits(msg.Schedule, msg.Limits)
+	if err != nil {
+		// The error names the offending field and carries no wire value, so it is safe to log.
+		slog.Warn("git_sync_config has a schedule or limit out of range", "err", err)
+		c.rejectConfig(version, proto.GitSyncConfigErrLimitsOutOfRange)
+		return false
+	}
 	next := make(map[string]repoState, len(msg.Repositories))
 	for i, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
@@ -241,6 +248,8 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
 	c.configErr = nil
+	// The configuration is a full replace, so limits it leaves out revert to their defaults.
+	c.limits.Store(&limits)
 	runsChanged := c.reconcileRunsLocked(next)
 	c.mu.Unlock()
 	if runsChanged {

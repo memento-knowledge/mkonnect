@@ -236,11 +236,13 @@ func TestClientScheduledSyncRunsWhenDueAndNotWhileSuspended(t *testing.T) {
 
 func TestClientRunDrivesTheSchedulerAndStopsItOnShutdown(t *testing.T) {
 	e := newSchedEnv(t, time.Now)
+	e.c.sched.tick = 2 * time.Millisecond
+	e.configure("", "repo-a")
+	// Set after configuring: an accepted configuration is a full replace of the limits, and one that
+	// leaves them out restores the defaults. 20ms is also below what a configuration may ask for.
 	l := DefaultLimits()
 	l.Interval = 20 * time.Millisecond
 	e.c.limits.Store(&l)
-	e.c.sched.tick = 2 * time.Millisecond
-	e.configure("", "repo-a")
 
 	ctx, cancel := context.WithCancel(e.ctx)
 	done := make(chan struct{})

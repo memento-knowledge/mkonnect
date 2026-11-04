@@ -155,8 +155,8 @@ type Client struct {
 	replicaHost string
 
 	// limits holds the effective schedule and resource limits. It starts as DefaultLimits and is
-	// replaced as a whole by whatever resolves a configuration's limits (ResolveLimits); until that
-	// is wired in, the defaults apply. Read it through effectiveLimits.
+	// replaced as a whole by each accepted configuration, which is a full replace: limits it leaves
+	// out revert to their defaults. Read it through effectiveLimits.
 	limits atomic.Pointer[Limits]
 
 	// Completion-triggered statuses are coalesced: see notifyStatus.
@@ -172,8 +172,9 @@ type Client struct {
 	// wire order matches sequence order.
 	seq atomic.Uint64
 
-	// originCheck caches the most recent pre-config reachability result; probing is guarded so only
-	// one probe runs at a time and no more often than the health cadence.
+	// originCheck caches the most recent origin reachability result, reported in every status; nil
+	// when there is none (no local provider, or the last probe could not run). probing is guarded so
+	// only one probe runs at a time, and see maybeProbe for how often it runs.
 	originCheck atomic.Pointer[proto.OriginCheck]
 	probing     atomic.Bool
 	lastProbe   atomic.Int64 // UnixNano of the last probe start
@@ -205,6 +206,8 @@ type Client struct {
 	// per-heartbeat context the gateway cancels as soon as OnHeartbeat returns.
 	connCtx    context.Context
 	connSender gateway.Sender
+	// connGen counts connections, so work started on one can tell it has been superseded.
+	connGen uint64
 
 	// statusMu serialises build-and-send so a heartbeat cannot send a stale snapshot after the read
 	// loop has already sent a newer one, and so the sequence number matches wire order.
@@ -245,6 +248,8 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		gc:             newMirrorGC(),
 		replicaHost:    replicaHost,
 	}
+	defaults := DefaultLimits()
+	c.limits.Store(&defaults)
 	c.runs = c.runStore.load()
 	c.mgr = newManager(defaultSyncConcurrency,
 		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, runOut: o.runOut, now: now},
@@ -257,8 +262,6 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 			suspended: c.criticalPatchRequired.Load,
 			changed:   c.notifyStatus,
 		})
-	defaults := DefaultLimits()
-	c.limits.Store(&defaults)
 	c.sched = newScheduler(schedHooks{
 		repos:     c.schedulableTargets,
 		enqueue:   c.mgr.enqueueScheduled,
@@ -320,22 +323,23 @@ func (c *Client) OnHandshake(info gateway.HandshakeInfo) {
 	}
 }
 
-// OnConnected sends an immediate status (so the platform sees the connector promptly) and starts a
-// pre-config origin reachability probe off the connection goroutine; the probe's result arrives in
-// a later status, so the first write is never blocked on the network. The connection context and
+// OnConnected sends an immediate status (so the platform sees the connector promptly) carrying the
+// last origin check, if any, and starts a new origin reachability probe off the connection
+// goroutine if the cadence allows; its result arrives in a later status, so the first write is
+// never blocked on the network. The connection context and
 // sender are captured so a later heartbeat-triggered probe runs under the connection's lifetime.
 func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
 	c.mu.Lock()
 	c.connCtx = ctx
 	c.connSender = s
+	c.connGen++
 	c.mu.Unlock()
-	c.lastProbe.Store(0) // allow an immediate probe on each new connection
 	c.emitStatus(ctx, s, statusWriteTimeout)
 	c.maybeProbe()
 }
 
 // OnHeartbeat pushes the current status each tick (the status resend cadence is the gateway health
-// interval), refreshing the pre-config origin check no more often than that interval.
+// interval), refreshing the origin check at the cadence maybeProbe describes.
 func (c *Client) OnHeartbeat(ctx context.Context, s gateway.Sender) error {
 	c.maybeProbe()
 	return c.sendStatus(ctx, s)
