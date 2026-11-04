@@ -95,7 +95,7 @@ func TestSlotPoolServesWaitersInArrivalOrder(t *testing.T) {
 			p.release()
 		}()
 		// Let each goroutine queue before starting the next, so arrival order is defined.
-		time.Sleep(20 * time.Millisecond)
+		expectQueued(t, p, i+1)
 	}
 	p.release()
 	wg.Wait()
@@ -175,5 +175,53 @@ func TestSlotPoolNeverDropsBelowOne(t *testing.T) {
 	p.release()
 	if !p.acquire(context.Background()) {
 		t.Fatal("a pool resized below 1 must still allow one holder")
+	}
+}
+
+// The two ways a wait can end by cancellation, driven directly so neither depends on scheduling.
+func TestSlotPoolAbandonAfterTheSlotWasGrantedHandsItBack(t *testing.T) {
+	p := newSlotPool(1)
+	p.acquire(context.Background())
+
+	first := &slotWaiter{ready: make(chan struct{})}
+	second := &slotWaiter{ready: make(chan struct{})}
+	p.mu.Lock()
+	e1 := p.waiters.PushBack(first)
+	p.waiters.PushBack(second)
+	p.mu.Unlock()
+
+	p.release() // grants the slot to first
+	if !first.granted {
+		t.Fatal("setup: the slot was not granted to the first waiter")
+	}
+	p.abandon(first, e1) // first was cancelled before it noticed
+
+	if !second.granted {
+		t.Error("the slot first gave up was not passed to the next waiter")
+	}
+	p.mu.Lock()
+	held, queued := p.held, p.waiters.Len()
+	p.mu.Unlock()
+	if held != 1 || queued != 0 {
+		t.Errorf("held=%d queued=%d, want 1 held (by second) and nothing queued", held, queued)
+	}
+}
+
+func TestSlotPoolAbandonBeforeAnyGrantLeavesTheQueue(t *testing.T) {
+	p := newSlotPool(1)
+	p.acquire(context.Background())
+	w := &slotWaiter{ready: make(chan struct{})}
+	p.mu.Lock()
+	e := p.waiters.PushBack(w)
+	p.mu.Unlock()
+
+	p.abandon(w, e)
+	p.release()
+
+	p.mu.Lock()
+	held, queued := p.held, p.waiters.Len()
+	p.mu.Unlock()
+	if w.granted || held != 0 || queued != 0 {
+		t.Errorf("granted=%v held=%d queued=%d, want an abandoned waiter to be skipped and the pool empty", w.granted, held, queued)
 	}
 }

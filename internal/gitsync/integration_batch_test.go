@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -462,4 +463,115 @@ func TestBatchedPushOverHTTP(t *testing.T) {
 			t.Errorf("replica saw Authorization %q", h)
 		}
 	}
+}
+
+// batchRefspecs returns every refspec carried by the batch pushes (not the plan, not the final push).
+func (r *pushRecorder) batchRefspecs() []string {
+	var out []string
+	for _, c := range r.pushes() {
+		if slices.Contains(c.argv, "--dry-run") || slices.Contains(c.argv, "--prune") {
+			continue
+		}
+		out = append(out, refspecsOf(c)...)
+	}
+	return out
+}
+
+// Git refuses the explicit refspec refs/heads/foo when the repository also has
+// refs/heads/refs/heads/foo ("matches more than one"), though the glob push handles both. Such refs
+// must be left to the final push, or the repository would fail every batched sync. The longer name is
+// first seen as a change (first sync) and then only as an up-to-date ref (second sync): both must count.
+func TestBatchedPushWithNamesGitFindsAmbiguousConverges(t *testing.T) {
+	e := newBatchEnv(t, 24)
+	e.lim.PushBatchRefs = 10
+	update := func(lines ...string) {
+		t.Helper()
+		gitStdin(t, "", strings.Join(lines, "\n")+"\n", "--git-dir="+e.origin, "update-ref", "--stdin")
+	}
+	update("create refs/heads/refs/heads/foo "+e.sha, "create refs/heads/refs/tags/fresh "+e.sha, "create refs/tags/refs/tags/t1x "+e.sha)
+
+	for phase, create := range [][]string{
+		nil, // phase 0: the shadows are new
+		{ // phase 1: the shadows are up to date; the shorter names arrive with enough other changes to batch
+			"create refs/heads/foo " + e.sha, "create refs/tags/fresh " + e.sha, "create refs/tags/t1x " + e.sha,
+		},
+	} {
+		if phase == 1 {
+			var more []string
+			for i := range 12 {
+				more = append(more, fmt.Sprintf("create refs/heads/extra%02d %s", i, e.sha))
+			}
+			update(append(create, more...)...)
+			// The premise: an explicit push of the shorter name really is refused by this git.
+			probe := t.TempDir()
+			git(t, "", "init", "--bare", probe)
+			if out, err := exec.Command("git", "--git-dir="+e.origin, "push", "--dry-run", probe, "+refs/heads/foo:refs/heads/foo").CombinedOutput(); err == nil {
+				t.Skipf("this git accepts the ambiguous refspec, so there is nothing to guard against: %s", out)
+			}
+		}
+		before := len(e.rec.batchRefspecs())
+		if res := e.sync(context.Background()); res.State != StateOK {
+			t.Fatalf("phase %d: sync = %+v, want ok", phase, res)
+		}
+		batched := e.rec.batchRefspecs()[before:]
+		if len(batched) == 0 {
+			t.Errorf("phase %d: no batch push ran: the test did not exercise batching", phase)
+		}
+		for _, spec := range batched {
+			for _, held := range []string{"refs/heads/foo:", "refs/tags/fresh:", "refs/tags/t1x:"} {
+				if strings.HasPrefix(spec[1:], held) {
+					t.Errorf("phase %d: batch carries %q, which git finds ambiguous", phase, spec)
+				}
+			}
+		}
+		e.wantReplicaEqualsOrigin()
+	}
+}
+
+// A ref git can store but that is too long to share an argument list is left to the final push, and
+// does not make the plan unusable.
+func TestBatchedPushWithAVeryLongRefConverges(t *testing.T) {
+	e := newBatchEnv(t, 24)
+	e.lim.PushBatchRefs = 10
+	var parts []string
+	for range 18 {
+		parts = append(parts, strings.Repeat("d", 100))
+	}
+	long := "refs/heads/" + strings.Join(parts, "/")
+	if len(long) <= maxBatchRefLen {
+		t.Fatalf("test ref is only %d bytes", len(long))
+	}
+	// Loose refs are files, so a name this long needs a filesystem with long paths; macOS caps a
+	// path at 1024 bytes, which the origin, the mirror and the replica would each exceed.
+	if runtime.GOOS != "linux" {
+		t.Skip("needs a platform whose path limit allows a ref name over 1 KiB")
+	}
+	gitStdin(t, "", "create "+long+" "+e.sha+"\n", "--git-dir="+e.origin, "update-ref", "--stdin")
+
+	res := e.sync(context.Background())
+	if res.State != StateOK {
+		t.Fatalf("sync = %+v, want ok", res)
+	}
+	for _, spec := range e.rec.batchRefspecs() {
+		if strings.Contains(spec, long) {
+			t.Error("the over-long ref was placed in a batch")
+		}
+	}
+	if len(e.rec.batchRefspecs()) == 0 {
+		t.Error("no batch push ran: the test did not exercise batching")
+	}
+	e.wantReplicaEqualsOrigin()
+}
+
+// A mirror that fits in one batch is pushed once, as without batching, with no plan.
+func TestBatchedPushOfASmallMirrorIsNotPlanned(t *testing.T) {
+	e := newBatchEnv(t, 4) // 4 branches + main + 5 tags = 10 refs
+	e.lim.PushBatchRefs = 50
+	if res := e.sync(context.Background()); res.State != StateOK {
+		t.Fatalf("sync = %+v", res)
+	}
+	if want := []string{"final"}; !slices.Equal(e.rec.kinds(), want) {
+		t.Errorf("pushes = %v, want %v", e.rec.kinds(), want)
+	}
+	e.wantReplicaEqualsOrigin()
 }

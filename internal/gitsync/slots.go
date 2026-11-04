@@ -29,6 +29,8 @@ func newSlotPool(limit int) *slotPool {
 // is held. A slot is held until release is called.
 func (p *slotPool) acquire(ctx context.Context) bool {
 	p.mu.Lock()
+	// The empty-queue test is belt and braces: grantLocked runs on every release and resize, so a
+	// waiter only exists while the pool is full. It keeps a newcomer from ever passing one.
 	if p.waiters.Len() == 0 && p.held < p.limit {
 		p.held++
 		p.mu.Unlock()
@@ -44,16 +46,22 @@ func (p *slotPool) acquire(ctx context.Context) bool {
 	case <-ctx.Done():
 	}
 
+	p.abandon(w, elem)
+	return false
+}
+
+// abandon ends a wait that the caller's context cut short. If a slot had been granted in the
+// meantime it is handed back through the same path as release, so no waiter is left stalled below
+// the limit; otherwise the waiter just leaves the queue.
+func (p *slotPool) abandon(w *slotWaiter, elem *list.Element) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if w.granted {
-		// The grant raced the cancellation: the slot is ours, so hand it on through the normal path.
 		p.held--
 		p.grantLocked()
-		return false
+		return
 	}
 	p.waiters.Remove(elem)
-	return false
 }
 
 // release returns a slot.

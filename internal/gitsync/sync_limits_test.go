@@ -399,8 +399,22 @@ func TestPushIsNeverBatchedWithoutTheOutputSeam(t *testing.T) {
 	assertSinglePrunePush(t, f, d.mirrors.Dir("repo-a"))
 }
 
-func planOutput(upserts, deletes int) func(c gitCall) string {
+// manyRefs makes the fake mirror report n refs when they are counted for batching (a count of at most
+// the batch size skips the plan), and answers every other call with next, if any.
+func manyRefs(n int, next func(gitCall) string) func(gitCall) string {
 	return func(c gitCall) string {
+		if c.sub() == "for-each-ref" && slices.Contains(c.argv, "--format=x") {
+			return strings.Repeat("x\n", n)
+		}
+		if next != nil {
+			return next(c)
+		}
+		return ""
+	}
+}
+
+func planOutput(upserts, deletes int) func(c gitCall) string {
+	return manyRefs(1000, func(c gitCall) string {
 		if c.sub() != "push" || !slices.Contains(c.argv, "--dry-run") {
 			return ""
 		}
@@ -413,7 +427,7 @@ func planOutput(upserts, deletes int) func(c gitCall) string {
 			b.WriteString("-\t:refs/heads/d" + strconv.Itoa(i) + "\t[deleted]\n")
 		}
 		return b.String() + "Done\n"
-	}
+	})
 }
 
 // A change that fits one batch is the plan followed by today's single pruning push: deletions never
@@ -464,12 +478,12 @@ func TestUnreadablePlanPushesNothing(t *testing.T) {
 		"empty name":                    "*\trefs/heads/:refs/heads/\t[new branch]\n",
 	} {
 		t.Run(name, func(t *testing.T) {
-			f := &fakeGit{stdout: func(c gitCall) string {
+			f := &fakeGit{stdout: manyRefs(1000, func(c gitCall) string {
 				if c.sub() == "push" && slices.Contains(c.argv, "--dry-run") {
 					return out
 				}
 				return ""
-			}}
+			})}
 			d := limitsDeps(t, f, Limits{PushBatchRefs: 1})
 			got := syncRepo(context.Background(), d, testTask())
 			if got.State != StateError || got.ErrorType != ErrUnclassified || got.ErrorDetail != errPlanDetail {
@@ -483,7 +497,7 @@ func TestUnreadablePlanPushesNothing(t *testing.T) {
 }
 
 func TestPlanPushFailureIsClassifiedAsAPushFailure(t *testing.T) {
-	f := &fakeGit{script: func(c gitCall) ([]byte, error) {
+	f := &fakeGit{stdout: manyRefs(1000, nil), script: func(c gitCall) ([]byte, error) {
 		if c.sub() == "push" {
 			return []byte("fatal: unable to access 'https://replica.example.com/r/repo-a.git/': The requested URL returned error: 403"), errExit
 		}
@@ -564,7 +578,8 @@ func TestValidPushRef(t *testing.T) {
 		"refs/heads/a\x00b":      false,
 		"refs/heads/a\nb":        false,
 		"refs/heads/a\x7f":       false,
-		"refs/heads/" + strings.Repeat("a", maxRefLen): false,
+		"refs/heads/" + strings.Repeat("a", maxPlanRefLen-len("refs/heads/")):   true,
+		"refs/heads/" + strings.Repeat("a", maxPlanRefLen-len("refs/heads/")+1): false,
 	} {
 		if got := validPushRef(ref); got != want {
 			t.Errorf("validPushRef(%q) = %v, want %v", ref, got, want)
@@ -575,19 +590,29 @@ func TestValidPushRef(t *testing.T) {
 func TestSplitConflicts(t *testing.T) {
 	for name, tc := range map[string]struct {
 		upserts, deletes []string
+		shadows          []string
 		free, held       []string
 	}{
-		"nothing to delete":         {[]string{"refs/heads/a", "refs/heads/b"}, nil, []string{"refs/heads/a", "refs/heads/b"}, nil},
-		"unrelated delete":          {[]string{"refs/heads/a"}, []string{"refs/heads/b"}, []string{"refs/heads/a"}, nil},
-		"new file over stale dir":   {[]string{"refs/heads/x", "refs/heads/y"}, []string{"refs/heads/x/y"}, []string{"refs/heads/y"}, []string{"refs/heads/x"}},
-		"new dir under stale file":  {[]string{"refs/heads/x/y", "refs/heads/z"}, []string{"refs/heads/x"}, []string{"refs/heads/z"}, []string{"refs/heads/x/y"}},
-		"deep dir":                  {[]string{"refs/heads/a/b"}, []string{"refs/heads/a/b/c/d"}, nil, []string{"refs/heads/a/b"}},
-		"deep file":                 {[]string{"refs/heads/a/b/c"}, []string{"refs/heads/a/b"}, nil, []string{"refs/heads/a/b/c"}},
-		"shared prefix is no clash": {[]string{"refs/heads/xy", "refs/heads/x-1"}, []string{"refs/heads/x"}, []string{"refs/heads/xy", "refs/heads/x-1"}, nil},
-		"tags and heads are apart":  {[]string{"refs/tags/x"}, []string{"refs/heads/x/y"}, []string{"refs/tags/x"}, nil},
+		"nothing to delete":           {[]string{"refs/heads/a", "refs/heads/b"}, nil, nil, []string{"refs/heads/a", "refs/heads/b"}, nil},
+		"unrelated delete":            {[]string{"refs/heads/a"}, []string{"refs/heads/b"}, nil, []string{"refs/heads/a"}, nil},
+		"new file over stale dir":     {[]string{"refs/heads/x", "refs/heads/y"}, []string{"refs/heads/x/y"}, nil, []string{"refs/heads/y"}, []string{"refs/heads/x"}},
+		"new dir under stale file":    {[]string{"refs/heads/x/y", "refs/heads/z"}, []string{"refs/heads/x"}, nil, []string{"refs/heads/z"}, []string{"refs/heads/x/y"}},
+		"deep dir":                    {[]string{"refs/heads/a/b"}, []string{"refs/heads/a/b/c/d"}, nil, nil, []string{"refs/heads/a/b"}},
+		"deep file":                   {[]string{"refs/heads/a/b/c"}, []string{"refs/heads/a/b"}, nil, nil, []string{"refs/heads/a/b/c"}},
+		"shared prefix is no clash":   {[]string{"refs/heads/xy", "refs/heads/x-1"}, []string{"refs/heads/x"}, nil, []string{"refs/heads/xy", "refs/heads/x-1"}, nil},
+		"tags and heads are apart":    {[]string{"refs/tags/x"}, []string{"refs/heads/x/y"}, nil, []string{"refs/tags/x"}, nil},
+		"branch shadowed by a branch": {[]string{"refs/heads/foo", "refs/heads/bar"}, nil, []string{"refs/heads/refs/heads/foo"}, []string{"refs/heads/bar"}, []string{"refs/heads/foo"}},
+		"tag shadowed by a branch":    {[]string{"refs/tags/v1", "refs/tags/v2"}, nil, []string{"refs/heads/refs/tags/v1"}, []string{"refs/tags/v2"}, []string{"refs/tags/v1"}},
+		"tag shadowed by a tag":       {[]string{"refs/tags/v1"}, nil, []string{"refs/tags/refs/tags/v1"}, nil, []string{"refs/tags/v1"}},
+		"the shadow itself is fine":   {[]string{"refs/heads/refs/heads/foo"}, nil, []string{"refs/heads/refs/heads/foo"}, []string{"refs/heads/refs/heads/foo"}, nil},
+		"a ref too long for a batch":  {[]string{"refs/heads/" + strings.Repeat("a", maxBatchRefLen), "refs/heads/b"}, nil, nil, []string{"refs/heads/b"}, []string{"refs/heads/" + strings.Repeat("a", maxBatchRefLen)}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			free, held := splitConflicts(tc.upserts, tc.deletes)
+			shadowSet := map[string]struct{}{}
+			for _, sh := range tc.shadows {
+				shadowSet[sh] = struct{}{}
+			}
+			free, held := splitConflicts(tc.upserts, tc.deletes, shadowSet)
 			if !slices.Equal(free, tc.free) || !slices.Equal(held, tc.held) {
 				t.Errorf("free, held = %v, %v; want %v, %v", free, held, tc.free, tc.held)
 			}
@@ -653,5 +678,100 @@ func TestBatchArgumentsStayUnderTheByteBudget(t *testing.T) {
 		if total > maxBatchArgBytes {
 			t.Fatalf("a batch of %d refs takes %d bytes of refspec text, over the %d budget", len(b), total, maxBatchArgBytes)
 		}
+	}
+}
+
+// A mirror with no more refs than a batch cannot need batching, so it is pushed as it always was,
+// without the extra request to the replica that planning costs.
+func TestMirrorThatFitsOneBatchIsNotPlanned(t *testing.T) {
+	f := &fakeGit{stdout: manyRefs(5, planOutput(500, 0))}
+	d := limitsDeps(t, f, Limits{PushBatchRefs: 5})
+	if got := syncRepo(context.Background(), d, testTask()); got.State != StateOK {
+		t.Fatalf("sync = %+v", got)
+	}
+	assertSinglePrunePush(t, f, d.mirrors.Dir("repo-a"))
+}
+
+// When the refs cannot be counted the plan decides instead.
+func TestUncountableMirrorIsPlanned(t *testing.T) {
+	f := &fakeGit{stdout: planOutput(1, 0), script: func(c gitCall) ([]byte, error) {
+		if c.sub() == "for-each-ref" && slices.Contains(c.argv, "--format=x") {
+			return nil, errExit
+		}
+		return nil, nil
+	}}
+	d := limitsDeps(t, f, Limits{PushBatchRefs: 5})
+	if got := syncRepo(context.Background(), d, testTask()); got.State != StateOK {
+		t.Fatalf("sync = %+v", got)
+	}
+	if pushes := pushCalls(f); len(pushes) != 2 || !slices.Contains(pushes[0].argv, "--dry-run") {
+		t.Errorf("pushes = %v, want the plan then one push", pushes)
+	}
+}
+
+// The token is judged again before the plan, which is a request to the replica: one that expired
+// during the fetch is not used, and no push of any kind runs.
+func TestTokenExpiringDuringTheFetchStopsBeforeThePlan(t *testing.T) {
+	var expired bool
+	f := &fakeGit{stdout: planOutput(50, 0), script: func(c gitCall) ([]byte, error) {
+		if c.sub() == "fetch" {
+			expired = true
+		}
+		return nil, nil
+	}}
+	d := limitsDeps(t, f, Limits{PushBatchRefs: 5})
+	d.now = func() time.Time {
+		if expired {
+			return syncNow.Add(10 * 365 * 24 * time.Hour)
+		}
+		return syncNow
+	}
+	got := syncRepo(context.Background(), d, testTask())
+	if got.State != StateError || got.ErrorType != ErrPushTokenExpired {
+		t.Fatalf("result = %+v, want error/push_token_expired", got)
+	}
+	if n := len(pushCalls(f)); n != 0 {
+		t.Errorf("%d push(es) ran with an expired token, want none", n)
+	}
+}
+
+// A valid ref too long to share an argument list is not a reason to refuse the plan: it is written
+// by the final push, and the others go in batches. (The real-git version of this needs a platform
+// whose path limit allows such a name.)
+func TestLongRefIsLeftToTheFinalPush(t *testing.T) {
+	long := "refs/heads/" + strings.Repeat("d/", maxBatchRefLen/2)
+	long = strings.TrimSuffix(long, "/")
+	f := &fakeGit{stdout: manyRefs(1000, func(c gitCall) string {
+		if c.sub() != "push" || !slices.Contains(c.argv, "--dry-run") {
+			return ""
+		}
+		out := "*\t" + long + ":" + long + "\t[new branch]\n"
+		for i := range 11 {
+			out += "*\trefs/heads/n" + strconv.Itoa(i) + ":refs/heads/n" + strconv.Itoa(i) + "\t[new branch]\n"
+		}
+		return out
+	})}
+	d := limitsDeps(t, f, Limits{PushBatchRefs: 5})
+	if got := syncRepo(context.Background(), d, testTask()); got.State != StateOK {
+		t.Fatalf("sync = %+v, want ok", got)
+	}
+	var batched int
+	for _, c := range pushCalls(f) {
+		if slices.Contains(c.argv, "--dry-run") || slices.Contains(c.argv, "--prune") {
+			continue
+		}
+		batched += len(refspecsOf(c))
+		for _, spec := range refspecsOf(c) {
+			if len(spec) > maxBatchRefLen {
+				t.Errorf("a batch carries a %d byte refspec", len(spec))
+			}
+		}
+	}
+	if batched != 11 {
+		t.Errorf("batches carried %d refs, want the 11 short ones", batched)
+	}
+	pushes := pushCalls(f)
+	if last := pushes[len(pushes)-1]; !slices.Contains(last.argv, "--prune") || !slices.Equal(refspecsOf(last), mirrorRefspecs) {
+		t.Errorf("the last push = %v, want the full pruning push", last.argv)
 	}
 }

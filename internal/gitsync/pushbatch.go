@@ -1,6 +1,7 @@
 package gitsync
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"slices"
@@ -20,13 +21,17 @@ import (
 //  2. pushes only the creates and updates, in batches of at most push_batch_refs, with explicit
 //     refspecs and NO --prune (an explicit push never deletes);
 //  3. and only after every batch succeeded makes ONE final push of the full refspecs with --prune,
-//     which sends next to nothing (everything is already current) and carries all the deletions.
+//     which carries all the deletions and writes only what no batch could (everything else is
+//     already current, so it sends little).
 //
 // A batch that fails, a token that expires between batches, or a cancellation stops the sync before
 // the final push, so such a run deletes nothing. A rejected ref in the final push can leave some of
-// its deletions applied, as the unbatched push always could. Deletions are deliberately not batched:
-// the task for a single final prune step, and a deletion command carries no pack data to make a push
-// oversized.
+// its deletions applied, as the unbatched push always could.
+//
+// push_batch_refs bounds the refs written by a batch push, not the final push: that one also carries
+// every deletion (they are the job of the single final prune step, and a deletion command has no
+// pack data to make a push oversized) and the few refs that cannot go in a batch (see
+// splitConflicts), which are written by it.
 //
 // The empty-origin guard (hasPushableRefs) runs before any of this, so a mirror with no refs never
 // reaches a push at all. The window between the plan and the final push is the length of the batched
@@ -40,10 +45,15 @@ const (
 	// maxPlanBytes bounds the ref names a plan retains; a plan that needs more is refused, not
 	// truncated, because a partial plan cannot be pushed in full.
 	maxPlanBytes = 64 << 20
-	// maxPlanLine bounds one porcelain status line the plan reads.
-	maxPlanLine = 2048
-	// maxRefLen bounds one ref name accepted into argv.
-	maxRefLen = 1024
+	// maxPlanRefLen bounds a ref name the plan accepts: longer than any ref git can store (a path is
+	// at most 4096 bytes), so a plan naming one is not a plan from git.
+	maxPlanRefLen = 4096
+	// maxPlanLine bounds one porcelain status line the plan reads: two names, the flag, the
+	// separators and git's summary.
+	maxPlanLine = 2*maxPlanRefLen + 256
+	// maxBatchRefLen bounds a ref name placed in a batch's argv; a longer (but valid) one is left to
+	// the final push, which names no ref at all.
+	maxBatchRefLen = 1024
 )
 
 // errPlanDetail is the fixed detail reported when the plan cannot be trusted. It names nothing the
@@ -62,13 +72,13 @@ func (d syncDeps) pushStage(ctx context.Context, home string, t syncTask, lim Li
 	}
 
 	var batches [][]string
-	if lim.PushBatchRefs > 0 && d.runOut != nil {
+	if lim.PushBatchRefs > 0 && d.runOut != nil && d.mirrorMayExceedBatch(ctx, home, t, lim.PushBatchRefs) {
 		plan, res, ok := d.planPush(ctx, home, t, lim, stats)
 		if !ok {
 			return res
 		}
 		if len(plan.upserts) > lim.PushBatchRefs {
-			free, _ := splitConflicts(plan.upserts, plan.deletes)
+			free, _ := splitConflicts(plan.upserts, plan.deletes, plan.shadows)
 			batches = partitionBatches(free, lim.PushBatchRefs, maxBatchArgBytes)
 		}
 	}
@@ -85,6 +95,27 @@ func (d syncDeps) pushStage(ctx context.Context, home string, t syncTask, lim Li
 	// The one push that prunes. Unbatched, it is the whole push.
 	res, _ := d.pushOnce(ctx, home, t, lim, stats, &counter, mirrorRefspecs, true)
 	return res
+}
+
+// mirrorMayExceedBatch reports whether the mirror holds more refs than one batch, which is the only
+// case in which a push could need batching. A mirror that fits is pushed as it always was, without
+// the extra request to the replica that planning costs. When the refs cannot be counted it answers
+// yes, and the plan decides.
+func (d syncDeps) mirrorMayExceedBatch(ctx context.Context, home string, t syncTask, batch int) bool {
+	var n lineCounter
+	argv := []string{"git", "--git-dir=" + d.mirrors.Dir(t.RepoID), "for-each-ref", "--format=x", "refs/heads", "refs/tags"}
+	if _, err := d.runBoundedOut(ctx, d.fetchTimeoutOrDefault(), "ref count", argv, gitBaseEnv(home), home, &n); err != nil {
+		return true
+	}
+	return n.lines > batch
+}
+
+// lineCounter counts the lines written to it.
+type lineCounter struct{ lines int }
+
+func (c *lineCounter) Write(b []byte) (int, error) {
+	c.lines += bytes.Count(b, []byte{'\n'})
+	return len(b), nil
 }
 
 // pushOnce runs one push process and reports whether it succeeded; when it did not, the result says
@@ -171,6 +202,10 @@ func (d syncDeps) planPush(ctx context.Context, home string, t syncTask, lim Lim
 // untrusted text: each must pass validPushRef or the whole plan is unusable.
 type pushPlan struct {
 	upserts, deletes []string
+	// shadows are the names, on either side, of the form refs/heads/refs/... or refs/tags/refs/...
+	// Only those can make a shorter name ambiguous (see splitConflicts), so only those are kept of
+	// the up-to-date refs, which are most of a plan.
+	shadows map[string]struct{}
 
 	line     []byte
 	overLong bool
@@ -201,7 +236,7 @@ func (p *pushPlan) endLine() {
 	}
 	flag := line[0]
 	switch flag {
-	case '*', ' ', '+', '-':
+	case '*', ' ', '+', '-', '=':
 	default:
 		return
 	}
@@ -233,11 +268,29 @@ func (p *pushPlan) endLine() {
 		p.bad = true
 		return
 	}
-	if flag == '-' {
+	if isShadow(to) {
+		if p.shadows == nil {
+			p.shadows = map[string]struct{}{}
+		}
+		p.shadows[to] = struct{}{}
+	}
+	switch flag {
+	case '-':
 		p.deletes = append(p.deletes, to)
-	} else {
+	case '=':
+	default:
 		p.upserts = append(p.upserts, to)
 	}
+}
+
+// isShadow reports whether name is a branch or tag whose own name starts with "refs/", such as
+// refs/heads/refs/heads/x.
+func isShadow(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/heads/")
+	if !ok {
+		rest, ok = strings.CutPrefix(name, "refs/tags/")
+	}
+	return ok && strings.HasPrefix(rest, "refs/")
 }
 
 // unusable reports whether the plan must not be acted on: some status line was malformed, named an
@@ -254,7 +307,7 @@ func validPushRef(name string) bool {
 	if !ok {
 		rest, ok = strings.CutPrefix(name, "refs/tags/")
 	}
-	if !ok || rest == "" || len(name) > maxRefLen {
+	if !ok || rest == "" || len(name) > maxPlanRefLen {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
@@ -269,11 +322,15 @@ func validPushRef(name string) bool {
 }
 
 // splitConflicts separates the refs a push would write into those that can go in an explicit batch
-// and those that cannot: a ref that is a directory prefix of a ref the push would delete, or has one
-// as its own prefix (the replica still holds refs/heads/x/y while the mirror now has refs/heads/x).
-// An explicit push of such a ref fails to lock it; the final push, which deletes the other and
-// writes this one together, succeeds. The held-back refs are therefore left to the final push.
-func splitConflicts(upserts, deletes []string) (free, held []string) {
+// and those that cannot, which are left to the final push (whose glob refspecs name no ref):
+//   - a ref that is a directory prefix of a ref the push would delete, or has one as its own prefix
+//     (the replica still holds refs/heads/x/y while the mirror now has refs/heads/x). An explicit push
+//     of such a ref fails to lock it; the final push deletes the other and writes this one together;
+//   - a ref whose name another ref extends in a way git's name lookup also accepts: with both
+//     refs/heads/x and refs/heads/refs/heads/x, the refspec refs/heads/x matches more than one ref and
+//     git refuses it (shadows holds every such name of the plan, on either side);
+//   - a ref too long to put in an argument list with others.
+func splitConflicts(upserts, deletes []string, shadows map[string]struct{}) (free, held []string) {
 	deleted := make(map[string]struct{}, len(deletes))
 	dirs := map[string]struct{}{}
 	for _, d := range deletes {
@@ -285,9 +342,14 @@ func splitConflicts(upserts, deletes []string) (free, held []string) {
 		}
 	}
 	for _, u := range upserts {
-		conflict := false
+		conflict := len(u) > maxBatchRefLen
 		if _, ok := dirs[u]; ok {
 			conflict = true
+		}
+		for _, prefix := range []string{"refs/heads/", "refs/tags/"} {
+			if _, ok := shadows[prefix+u]; ok {
+				conflict = true
+			}
 		}
 		for i := 0; i < len(u) && !conflict; i++ {
 			if u[i] == '/' {

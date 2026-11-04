@@ -170,9 +170,10 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
 	}
 
-	// The connector's own repository ceiling: an oversized mirror is not pushed. The mirror is kept, so
-	// the next fetch stays incremental; the result repeats until the origin shrinks or the platform
-	// raises the ceiling.
+	// The connector's own repository ceiling: an oversized mirror is not pushed. It is checked after
+	// the fetch, so a repository far over the ceiling is still downloaded once. The mirror is kept, so
+	// the next fetch stays incremental; the result repeats until git reclaims enough space or the
+	// platform raises the ceiling.
 	if lim.MaxRepositoryMB > 0 {
 		over, err := mirrorExceeds(d.mirrors.Dir(t.RepoID), int64(lim.MaxRepositoryMB)*mebibyte)
 		if err != nil {

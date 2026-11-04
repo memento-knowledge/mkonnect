@@ -111,7 +111,7 @@ func packConfig(l Limits) [][2]string {
 // maintenanceConfig makes a fetch's automatic repack/gc run in the foreground when a repository
 // ceiling is in force. Detached, it would still be rewriting packs (briefly doubling their apparent
 // size) while the ceiling check measures the mirror, and could report a repository over the limit
-// that is not.
+// that is not. The maintenance then runs inside the fetch's own time budget.
 func maintenanceConfig(l Limits) [][2]string {
 	if l.MaxRepositoryMB <= 0 {
 		return nil
