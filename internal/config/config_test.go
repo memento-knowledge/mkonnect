@@ -12,7 +12,7 @@ import (
 // regardless of the ambient environment; the test then sets only what it needs.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "KEY_FILE", "PROTOCOL_VERSION", "ALLOW_INSECURE_GATEWAY", "CA_BUNDLE"} {
+	for _, k := range []string{"GATEWAY_URL", "CONNECTOR_ID", "REGISTRATION_TOKEN", "REGISTRATION_TOKEN_FILE", "KEY_FILE", "PROTOCOL_VERSION", "ALLOW_INSECURE_GATEWAY", "CA_BUNDLE"} {
 		t.Setenv(k, "")
 	}
 }

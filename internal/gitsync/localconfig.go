@@ -37,7 +37,7 @@ import (
 const minTokenLength = 16
 
 // DefaultConfigFile is where the provider config is read from when GIT_SYNC_CONFIG_FILE is unset.
-// Nothing mounts this path yet; packaging is tracked separately.
+// The container image creates /data for the non-root runtime user; mount a volume there.
 const DefaultConfigFile = "/data/git-sync.json"
 
 // DefaultConfigPath returns the provider-config path from GIT_SYNC_CONFIG_FILE, or the default. It
