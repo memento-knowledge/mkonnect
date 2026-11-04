@@ -86,7 +86,8 @@ before replicating them.
 |---|---|---|
 | Private signing key (ML-DSA-65) | `/data/gitsync-key` on the data volume | Mode `0600`, owner-only. Issued by the gateway at registration. Losing it means re-registering. |
 | Provider configuration, including your git server credential | A Secret mounted read-only at `/etc/mkonnect-gitsync-providers/`, or `/data/git-sync.json` on the data volume | In **cleartext** (not encrypted at rest by git-sync). git-sync tightens the file to owner-only (`0600`) where it can, and refuses to start with a read-only file that is group-writable or accessible by others. |
-| Mirrors of the replicated repositories | `/data/mirrors` on the data volume | A full copy of the history behind every branch and tag. Treat the volume as containing your source code. |
+| Mirrors of the replicated repositories | `/data/mirrors` on the data volume | A full copy of the history behind every branch and tag. Treat the volume as containing your source code. The mirror of a repository the platform stops listing is deleted once it has been unlisted for seven days (see [Mirror cleanup](git-sync.md#mirror-cleanup)); `GIT_SYNC_MIRROR_GC=off` turns that off. |
+| Run state | `/data/mirrors/run-state.json` on the data volume | Per repository: when the last attempt started and how long it took, when the last sync succeeded, how many refs it pushed, the newest commit time and default branch at your git server, and an unsalted SHA-256 hash of the origin and replica URLs (it does not reveal them, but could confirm a guessed pair). No credential, URL, host name, path, or error text. Mode `0600`. |
 | Replica push tokens | **Memory only** | Received from the platform per repository, with an expiry, and kept only for repositories that can be synced. Not written to disk and not logged. |
 | One-time registration token | A read-only file mounted from a Secret (Kubernetes) or from a dedicated Docker volume | Used once. Remove it after the connector has registered. It is never an environment variable. |
 | Per-sync scratch data | `/tmp` (disk-backed) | Each sync creates a throwaway, empty home directory for git, also used for git's temporary files, and removes it afterwards. The fetched objects themselves go into the mirror, not here. |
@@ -99,12 +100,18 @@ repository) takes effect at the next sync.
 
 The connector sends status: for each repository its ID, state (`pending`, `syncing`, `ok`,
 `error`), an error type, and, for failures it cannot classify, a single short detail line from
-which URLs, host names, and absolute paths have been removed. It also sends the configuration
-version it accepted, the earliest push-token expiry it holds, a per-process boot ID and sequence
-number, and, before any repository is configured, one aggregated reachability result for your
-configured git servers (`reachable`, `access_denied`, or `unreachable`; the worst outcome across
-them, not one per server). It never sends your git server credential, a repository's contents, or
-file paths.
+which URLs, host names, and absolute paths have been removed. It also sends, for each repository,
+the times of its last attempt and last success, how long the attempt took, how many refs it
+pushed, the newest commit time across the branches and tags, and the default branch name at your
+git server. It also sends the configuration version it accepted, the reason when it rejected a
+configuration, whether syncing is suspended pending a critical update, the earliest push-token
+expiry it holds, a per-process boot ID and sequence number, and one aggregated reachability result
+for your configured git servers (`reachable`, `access_denied`, or `unreachable`; the worst outcome
+across them, not one per server) with the time it was checked. That result is re-checked about
+every 30 seconds until a configuration is accepted and about every 5 minutes afterwards, and is
+absent when no provider is configured, before the first check has finished, and when the check
+cannot run. It never sends your git server credential, a repository's
+contents, or file paths.
 
 ### What is logged
 

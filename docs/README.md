@@ -8,7 +8,8 @@ Guides for administrators deploying and operating the mkonnect on-prem connector
   credentials safely.
 - **[git-sync guide](git-sync.md)** — optional add-on that mirrors selected internal git
   repositories (branches and tags) to Memento: install with Docker or Helm, configure your git
-  server credential, verify, upgrade, uninstall, and troubleshoot.
+  server credential, verify, understand the sync schedule, retries and what it keeps on disk,
+  upgrade, uninstall, and troubleshoot.
 - **[git-sync security and data handling](git-sync-security.md)** — for security reviewers: network
   destinations, data flow, credential custody, hardening, and network policy.
 

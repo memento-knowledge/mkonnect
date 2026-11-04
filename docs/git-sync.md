@@ -23,9 +23,21 @@ For each repository that you configure in the Memento portal, git-sync:
 2. **Pushes** those branches and tags from the mirror to the Memento replica over HTTPS. A branch
    or tag deleted on your git server is deleted on the replica at the next sync.
 
-git-sync syncs when the platform sends or refreshes the repository configuration and when it asks
-for an immediate sync. The first sync of a repository downloads all of its history; later syncs
-transfer only what changed.
+git-sync syncs a repository:
+
+- when the platform sends or refreshes the repository configuration (every repository in it that
+  can be synced is synced, which excludes repositories whose host you have not configured);
+- when the platform asks for an immediate sync; and
+- **periodically**, on its own timer. By default each repository is synced again 15 minutes after
+  its previous sync finished, and failures are retried with a growing delay. See
+  [Sync schedule and retries](#sync-schedule-and-retries).
+
+The first sync of a repository downloads all of its history; later syncs transfer only what
+changed.
+
+git-sync does not decide which repositories to sync: the platform sends the full list, and
+git-sync syncs nothing until it has received one. When a repository disappears from that list, git-sync
+removes its local mirror after a grace period (see [Mirror cleanup](#mirror-cleanup)).
 
 Your git server's credential stays on your side: it is stored in git-sync's local configuration
 and used only for requests to your git server. It is never sent to Memento.
@@ -90,14 +102,17 @@ error, the release most likely has no git-sync image.
 - **Data volume** (`/data`): the sum of the mirrored repositories' sizes, multiplied by about 1.2,
   plus headroom for growth. A mirror holds the full history of every branch and tag, so it is about
   the size of a bare clone. Git writes the objects it fetches into the mirror, and repacks them
-  there, so this is the volume that needs headroom. The Helm chart default is `20Gi`.
+  there, so this is the volume that needs headroom. The Helm chart default is `20Gi`. The mirror of
+  a repository that leaves the configuration is kept for at least seven days before it is removed
+  (see [Mirror cleanup](#mirror-cleanup)), so leave room for those as well.
 - **Scratch space** (`/tmp`): holds each sync's empty home directory and git's own temporary
   files, not the mirrors, so it is much smaller than the data volume. It must be backed by disk,
   not memory. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
   `gitSync.tmp.sizeLimit` if you see `local_disk_exhausted` for `/tmp`.
-- **Concurrency and memory:** up to four repositories sync at once. A very large repository, or a
-  large first sync, can exceed the default memory limit; the repository is then reported as
-  `job_out_of_memory` (see [Troubleshooting](#troubleshooting)).
+- **Concurrency and memory:** up to four repositories sync at once; the others wait their turn
+  (see [Concurrency](#concurrency)). A very large repository, or a large first sync, can exceed the
+  default memory limit; the repository is then reported as `job_out_of_memory` (see
+  [Troubleshooting](#troubleshooting)).
 
 ## Option A: Docker
 
@@ -157,7 +172,11 @@ docker run -d --name mkonnect-gitsync --restart unless-stopped \
 Notes:
 
 - `gitsync-data` is where the private key (`/data/gitsync-key`), the provider configuration
-  (`/data/git-sync.json`), and the mirrors (`/data/mirrors`) live. Removing it deletes all three.
+  (`/data/git-sync.json`), the mirrors (`/data/mirrors`), and the run state
+  (`/data/mirrors/run-state.json`, see [Data on the volume](#data-on-the-volume)) live. Removing it
+  deletes all of them.
+- To turn off the automatic removal of old mirrors, add `GIT_SYNC_MIRROR_GC=off` to `gitsync.env`
+  and recreate the container (see [Mirror cleanup](#mirror-cleanup)).
 - `gitsync-tmp` is scratch space only and can be recreated at any time. Docker does not cap the
   size of a volume, so make sure the host has room for it.
 - Keep `gitsync-data`, `gitsync-tmp`, and `gitsync-secrets` separate from the API connector's
@@ -400,8 +419,15 @@ git-sync should register and connect within a few seconds.
 
 - **Portal:** the git-sync connector shows as connected, with a recent heartbeat. Once a provider
   is configured, the portal also shows whether your git servers are reachable and accept the
-  credential (one combined result, the worst across the servers you configured), before any
-  repository is added. After you add repositories, each shows its sync state.
+  credential (one combined result, the worst across the servers you configured: `reachable`,
+  `access_denied`, or `unreachable`), before any repository is added. git-sync re-checks it about
+  every 30 seconds until the platform's first configuration is accepted and about every 5 minutes
+  afterwards, and keeps reporting it once repositories are syncing, so a credential that is later
+  revoked shows up there too. The result is absent while no provider is configured, until the
+  first check has finished, and when the check cannot run at all (for example git is missing from
+  the image; the log says `origin reachability check could not run`). After you add repositories,
+  each shows its sync state, when it last succeeded, and the outcome of its last attempt (see
+  [Run state](#run-state)).
 - **Docker logs:**
 
   ```bash
@@ -462,6 +488,199 @@ If you passed the token with `--set-file`, earlier Helm release revisions still 
 note in the [Installation guide](installation.md#remove-the-registration-token-after-verification).
 Using an existing Secret, as above, keeps the token out of Helm release history entirely.
 
+## Sync schedule and retries
+
+The platform sends no timer, so git-sync re-syncs every repository on its own schedule.
+
+- **Interval.** A repository is synced again 15 minutes (the default interval) after its previous
+  sync *finished*, give or take 10%, so repositories do not all fall due together. The first
+  scheduled run of a newly configured repository (or one whose origin or replica changed, and of
+  every repository after a restart) is spread out further: the interval plus a random delay of up
+  to 2 minutes (at most the interval itself). git-sync looks for due repositories every 5 seconds,
+  so a sync can start a few seconds late.
+- **No pile-up.** A scheduled run is skipped for a repository that is still syncing (queued or
+  running), and it is not made up afterwards. Because the interval is measured from the end of the
+  previous sync, a slow repository is never synced back to back.
+- **Immediate syncs.** An accepted configuration (the platform may re-send it, for example to renew
+  push tokens) and an immediate-sync request from Memento both start a sync at once, whatever the
+  schedule or the backoff below says. If the repository is already syncing, one more sync follows
+  when it ends, however many requests arrived.
+- **The platform can change the interval.** The configuration it sends may carry an interval from
+  60 seconds to 24 hours; one that omits it gets the 15-minute default. A new interval applies
+  without a restart. A value outside the range rejects the whole configuration with
+  `limits_out_of_range` (see [Rejected configuration](#rejected-configuration-config_error)).
+- **Only repositories that can be synced are scheduled.** A repository whose host has no
+  provider on your side (`origin_access_denied` with `host not configured locally`), or whose
+  replica configuration is unusable, is reported but not synced at all until that changes (for
+  the first, add the provider and restart git-sync; for the second, the platform has to send a
+  corrected configuration).
+
+### Concurrency
+
+Up to four repositories sync at once, and the others wait for a free slot. A repository that is
+waiting is reported as `syncing`, so with many repositories one can show `syncing` for a while
+before git actually starts on it. The number is fixed in this release.
+
+### Failures and backoff
+
+A failed sync is retried with a growing delay, so a persistent fault does not hammer your git
+server or the replica. After *n* consecutive failures the next scheduled attempt waits
+`interval × 2^(n−1)`, but never less than the interval and never more than one hour (or the interval, if that is
+longer), plus a random
+extra of up to 20% (a retry is never made sooner than that wait). With the default 15-minute
+interval:
+
+| Consecutive failures | Next scheduled attempt after |
+|---|---|
+| 1 | 15 to 18 minutes |
+| 2 | 30 to 36 minutes |
+| 3 or more | 60 to 72 minutes |
+
+If the interval is longer than one hour, failures are retried at that interval (plus the extra).
+
+Three failure types wait the longest delay straight away, from the **first** failure:
+`origin_access_denied`, `credential_rejected`, and `push_token_expired` (at least one hour, or the
+interval if that is longer, plus the extra). Retrying sooner cannot succeed until a credential or the
+configuration changes, and repeated failed logins can lock a service account out.
+
+A successful sync clears the backoff. A repository whose origin or replica changes in a new
+configuration starts again with a fresh schedule; a configuration that leaves them unchanged (for
+example a push-token refresh) keeps its backoff, though it still starts one attempt at once, and
+that attempt's result counts as usual. The backoff is held in memory only: restarting git-sync
+resets it, and after a restart repositories are synced when the platform next sends the
+configuration. A sync cut short by shutdown counts as neither a success nor a failure.
+
+To retry sooner after you fix a cause, restart git-sync (a changed provider configuration needs
+that anyway) or ask Memento for an immediate sync.
+
+### While syncing is suspended
+
+If the gateway reports that a critical security update is required, git-sync starts no new sync,
+neither scheduled nor requested (a sync already running is not cancelled), and keeps the results
+it already has; repositories that have not synced yet stay `pending`. Its status carries
+`suspended: critical_update_required` (how the portal shows it is up to the platform), and the log
+says `gateway requires a critical security update`. Mirror cleanup is paused too. Upgrade to the
+latest release. git-sync reads the flag again on every connection, so syncing resumes by itself
+once the gateway no longer requires an update. When it resumes, repositories that fell due in the
+meantime start spread over up to 2 minutes (less if the interval is shorter), not all at once.
+
+### Limits the platform can send
+
+The configuration may also carry resource limits: concurrency, push batching, pack settings, a
+repository size ceiling, and a push timeout. git-sync checks every value against its accepted range
+and rejects the whole configuration if one is outside it, but **only the interval is applied
+today**. Concurrency stays at four, the push and fetch time limits stay at 30 minutes each, and none of
+the others has an effect yet.
+
+## Data on the volume
+
+Everything git-sync keeps lives on the data volume (`/data`). Each configured repository has one
+bare mirror, and one small file records what happened to each repository.
+
+| Path | Contents |
+|---|---|
+| `/data/gitsync-key` | The private key issued at registration. |
+| `/data/git-sync.json` | The provider configuration, unless it is mounted from a Secret. |
+| `/data/mirrors/<64 hex characters>.git` | The bare mirror of one repository. |
+| `/data/mirrors/run-state.json` | The [run state](#run-state). |
+| `/data/mirrors/.mkonnect-gc-trash/` | Created the first time a mirror is removed and kept afterwards, normally empty; a mirror sits here only briefly while it is being deleted (see [Mirror cleanup](#mirror-cleanup)). |
+
+The mirrors directory is `GIT_SYNC_MIRRORS_DIR` when that is set (the chart sets it to
+`/data/mirrors`), otherwise a `mirrors` directory next to the provider configuration file.
+
+### Mirror layout
+
+A mirror's directory name is the SHA-256 of the repository ID, in lower-case hex, followed by
+`.git`; the name never contains the repository ID itself. To find the mirror of a repository ID
+(the IDs appear in the portal and in the logs), run:
+
+```bash
+printf %s '<repository-id>' | sha256sum    # on macOS: shasum -a 256
+```
+
+A sync fetches only branches and tags into the mirror. Do not edit or add files in the mirrors
+directory: git-sync treats a directory named like a mirror as its own. If a mirror is damaged (git reports it as
+corrupt or not a repository), the next sync deletes and rebuilds it from the origin. Deleting a
+mirror yourself while git-sync is stopped is safe for the same reason: the next sync downloads the
+repository again in full.
+
+### Run state
+
+`run-state.json` is a small JSON file that remembers, for each repository, the outcome of its last
+attempts, so a restart does not make a healthy repository look as if it never synced. For each
+repository it holds:
+
+- when the last attempt started, how long it took, and how many refs it created, updated or
+  deleted on the replica (zero is normal when nothing changed);
+- `last_success_at`, when the last successful sync finished. A sync that found nothing new counts
+  as a success. It is carried unchanged through failed attempts, and stays **empty until the first
+  success** (absent from the file, and reported as `null` in the status);
+- the committer time of the newest commit across the origin's branches and tags, and the origin's
+  default branch, as last learned (a failed attempt leaves the previous values);
+- a hash that identifies the origin and replica the record was made against.
+
+It holds no credential, URL, host name, path, or error text. The file is owner-only (`0600`),
+written atomically, and written within a few seconds of a sync finishing; a clean shutdown writes
+it out. After a restart, once the platform has sent the configuration, a repository shows `syncing`
+(or `pending` while syncing is suspended) until its first sync since the restart finishes, but it
+reports its earlier last-success time, duration and ref count right away.
+
+A repository's record is dropped when its origin or replica changes, because the old success says
+nothing about the new replica, and when the repository is no longer in the configuration (unless the
+configuration lists no repositories at all, which is treated as a platform mishap, not a decision).
+
+git-sync starts and syncs normally whatever the state of this file. It ignores the whole file, and
+logs `ignoring run state file` with a reason, when it is unreadable, not a regular file,
+writable by everyone, larger than 8 MiB, not valid JSON, from an unsupported version, or listing
+more than 4096 repositories (the reasons are `unreadable`, `not_regular`, `world_writable`,
+`oversized`, `corrupt`, `unsupported_version`, and `too_many_entries`). It drops and counts individual invalid entries (`dropped invalid run state
+entries`). The effect is only that last-success times start from empty (null) until the next
+success. To reset them yourself, stop git-sync and delete the file.
+
+A failure to write it is logged as `run state write failed` with the step that failed, and never
+fails a sync. The usual cause is a full or read-only volume.
+
+### Mirror cleanup
+
+When a repository leaves the platform's configuration, its mirror would otherwise stay on the
+volume for good. git-sync removes it after a grace period:
+
+1. A mirror counts as orphaned when no repository in the **currently accepted** configuration maps
+   to it. A repository the platform still lists keeps its mirror even if its host is not
+   configured on your side or it is failing.
+2. The first time git-sync sees a mirror orphaned it writes a `.mkonnect-orphaned` file in the
+   mirror with the time, and logs `mirror is no longer in the configuration; it will be removed
+   after the grace period`. The mark survives restarts. If the repository returns to the
+   configuration before the grace period ends, the mark is removed and the grace period starts
+   over the next time.
+3. Once the mirror has been orphaned for **seven days** it is moved into
+   `.mkonnect-gc-trash/` and deleted, and git-sync logs `removed orphaned mirror`. A removal that
+   fails or is interrupted is retried at the next sweep.
+
+Sweeps run after every accepted configuration and every 6 hours, so a mirror is removed within about
+6 hours of its seven days ending. They are deliberately cautious. Nothing is removed:
+
+- while `GIT_SYNC_MIRROR_GC=off` is set (the value is not case-sensitive; any other value, or none,
+  leaves cleanup on). git-sync logs `mirror cleanup is disabled` at start;
+- before the platform has sent a configuration since git-sync started, and while the accepted
+  configuration lists **no repositories**. Removing the last repository in Memento therefore
+  does not free its mirror by itself; delete it yourself with git-sync stopped if you want the
+  space back;
+- while the latest configuration was rejected (see
+  [Rejected configuration](#rejected-configuration-config_error)) or a critical update is required;
+- while a sync of that mirror is queued or running;
+- while the system clock reads before 1 January 2025, because a mark written with a wrong clock
+  would look ancient later (git-sync logs `mirror cleanup skipped`). The grace period relies on a
+  correct host clock.
+
+Only directories named exactly like a mirror (64 lower-case hex characters and `.git`) are ever
+removed; symbolic links, the run-state file and every other entry are left alone.
+
+With Docker, add `GIT_SYNC_MIRROR_GC=off` to `gitsync.env` and recreate the container. The Helm
+chart has no value for it yet. `kubectl -n <namespace> set env deployment/mkonnect-gitsync GIT_SYNC_MIRROR_GC=off`
+sets it on the running Deployment; check that it is still there after each `helm upgrade`, because
+Helm manages that Deployment.
+
 ## Upgrading
 
 Releases use calendar identifiers (`YYYYMMDD.n`). Always pin an explicit release, and check first
@@ -499,10 +718,13 @@ pull if that release has no git-sync image. If you pinned `gitSync.image.tag`, u
 > git-sync Deployment **and its volume with the private key and all mirrors**; you would then have
 > to register the connector again with a new token. See [Uninstalling](#uninstalling).
 
-The key, provider configuration, and mirrors are on the volume, so the connector reconnects with
-its existing key and syncs incrementally. A sync that is running when the container stops is
-cancelled and starts again afterwards. If the platform reports that a critical security update is
-required, git-sync stops syncing (repositories stay `pending`) until you upgrade.
+The key, provider configuration, mirrors, and run state are on the volume, so the connector
+reconnects with its existing key and syncs incrementally. A sync that is running when the container
+stops is cancelled; the repository is synced again once the platform sends its configuration to the
+restarted connector. The failure backoff is not kept across a restart (see
+[Failures and backoff](#failures-and-backoff)). If the gateway reports that a critical security
+update is required, git-sync starts no new sync until you upgrade (see
+[While syncing is suspended](#while-syncing-is-suspended)).
 
 ## Uninstalling
 
@@ -549,22 +771,32 @@ logged as `error_type` on a `sync failed` line. Details that could identify your
 (URLs, host names, paths) are deliberately left out of what is reported to the platform; look at
 your own logs and network for those.
 
+A failed sync is retried automatically, with a growing delay (see
+[Failures and backoff](#failures-and-backoff)); you do not need to restart git-sync to make it try
+again. The exceptions are the two kinds of repository that are never scheduled: one whose host is
+not configured locally, and one with an unusable replica configuration. After you fix a cause, an immediate sync from Memento, or a restart (once the platform has
+sent the configuration again), retries at once instead of waiting out the delay. A later success
+clears the error.
+
 | Symptom or error type | Likely cause and fix |
 |---|---|
-| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. |
+| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry, then restart git-sync if you changed the provider configuration. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider and restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit. Test from the host that runs git-sync. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. |
-| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. |
-| `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. |
+| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
+| `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `replica_rejected` | The replica refused the push: a rejected ref, a policy decision, or a size or quota limit. Contact Memento with the repository ID. |
 | `push_timeout` | A push ran past its 30-minute limit, typically a very large first push over a slow link. Check bandwidth to the replica; later syncs push less. |
 | `local_disk_exhausted` | The data volume or the `/tmp` scratch space is full. The mirrors are on the data volume: grow `gitSync.persistence.size` (or the Docker volume's backing disk). For `/tmp`, raise `gitSync.tmp.sizeLimit`. See [Sizing](#sizing). |
 | `job_out_of_memory` | git was killed for lack of memory. Raise the memory limit (`gitSync.resources.limits.memory`, or `--memory` with Docker). |
 | `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
-| The connector reports `config_error` with reason `replica_host_not_pinned` (how the portal shows it is up to the platform; reason values may be refined in later releases) | `GIT_SYNC_REPLICA_HOST` is missing, empty, or not a valid `host` or `host:port` (the chart requires `gitSync.config.replicaHost`). git-sync then rejects every configuration and never pushes, though it stays connected. `connector status` shows what the process sees; the log line says why. Fix the value and restart. |
-| The connector reports `config_error` with reason `replica_host_mismatch` | A repository's replica URL names a host or port other than the one you pinned (the match is exact, and the URL must be `https`). Re-copy the replica host and port from your instructions, including a non-default port as `host:port`. If the value is correct, contact Memento. git-sync never pushes to any other host; the previous configuration stays in effect. |
-| Repositories stay `pending`, and the log says a critical security update is required | The platform requires an upgrade before syncing continues. Upgrade to the latest release. |
-| A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time). Watch `kubectl logs` / `docker logs` for the outcome. |
+| The status carries a `config_error` (how the portal shows it is up to the platform) | The platform sent a configuration that git-sync rejected as a whole, and the previous configuration stays in effect. See [Rejected configuration](#rejected-configuration-config_error) for each reason, including the two replica-host pin errors, `replica_host_not_pinned` and `replica_host_mismatch`, that you can fix yourself. |
+| The status carries `suspended: critical_update_required`, and the log says `gateway requires a critical security update` | git-sync starts no new sync until it is upgraded. Upgrade to the latest release; see [While syncing is suspended](#while-syncing-is-suspended). |
+| A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time, and a repository waiting for a slot is also reported as `syncing`). Watch `kubectl logs` / `docker logs` for the outcome. |
+| A repository is `error` and was not retried for a long time | Failures back off, up to an hour or more, and the three credential failures wait at least an hour from the first one. See [Failures and backoff](#failures-and-backoff). |
+| The last success time is empty (null) for a repository that used to sync | Either it has never succeeded since its origin or replica last changed, or the run state was discarded. Look for `ignoring run state file` in the log; see [Run state](#run-state). It fills in again after the next successful sync. |
+| Disk usage does not drop after a repository was removed in Memento | Mirrors are removed seven days after the repository left the configuration, and not at all while cleanup is off, a configuration was rejected, or no repository is configured. See [Mirror cleanup](#mirror-cleanup). |
+| Log warns `mirror cleanup skipped: the system clock reads an implausibly early time` | The host clock is before 2025. Fix the clock (NTP); cleanup resumes by itself. |
 | Container exits at start with `configuration error: GATEWAY_URL …` or `CONNECTOR_ID is required` | `GATEWAY_URL` must be an absolute `wss://` URL, and `CONNECTOR_ID` must be set. |
 | Container exits at start with `configuration error: REGISTRATION_TOKEN_FILE: …` | The registration token file could not be used. The message says which: `must be an absolute path`; `opening <path>: …` (the file is missing or unreadable: the volume or Secret is not mounted, or the Secret or key name is wrong); `<path> is not a regular file`; `<path> has unsafe permissions` (accessible by others or writable by group: use mode `0600`, `0640`, `0440`, or `0400`; in Docker re-create it as described in [Option A](#option-a-docker)); `<path> is larger than 4096 bytes` (you pointed it at the wrong file); `<path> is empty`. After registration, either keep the file or remove `REGISTRATION_TOKEN_FILE` together with it. |
 | Start fails with `local config load failed` | The provider configuration is invalid: not valid JSON, an unknown field, a token shorter than 16 characters, an authentication mode on a non-`https` URL, two providers for one host, or a file readable by others. The message names the cause; it never includes a credential. |
@@ -574,6 +806,36 @@ your own logs and network for those.
 | A credential change did not take effect | The provider configuration is read at startup. Restart git-sync; see [Configure your git server credential](#configure-your-git-server-credential). |
 | `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret and restart, or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
 | Log warns that syncing needs git 2.31 or newer | The image does not contain a usable git. Use an official image for your release ID. |
+
+### Rejected configuration (`config_error`)
+
+git-sync accepts a configuration from the platform only as a whole. If anything in it is not
+acceptable, git-sync rejects all of it, keeps the previous configuration in effect (those
+repositories keep syncing on their schedule, and nothing from the rejected one is used), logs
+`git_sync_config rejected; leaving configuration unchanged` with the reason, and reports the reason
+and the rejected version in its status as `config_error`. The next configuration that is accepted
+clears it. While the latest configuration is rejected, [mirror cleanup](#mirror-cleanup) is
+paused. The reason values are the connector's current wording and may be refined in later
+releases.
+
+Only the first two are about your installation. For the others the configuration came from the
+platform, so there is nothing to change on your side: contact Memento with the reason.
+
+| Reason | What it means | What to do |
+|---|---|---|
+| `replica_host_not_pinned` | `GIT_SYNC_REPLICA_HOST` (Helm: `gitSync.config.replicaHost`) is missing, empty, or not a valid `host` or `host:port`. git-sync stays connected but rejects **every** configuration and never pushes. The log says why at start; `connector status` shows what the process sees (it reads its own environment, so run it in the same container). | Set it to the replica host from your installation instructions (`host` or `host:port`, the port defaulting to 443; no scheme or path) and restart git-sync. |
+| `replica_host_mismatch` | A repository's replica URL names a different host or port than you pinned, a scheme other than `https`, or something that cannot be shown to be the pinned host. The match is exact (no wildcards or subdomains) and applies to every repository, whether or not its origin is configured on your side. git-sync never pushes to any other host. | Compare the pin with the replica host and port in your installation instructions, including a non-default port as `host:port`; fix the pin and restart if it is wrong. If it is right, the platform sent a wrong URL: contact Memento. |
+| `limits_out_of_range` | The configuration's schedule or limits has a value outside its accepted range. The log line `git_sync_config has a schedule or limit out of range` names the field (for example `interval_seconds`, accepted 60 to 86400). A value of the wrong type, such as a non-integer interval, is reported as `malformed_message` instead. | Contact Memento. |
+| `too_many_repositories` | More than 4096 repositories in one configuration. | Contact Memento. |
+| `invalid_repo_id` | A repository ID that is empty, longer than 256 characters, contains anything other than letters, digits, `.`, `_` and `-`, or is `.` or `..`. | Contact Memento. |
+| `duplicate_repo_id` | Two entries with the same repository ID. | Contact Memento. |
+| `invalid_config_version` | The configuration's version is a JSON object or array rather than a single value, or is longer than 256 bytes. | Contact Memento. |
+| `malformed_message` | The configuration could not be read, or has no repository list. | Contact Memento. |
+
+A repository whose replica URL or push token is merely unusable (a missing URL, one on the
+pinned host but with a user name, query, or similar, or an empty push token) does not reject the whole configuration: if its origin host is
+configured on your side, only that repository fails, as `unclassified` with the detail
+`invalid replica configuration`.
 
 ### Restoring the key file mode
 
