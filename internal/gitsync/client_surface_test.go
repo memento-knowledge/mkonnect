@@ -1,0 +1,435 @@
+package gitsync_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/memento-knowledge/mkonnect/internal/gateway"
+	"github.com/memento-knowledge/mkonnect/internal/gitsync"
+	"github.com/memento-knowledge/mkonnect/internal/proto"
+)
+
+// This file covers what the connector reports about its own configuration: the effective limits, the
+// suspended marker, and the origin_check that accompanies every status.
+
+// configWithExtras builds a git_sync_config frame with no repositories, so no sync starts, and the
+// given extra top-level members (for example `"schedule":{"interval_seconds":120}`).
+func configWithExtras(version string, extras ...string) json.RawMessage {
+	s := fmt.Sprintf(`{"type":"git_sync_config","config_version":%s,"repositories":[]`, version)
+	for _, e := range extras {
+		s += "," + e
+	}
+	return json.RawMessage(s + "}")
+}
+
+func TestEffectiveLimitsDefaultBeforeAnyConfig(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	if got := c.EffectiveLimitsForTest(); got != gitsync.DefaultLimits() {
+		t.Errorf("effective limits = %+v, want the defaults %+v", got, gitsync.DefaultLimits())
+	}
+}
+
+func TestAcceptedConfigAppliesScheduleAndLimits(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configWithExtras("1",
+		`"schedule":{"interval_seconds":120}`,
+		`"limits":{"max_concurrency":2,"push_batch_refs":500,"pack_threads":3,"pack_window_memory_mb":64,"max_repository_mb":2048,"push_timeout_seconds":600}`))
+
+	want := gitsync.Limits{
+		Interval:           2 * time.Minute,
+		PushTimeout:        10 * time.Minute,
+		MaxConcurrency:     2,
+		PushBatchRefs:      500,
+		PackThreads:        3,
+		PackWindowMemoryMB: 64,
+		MaxRepositoryMB:    2048,
+	}
+	if got := c.EffectiveLimitsForTest(); got != want {
+		t.Errorf("effective limits = %+v, want %+v", got, want)
+	}
+}
+
+// The configuration is a full replace: whatever a later configuration leaves out goes back to its
+// default rather than keeping the earlier override.
+func TestConfigOmittingLimitsResetsToDefault(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configWithExtras("1",
+		`"schedule":{"interval_seconds":120}`, `"limits":{"max_concurrency":2}`))
+	c.HandleMessage(context.Background(), s, "git_sync_config", configWithExtras("2"))
+	if got := c.EffectiveLimitsForTest(); got != gitsync.DefaultLimits() {
+		t.Errorf("after a config without schedule/limits: %+v, want the defaults", got)
+	}
+}
+
+func TestConfigOmittingOneLimitResetsOnlyThatField(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configWithExtras("1",
+		`"limits":{"max_concurrency":2,"push_timeout_seconds":600}`))
+	c.HandleMessage(context.Background(), s, "git_sync_config", configWithExtras("2",
+		`"limits":{"max_concurrency":3}`))
+
+	want := gitsync.DefaultLimits()
+	want.MaxConcurrency = 3
+	if got := c.EffectiveLimitsForTest(); got != want {
+		t.Errorf("effective limits = %+v, want %+v", got, want)
+	}
+}
+
+// An out-of-range value rejects the whole configuration: the limits, the repositories and the
+// version it would have replaced all stay as they were, and no status reports an acceptance.
+func TestOutOfRangeLimitsRejectTheWholeConfig(t *testing.T) {
+	for name, extras := range map[string][]string{
+		"interval below minimum":      {`"schedule":{"interval_seconds":59}`},
+		"interval above maximum":      {`"schedule":{"interval_seconds":86401}`},
+		"concurrency zero":            {`"limits":{"max_concurrency":0}`},
+		"concurrency above maximum":   {`"limits":{"max_concurrency":33}`},
+		"batch refs below minimum":    {`"limits":{"push_batch_refs":99}`},
+		"negative pack threads":       {`"limits":{"pack_threads":-1}`},
+		"pack window below minimum":   {`"limits":{"pack_window_memory_mb":15}`},
+		"negative repository ceiling": {`"limits":{"max_repository_mb":-1}`},
+		"push timeout below minimum":  {`"limits":{"push_timeout_seconds":59}`},
+		"one bad among good values":   {`"schedule":{"interval_seconds":300}`, `"limits":{"max_concurrency":2,"push_timeout_seconds":59}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newTestClient(t, oneProvider)
+			s := &stubSender{}
+			ctx := context.Background()
+			// Unmatched hosts keep the repositories out of the sync engine.
+			c.HandleMessage(ctx, s, "git_sync_config", withExtras(configJSON("1", [3]string{"repo-a", "https://other.example.com/a", ""}), `"schedule":{"interval_seconds":120}`))
+			before := len(s.messages())
+
+			bad := withExtras(configJSON("2", [3]string{"repo-b", "https://other.example.com/b", ""}), extras...)
+			c.HandleMessage(ctx, s, "git_sync_config", bad)
+
+			if n := len(s.messages()); n != before {
+				t.Errorf("a rejected config sent %d new messages, want none", n-before)
+			}
+			if got := c.EffectiveLimitsForTest().Interval; got != 2*time.Minute {
+				t.Errorf("interval = %v after a rejected config, want the previous 2m", got)
+			}
+			if err := c.OnHeartbeat(ctx, s); err != nil {
+				t.Fatalf("OnHeartbeat: %v", err)
+			}
+			st := lastStatus(t, s.messages())
+			if string(st.ConfigVersion) != "1" {
+				t.Errorf("config_version = %s, want the previous 1", st.ConfigVersion)
+			}
+			if _, ok := repoStates(st)["repo-a"]; !ok || len(st.Repositories) != 1 {
+				t.Errorf("repositories = %+v, want only the previous repo-a", st.Repositories)
+			}
+		})
+	}
+}
+
+// withExtras splices extra top-level members into an already-built config frame.
+func withExtras(raw json.RawMessage, extras ...string) json.RawMessage {
+	s := string(raw)
+	s = s[:len(s)-1]
+	for _, e := range extras {
+		s += "," + e
+	}
+	return json.RawMessage(s + "}")
+}
+
+func TestSuspendedFollowsTheCriticalUpdateGate(t *testing.T) {
+	c := newTestClient(t, oneProvider)
+	s := &stubSender{}
+	ctx := context.Background()
+
+	if err := c.OnHeartbeat(ctx, s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	if got := lastStatus(t, s.messages()).Suspended; got != "" {
+		t.Errorf("suspended = %q with no critical update required, want absent", got)
+	}
+
+	c.SetCriticalPatchForTest(true)
+	if err := c.OnHeartbeat(ctx, s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	if got := lastStatus(t, s.messages()).Suspended; got != proto.GitSyncSuspendedCriticalUpdate {
+		t.Errorf("heartbeat status suspended = %q, want %q", got, proto.GitSyncSuspendedCriticalUpdate)
+	}
+	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+	if got := lastStatus(t, s.messages()).Suspended; got != "critical_update_required" {
+		t.Errorf("config status suspended = %q, want critical_update_required", got)
+	}
+
+	c.SetCriticalPatchForTest(false)
+	if err := c.OnHeartbeat(ctx, s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	if got := lastStatus(t, s.messages()).Suspended; got != "" {
+		t.Errorf("suspended = %q after the update requirement cleared, want absent", got)
+	}
+}
+
+// scriptedProber is a fakeProber whose result, error and blocking can all be changed while it runs.
+// A blocked Probe returns ctx.Err() when cancelled, as a real probe's subprocess would.
+type scriptedProber struct {
+	mu     sync.Mutex
+	result gitsync.OriginResult
+	err    error
+	block  chan struct{}
+	calls  atomic.Int32
+}
+
+func (p *scriptedProber) Probe(ctx context.Context, _ gitsync.LocalEntry) (gitsync.OriginResult, error) {
+	p.calls.Add(1)
+	p.mu.Lock()
+	block, res, err := p.block, p.result, p.err
+	p.mu.Unlock()
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-block:
+		}
+	}
+	return res, err
+}
+
+func (p *scriptedProber) set(res gitsync.OriginResult, err error, block chan struct{}) {
+	p.mu.Lock()
+	p.result, p.err, p.block = res, err, block
+	p.mu.Unlock()
+}
+
+// waitProbeDone waits until the probe goroutine has finished, including its status send, so a test
+// can assert that nothing further happened.
+func waitProbeDone(t *testing.T, c interface{ ProbeInFlightForTest() bool }) {
+	t.Helper()
+	waitFor(t, func() bool { return !c.ProbeInFlightForTest() })
+}
+
+func heartbeat(t *testing.T, c *gitsync.Client, s *stubSender) proto.GitSyncStatusMsg {
+	t.Helper()
+	if err := c.OnHeartbeat(context.Background(), s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	return lastStatus(t, s.messages())
+}
+
+func TestOriginCheckIsReportedBeforeAndAfterConfigAccepted(t *testing.T) {
+	prober := &scriptedProber{result: gitsync.OriginAccessDenied}
+	c := newTestClientP(t, oneProvider, prober)
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+	waitProbeDone(t, c)
+
+	pre := lastStatus(t, s.messages())
+	if pre.OriginCheck == nil || pre.OriginCheck.Result != "access_denied" || pre.OriginCheck.CheckedAt == "" {
+		t.Fatalf("origin_check before config = %+v, want access_denied with a checked_at", pre.OriginCheck)
+	}
+
+	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+	post := lastStatus(t, s.messages())
+	if post.OriginCheck == nil || *post.OriginCheck != *pre.OriginCheck {
+		t.Errorf("origin_check in the status after config = %+v, want the same %+v", post.OriginCheck, pre.OriginCheck)
+	}
+	if hb := heartbeat(t, c, s); hb.OriginCheck == nil || *hb.OriginCheck != *pre.OriginCheck {
+		t.Errorf("origin_check in a later heartbeat status = %+v, want the same %+v", hb.OriginCheck, pre.OriginCheck)
+	}
+}
+
+func TestOriginCheckRefreshedEveryIntervalAfterConfigAccepted(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &scriptedProber{result: gitsync.OriginUnreachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+	waitProbeDone(t, c)
+	first := latestOriginCheck(s.messages())
+	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+
+	prober.set(gitsync.OriginReachable, nil, nil)
+
+	// The health cadence no longer applies once configured: just past it, nothing is re-probed.
+	clk.advance(gateway.DefaultHeartbeatInterval + time.Second)
+	if hb := heartbeat(t, c, s); hb.OriginCheck == nil || hb.OriginCheck.Result != "unreachable" {
+		t.Errorf("origin_check = %+v, want the earlier unreachable result", hb.OriginCheck)
+	}
+	// Just short of the interval, still nothing.
+	clk.advance(gitsync.OriginCheckIntervalForTest - gateway.DefaultHeartbeatInterval - 2*time.Second)
+	heartbeat(t, c, s)
+	waitProbeDone(t, c)
+	if n := prober.calls.Load(); n != 1 {
+		t.Fatalf("probe ran %d times before the interval elapsed, want 1", n)
+	}
+
+	// At the interval it runs again and the new result replaces the old one.
+	clk.advance(time.Second)
+	heartbeat(t, c, s)
+	waitFor(t, func() bool {
+		oc := latestOriginCheck(s.messages())
+		return oc != nil && oc.Result == "reachable"
+	})
+	waitProbeDone(t, c)
+	if oc := latestOriginCheck(s.messages()); oc.CheckedAt == first.CheckedAt {
+		t.Errorf("checked_at did not advance: %q", oc.CheckedAt)
+	}
+	if n := prober.calls.Load(); n != 2 {
+		t.Errorf("probe ran %d times, want 2", n)
+	}
+}
+
+func TestOriginCheckAbsentWithoutLocalProvidersAfterConfig(t *testing.T) {
+	prober := &scriptedProber{result: gitsync.OriginReachable}
+	c := newTestClientP(t, "", prober)
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+	heartbeat(t, c, s)
+	waitProbeDone(t, c)
+	if n := prober.calls.Load(); n != 0 {
+		t.Errorf("prober ran %d times with no local providers, want 0", n)
+	}
+	if oc := latestOriginCheck(s.messages()); oc != nil {
+		t.Errorf("origin_check = %+v with no local providers, want absent", oc)
+	}
+}
+
+// A local fault (for example git is not installed) says nothing about the origin, so it is logged
+// and origin_check stays absent, before and after configuration.
+func TestOriginCheckAbsentOnLocalFault(t *testing.T) {
+	prober := &scriptedProber{err: errors.New("git not found")}
+	c := newTestClientP(t, oneProvider, prober)
+	s := &stubSender{}
+	ctx := context.Background()
+	c.OnConnected(ctx, s)
+	waitProbeDone(t, c)
+	if prober.calls.Load() != 1 {
+		t.Fatalf("probe ran %d times, want 1", prober.calls.Load())
+	}
+	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
+	heartbeat(t, c, s)
+	if oc := latestOriginCheck(s.messages()); oc != nil {
+		t.Errorf("origin_check = %+v after a local fault, want absent", oc)
+	}
+}
+
+// A later local fault must not leave the previous result standing: the platform reads origin_check as
+// current, and the connector can no longer vouch for it.
+func TestOriginCheckClearedWhenALaterProbeHitsALocalFault(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &scriptedProber{result: gitsync.OriginReachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	waitProbeDone(t, c)
+	if oc := latestOriginCheck(s.messages()); oc == nil {
+		t.Fatal("no origin_check after the first probe")
+	}
+
+	prober.set("", errors.New("git not found"), nil)
+	clk.advance(gateway.DefaultHeartbeatInterval + time.Second)
+	heartbeat(t, c, s)
+	waitProbeDone(t, c)
+	if hb := heartbeat(t, c, s); hb.OriginCheck != nil {
+		t.Errorf("origin_check = %+v after a probe hit a local fault, want absent", hb.OriginCheck)
+	}
+}
+
+// A probe cancelled by its connection closing proves nothing: it neither replaces the cached result
+// nor clears it, and it does not use up the cadence, so the next connection probes again at once.
+func TestCancelledProbeKeepsTheCachedResultAndIsRetried(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &scriptedProber{result: gitsync.OriginReachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	c.OnConnected(ctx1, s)
+	waitProbeDone(t, c)
+	cached := latestOriginCheck(s.messages())
+	c.HandleMessage(ctx1, s, "git_sync_config", configWithExtras("1"))
+
+	// A refresh is under way when the connection drops.
+	block := make(chan struct{})
+	prober.set(gitsync.OriginUnreachable, nil, block)
+	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+	if err := c.OnHeartbeat(ctx1, s); err != nil {
+		t.Fatalf("OnHeartbeat: %v", err)
+	}
+	waitFor(t, func() bool { return prober.calls.Load() == 2 })
+	cancel1()
+	waitProbeDone(t, c)
+
+	// The reconnect serves the old result and, the cancelled attempt not counting, probes again.
+	prober.set(gitsync.OriginUnreachable, nil, nil)
+	s2 := &stubSender{}
+	c.OnConnected(context.Background(), s2)
+	if first, ok := s2.messages()[0].(proto.GitSyncStatusMsg); !ok || first.OriginCheck == nil || *first.OriginCheck != *cached {
+		t.Errorf("origin_check in the first status of the new connection = %+v, want the cached %+v", first.OriginCheck, cached)
+	}
+	waitFor(t, func() bool {
+		oc := latestOriginCheck(s2.messages())
+		return oc != nil && oc.Result == "unreachable"
+	})
+	waitProbeDone(t, c)
+	if n := prober.calls.Load(); n != 3 {
+		t.Errorf("probe ran %d times, want 3 (initial, cancelled refresh, retry)", n)
+	}
+}
+
+// A reconnect must not re-run a probe whose result is still within its cadence: a flapping
+// connection would otherwise exec git against the origin on every attempt.
+func TestReconnectWithinTheIntervalDoesNotReprobe(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	prober := &scriptedProber{result: gitsync.OriginReachable}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	c.OnConnected(ctx1, s)
+	waitProbeDone(t, c)
+	c.HandleMessage(ctx1, s, "git_sync_config", configWithExtras("1"))
+	cancel1()
+
+	clk.advance(time.Minute)
+	s2 := &stubSender{}
+	c.OnConnected(context.Background(), s2)
+	waitProbeDone(t, c)
+	if n := prober.calls.Load(); n != 1 {
+		t.Errorf("probe ran %d times across a reconnect, want 1", n)
+	}
+	if first := lastStatus(t, s2.messages()); first.OriginCheck == nil {
+		t.Error("the first status on the new connection should carry the cached origin_check")
+	}
+}
+
+// Probes never pile up behind a slow origin: heartbeats that arrive while one is running start none.
+func TestNoProbePileUpBehindASlowOrigin(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+	block := make(chan struct{})
+	prober := &scriptedProber{result: gitsync.OriginReachable, block: block}
+	c := newTestClientClock(t, oneProvider, prober, clk.now)
+	s := &stubSender{}
+	c.OnConnected(context.Background(), s)
+	waitFor(t, func() bool { return prober.calls.Load() == 1 })
+
+	for range 10 {
+		clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+		heartbeat(t, c, s)
+	}
+	if n := prober.calls.Load(); n != 1 {
+		t.Fatalf("probe ran %d times while one was in flight, want 1", n)
+	}
+
+	close(block)
+	waitProbeDone(t, c)
+	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+	heartbeat(t, c, s)
+	waitFor(t, func() bool { return prober.calls.Load() == 2 })
+	waitProbeDone(t, c)
+}

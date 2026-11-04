@@ -129,7 +129,7 @@ var (
 // means unreachable. It never reports "reachable" for an unrecognised failure.
 //
 // It shares authMarkers and connMarkers with classifyGitFailure, so a given git error is read the
-// same way before configuration (here) and after it (per repository); the portal must not say
+// same way for the connector-level check (here) and for each repository's sync; the portal must not say
 // "access denied" and later "unreachable" for one problem. They differ deliberately only where the
 // target does: this probes a base URL that need not be a repository, so a server that answers with
 // a 404 or a 5xx is "reachable", whereas a missing repository is a failed sync.

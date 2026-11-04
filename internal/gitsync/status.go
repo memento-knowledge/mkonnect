@@ -69,7 +69,6 @@ func (c *Client) sendCurrentStatus() {
 func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	c.mu.Lock()
 	cv := cloneRaw(c.configVersion)
-	accepted := c.configAccepted
 	snapshot := make([]repoState, 0, len(c.repos))
 	for _, r := range c.repos {
 		snapshot = append(snapshot, r)
@@ -116,11 +115,16 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 		s := earliest.UTC().Format(time.RFC3339)
 		status.EarliestPushTokenExpiresAt = &s
 	}
-	// origin_check is a connector-level, pre-configuration signal only.
-	if !accepted {
-		if oc := c.originCheck.Load(); oc != nil {
-			status.OriginCheck = oc
-		}
+	// origin_check is a connector-level signal carried by every status for as long as the latest
+	// probe produced a result; it is nil when there are no local providers to probe or the probe
+	// could not run. The platform re-reads it on each status, so it is never latched.
+	if oc := c.originCheck.Load(); oc != nil {
+		status.OriginCheck = oc
+	}
+	// suspended follows the critical-update gate, so it clears by itself once the gateway stops
+	// requiring the update.
+	if c.criticalPatchRequired.Load() {
+		status.Suspended = proto.GitSyncSuspendedCriticalUpdate
 	}
 	return status
 }

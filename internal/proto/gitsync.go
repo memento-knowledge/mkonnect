@@ -146,8 +146,13 @@ type GitSyncStatusMsg struct {
 	// BootID is a random id created at each process start, so a sequence that restarts at a lower
 	// value after a crash is not mistaken for an older status.
 	BootID string `json:"boot_id"`
-	// OriginCheck reports pre-configuration origin reachability at the connector level; present only
-	// before any configuration has been accepted.
+	// OriginCheck reports origin reachability at the connector level. It is present in every status
+	// for as long as the connector has a result, and the platform should read it afresh from each
+	// one: it is re-checked about every 30 seconds until a configuration is accepted and about every
+	// 5 minutes afterwards, and its checked_at says when. It is absent when no local provider is
+	// configured (there is nothing to check), when the connector could not run the check (for
+	// example git is not installed, which says nothing about the origin), and in the first status
+	// after connecting until the first check finishes.
 	OriginCheck *OriginCheck `json:"origin_check,omitempty"`
 	// Repositories is the per-repository state; always a (possibly empty) array, never null.
 	Repositories []GitSyncRepoStatus `json:"repositories"`
@@ -206,8 +211,9 @@ type GitSyncConfigError struct {
 	Reason string `json:"reason"`
 }
 
-// OriginCheck is the connector-level reachability result reported before any repository is
-// configured, so the portal can show "origin reachable" / "access denied" during setup.
+// OriginCheck is the connector-level reachability result of the locally configured origin
+// providers, so the portal can show "origin reachable" / "access denied" during setup and keep
+// showing it once repositories are syncing.
 type OriginCheck struct {
 	Result    string `json:"result"`     // "reachable" | "access_denied" | "unreachable"
 	CheckedAt string `json:"checked_at"` // RFC3339

@@ -541,33 +541,6 @@ func TestWireStringsPinned(t *testing.T) {
 	}
 }
 
-func TestOriginCheckPreConfigThenAbsent(t *testing.T) {
-	prober := &fakeProber{result: gitsync.OriginAccessDenied}
-	c := newTestClientP(t, oneProvider, prober)
-	s := &stubSender{}
-	ctx := context.Background()
-	c.OnConnected(ctx, s)
-
-	waitFor(t, func() bool {
-		for _, m := range s.messages() {
-			if st, ok := m.(proto.GitSyncStatusMsg); ok && st.OriginCheck != nil {
-				return true
-			}
-		}
-		return false
-	})
-	st := lastStatus(t, s.messages())
-	if st.OriginCheck == nil || st.OriginCheck.Result != "access_denied" || st.OriginCheck.CheckedAt == "" {
-		t.Errorf("origin_check = %+v, want access_denied with a checked_at", st.OriginCheck)
-	}
-
-	// Once configuration is accepted, origin_check is no longer reported.
-	c.HandleMessage(ctx, s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
-	if lastStatus(t, s.messages()).OriginCheck != nil {
-		t.Error("origin_check should be absent once config is accepted")
-	}
-}
-
 func TestOriginCheckAbsentWithoutLocalEntries(t *testing.T) {
 	prober := &fakeProber{result: gitsync.OriginReachable}
 	c := newTestClientP(t, "", prober)

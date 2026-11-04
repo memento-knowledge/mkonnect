@@ -84,9 +84,9 @@ func TestLimitedBufferUnderTheCapIsVerbatim(t *testing.T) {
 	}
 }
 
-// The pre-config reachability probe and the per-repository sync classifier look at the same git
-// output, so the portal must not be told "access denied" before configuration and "unreachable"
-// after it for one underlying problem. (They differ deliberately on a 404/"not found": the probe
+// The connector-level reachability probe and the per-repository sync classifier look at the same
+// git output, so the portal must not be told "access denied" by one and "unreachable" by the other
+// for one underlying problem. (They differ deliberately on a 404/"not found": the probe
 // targets a base URL that need not be a repository, so a server that answers is "reachable".)
 func TestProbeAndSyncClassifyAuthAndConnectionFailuresAlike(t *testing.T) {
 	exit := errors.New("exit status 128")

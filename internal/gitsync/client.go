@@ -131,11 +131,16 @@ type Client struct {
 	// wire order matches sequence order.
 	seq atomic.Uint64
 
-	// originCheck caches the most recent pre-config reachability result; probing is guarded so only
-	// one probe runs at a time and no more often than the health cadence.
+	// originCheck caches the most recent origin reachability result, reported in every status; nil
+	// when there is none (no local provider, or the last probe could not run). probing is guarded so
+	// only one probe runs at a time, and see maybeProbe for how often it runs.
 	originCheck atomic.Pointer[proto.OriginCheck]
 	probing     atomic.Bool
 	lastProbe   atomic.Int64 // UnixNano of the last probe start
+
+	// limits is the schedule and resource bounds in force: the defaults until a configuration is
+	// accepted, then what that configuration resolved to. Read through effectiveLimits.
+	limits atomic.Pointer[Limits]
 
 	// mu guards the configured set and version, which OnHeartbeat (its own goroutine) and
 	// HandleMessage (the read loop) both reach.
@@ -180,6 +185,8 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
 	}
+	defaults := DefaultLimits()
+	c.limits.Store(&defaults)
 	c.mgr = newManager(defaultSyncConcurrency,
 		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, now: now},
 		syncHooks{
@@ -200,6 +207,10 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	return c
 }
 
+// effectiveLimits returns the schedule and resource bounds currently in force. It is safe to call
+// from any goroutine; the value is a snapshot, replaced as a whole when a configuration is accepted.
+func (c *Client) effectiveLimits() Limits { return *c.limits.Load() }
+
 // Run connects and maintains the connection with backoff until ctx is cancelled.
 func (c *Client) Run(ctx context.Context) { c.gw.Run(ctx) }
 
@@ -217,7 +228,7 @@ func (c *Client) OnHandshake(info gateway.HandshakeInfo) {
 }
 
 // OnConnected sends an immediate status (so the platform sees the connector promptly) and starts a
-// pre-config origin reachability probe off the connection goroutine; the probe's result arrives in
+// origin reachability probe off the connection goroutine; the probe's result arrives in
 // a later status, so the first write is never blocked on the network. The connection context and
 // sender are captured so a later heartbeat-triggered probe runs under the connection's lifetime.
 func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
@@ -225,13 +236,12 @@ func (c *Client) OnConnected(ctx context.Context, s gateway.Sender) {
 	c.connCtx = ctx
 	c.connSender = s
 	c.mu.Unlock()
-	c.lastProbe.Store(0) // allow an immediate probe on each new connection
 	c.emitStatus(ctx, s, statusWriteTimeout)
 	c.maybeProbe()
 }
 
 // OnHeartbeat pushes the current status each tick (the status resend cadence is the gateway health
-// interval), refreshing the pre-config origin check no more often than that interval.
+// interval), refreshing the origin check at the cadence maybeProbe describes.
 func (c *Client) OnHeartbeat(ctx context.Context, s gateway.Sender) error {
 	c.maybeProbe()
 	return c.sendStatus(ctx, s)

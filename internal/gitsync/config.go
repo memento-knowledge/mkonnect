@@ -128,6 +128,12 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 		slog.Warn("git_sync_config has an invalid config_version; leaving configuration unchanged")
 		return false
 	}
+	limits, err := ResolveLimits(msg.Schedule, msg.Limits)
+	if err != nil {
+		// The error names the offending field and carries no wire value, so it is safe to log.
+		slog.Warn("git_sync_config has a schedule or limit out of range; leaving configuration unchanged", "err", err)
+		return false
+	}
 	next := make(map[string]repoState, len(msg.Repositories))
 	for _, r := range msg.Repositories {
 		if !validRepoID(r.RepoID) {
@@ -185,6 +191,8 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	c.repos = next
 	c.configVersion = cloneRaw(msg.ConfigVersion)
 	c.configAccepted = true
+	// The configuration is a full replace, so limits it leaves out revert to their defaults.
+	c.limits.Store(&limits)
 	c.mu.Unlock()
 	slog.Info("git_sync_config accepted", "repo_count", len(next))
 	return true
