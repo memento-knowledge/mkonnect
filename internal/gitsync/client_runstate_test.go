@@ -415,7 +415,7 @@ func TestChangedTargetDoesNotInheritTheOldSuccess(t *testing.T) {
 	cases := map[string]func(h *statsHarness){
 		"replica moved": func(h *statsHarness) {
 			h.c.HandleMessage(h.ctx, h.s, "git_sync_config", configJSONRaw("2",
-				repoJSON("repo-a", repoAOrigin, "", "https://replica2.example.com/r/repo-a.git", testPushToken)))
+				repoJSON("repo-a", repoAOrigin, "", "https://replica.example.com/r/repo-a-moved.git", testPushToken)))
 		},
 		"origin moved": func(h *statsHarness) {
 			h.config([3]string{"repo-a", "https://git.example.com/team/other.git", ""})
@@ -492,11 +492,11 @@ func TestUnsyncableRepositoryDoesNotKeepASuccessFromAnotherTarget(t *testing.T) 
 		},
 		"replica moved while the origin is unmatched": func(h *statsHarness) {
 			h.c.HandleMessage(h.ctx, h.s, "git_sync_config", configJSONRaw("2",
-				repoJSON("repo-a", "https://elsewhere.example.org/team/a.git", "", "https://replica2.example.com/r/repo-a.git", testPushToken)))
+				repoJSON("repo-a", "https://elsewhere.example.org/team/a.git", "", "https://replica.example.com/r/repo-a-moved.git", testPushToken)))
 		},
-		"replica URL no longer valid": func(h *statsHarness) {
+		"replica URL no longer given": func(h *statsHarness) {
 			h.c.HandleMessage(h.ctx, h.s, "git_sync_config", configJSONRaw("2",
-				repoJSON("repo-a", repoAOrigin, "", "http://replica.example.com/r/repo-a.git", testPushToken)))
+				repoJSON("repo-a", repoAOrigin, "", "", testPushToken)))
 		},
 	}
 	for name, change := range cases {

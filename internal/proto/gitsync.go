@@ -111,8 +111,11 @@ type GitSyncRepoConfig struct {
 	// configuration). The connector uses the local credential against it only if its scheme, host
 	// and port match a locally configured provider.
 	OriginURL string `json:"origin_url"`
-	// ReplicaPushURL is where the connector pushes the mirror. It must be an https URL: the push
-	// token travels to it.
+	// ReplicaPushURL is where the connector pushes the mirror. It must be an https URL on exactly the
+	// host and port the connector was pinned to at install (GIT_SYNC_REPLICA_HOST), because the push
+	// token travels to it: a URL naming any other host rejects the whole configuration, and with no
+	// pin every configuration is rejected. A missing URL, or one that names the pinned host but carries
+	// userinfo, a query, a fragment or whitespace, fails only that repository.
 	ReplicaPushURL string `json:"replica_push_url"`
 	// PushToken authenticates the push to the replica, sent as an Authorization Bearer token
 	// (INFERRED: the contract names the token but not the scheme). It is a Secret so it cannot leak
@@ -179,15 +182,18 @@ const (
 	// GitSyncConfigErrMalformedMessage: the message could not be decoded, or a required field was
 	// missing or of the wrong type.
 	GitSyncConfigErrMalformedMessage = "malformed_message"
-	// GitSyncConfigErrReplicaHostMismatch: a replica_push_url named a host other than the replica host
-	// pinned at install (GIT_SYNC_REPLICA_HOST). RESERVED: this value is defined here so the wire
-	// contract is complete; it is emitted by the replica-host pinning check, which is implemented
-	// separately. Until that check exists the connector does not enforce the pin.
+	// GitSyncConfigErrReplicaHostMismatch: a repository's replica_push_url names a host or port other
+	// than the replica host pinned at install (GIT_SYNC_REPLICA_HOST), a scheme other than https, or
+	// any non-empty value that cannot be shown to name the pinned host (does not parse, no host,
+	// non-ASCII or percent-encoded host). The match is exact: no wildcards, subdomains or suffixes. One such repository rejects the whole
+	// configuration, whether or not its origin matches a local provider; the previous configuration
+	// stays in effect and nothing from the rejected one is synced.
 	GitSyncConfigErrReplicaHostMismatch = "replica_host_mismatch"
-	// GitSyncConfigErrReplicaHostNotPinned: no replica host is pinned at install (GIT_SYNC_REPLICA_HOST
-	// is absent or empty). RESERVED, with the same caveat. The intended behaviour is to fail closed:
-	// reject every configuration and never push. It is a separate value from a mismatch so an
-	// operator can tell an incomplete install from a bad URL.
+	// GitSyncConfigErrReplicaHostNotPinned: no valid replica host is pinned at install
+	// (GIT_SYNC_REPLICA_HOST is absent, empty or malformed). The connector fails closed: it rejects
+	// every configuration with this reason and never pushes, while still connecting, reporting
+	// status and heartbeating. It is a separate value from a mismatch so an operator can tell an
+	// incomplete install from a bad URL.
 	GitSyncConfigErrReplicaHostNotPinned = "replica_host_not_pinned"
 )
 

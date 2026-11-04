@@ -103,15 +103,38 @@ func newTestClientClock(t *testing.T, localJSON string, p gitsync.OriginProber, 
 	return newTestClientOpts(t, localJSON, p, now)
 }
 
+// syncStopTimeout bounds how long a test's cleanup waits for background syncs to stop.
+const syncStopTimeout = 10 * time.Second
+
+// waitForSyncsToStop blocks until the client has no sync in flight. A sync keeps running after the
+// test body returns, and it may touch the mirrors root (creating it if absent, and a real clone
+// creates the mirror under it), so it must have stopped before the test's temporary directories are
+// removed or that removal races it and fails with "directory not empty". Register it from a
+// t.Cleanup AFTER the last t.TempDir call: cleanups run last-in first-out.
+func waitForSyncsToStop(t *testing.T, c *gitsync.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), syncStopTimeout)
+	defer cancel()
+	c.Wait(ctx)
+	if ctx.Err() != nil {
+		t.Errorf("a sync was still running %v after the test ended", syncStopTimeout)
+	}
+}
+
 // newTestClientOpts builds a client whose git runner, by default, blocks until the test ends: a sync
 // started by a config push stays "syncing" (deterministic for status assertions) and never reaches
-// a real git or the network. Pass gitsync.WithGitRunner to take control of it.
+// a real git or the network. Pass gitsync.WithGitRunner to take control of it; a test that does must
+// let its runner return (release its gate or cancel its context) before it ends.
+//
+// The client's cleanup releases the default runner and waits for every sync to stop, and it runs
+// before the temporary directories the client uses are removed.
 func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, now func() time.Time, opts ...gitsync.Option) *gitsync.Client {
 	t.Helper()
 	gate := make(chan struct{})
-	release := sync.OnceFunc(func() { close(gate) })
-	t.Cleanup(release)
 	defaults := []gitsync.Option{
+		// The replica host every fixture URL uses; a test of the unpinned behaviour overrides it
+		// with WithReplicaHost("").
+		gitsync.WithReplicaHost("replica.example.com"),
 		gitsync.WithMirrorsRoot(t.TempDir()),
 		gitsync.WithStatusInterval(10 * time.Millisecond),
 		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
@@ -135,15 +158,10 @@ func newTestClientOpts(t *testing.T, localJSON string, p gitsync.OriginProber, n
 	}
 	cfg := &config.Config{GatewayURL: "wss://gw.example.com", ConnectorID: "gitsync-test", ProtocolVersion: "v1"}
 	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local, p, now, "boot-test", append(defaults, opts...)...)
-	// A finishing sync saves the run state under the mirrors root, after the test may already have
-	// returned. This is registered after the temp dirs, so it runs before they are removed: it releases
-	// the default runner and waits for the syncs to end, so nothing writes into a directory being
-	// deleted.
+	// Registered after the last t.TempDir above, so it runs before any of them is removed.
 	t.Cleanup(func() {
-		release()
-		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		c.Wait(wctx)
+		close(gate)
+		waitForSyncsToStop(t, c)
 	})
 	return c
 }
@@ -375,9 +393,13 @@ func TestApplyConfigValidationRejected(t *testing.T) {
 			c := newTestClient(t, "")
 			s := &stubSender{}
 			c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(raw))
-			// A rejected config emits no status and leaves the connector unconfigured.
-			if n := len(s.messages()); n != 0 {
-				t.Errorf("rejected config emitted %d status messages, want 0", n)
+			// A rejected config leaves the connector unconfigured and reports one status carrying why.
+			msgs := s.messages()
+			if len(msgs) != 1 {
+				t.Fatalf("rejected config emitted %d status messages, want 1", len(msgs))
+			}
+			if ce := lastStatus(t, msgs).ConfigError; ce == nil || ce.Reason == "" {
+				t.Errorf("rejected config status carries no config_error: %+v", ce)
 			}
 			if err := c.OnHeartbeat(context.Background(), s); err != nil {
 				t.Fatalf("OnHeartbeat: %v", err)
@@ -493,14 +515,20 @@ func TestCriticalPatchGateViaHandleMessage(t *testing.T) {
 	}
 }
 
-func TestMalformedMessagesAreIgnored(t *testing.T) {
+func TestMalformedMessagesGetAtMostAConfigError(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	s := &stubSender{}
 	c.HandleMessage(context.Background(), s, "git_sync_config", json.RawMessage(`{"repositories":"nope"}`))
 	c.HandleMessage(context.Background(), s, "git_sync_now", json.RawMessage(`{"repo_id":123}`))
 	c.HandleMessage(context.Background(), s, "something_else", json.RawMessage(`{}`))
-	if n := len(s.messages()); n != 0 {
-		t.Errorf("malformed/unknown messages sent %d replies, want 0", n)
+	// Only the malformed configuration is answered (a status carrying config_error); the malformed
+	// sync request and the unknown type are ignored.
+	msgs := s.messages()
+	if len(msgs) != 1 {
+		t.Fatalf("malformed/unknown messages sent %d replies, want 1", len(msgs))
+	}
+	if ce := lastStatus(t, msgs).ConfigError; ce == nil || ce.Reason != proto.GitSyncConfigErrMalformedMessage {
+		t.Errorf("config_error = %+v, want malformed_message", ce)
 	}
 	// A valid config still applies afterwards.
 	c.HandleMessage(context.Background(), s, "git_sync_config", configJSON("1", [3]string{"repo-a", "https://git.example.com/a.git", ""}))
@@ -784,6 +812,7 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 	c := gitsync.NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), local,
 		&fakeProber{result: gitsync.OriginReachable}, fixedNow, "boot-test",
 		gitsync.WithMirrorsRoot(t.TempDir()),
+		gitsync.WithReplicaHost("replica.example.com"),
 		gitsync.WithGitRunner(func(ctx context.Context, _, _ []string, _ string) ([]byte, error) {
 			<-ctx.Done()
 			return nil, ctx.Err()
@@ -791,6 +820,8 @@ func TestEnrollsAndDispatchesStatus(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Runs after the deferred cancel, and before the temporary directories above are removed.
+	t.Cleanup(func() { waitForSyncsToStop(t, c) })
 	connectDone := make(chan error, 1)
 	go func() { connectDone <- c.Connect(ctx) }()
 

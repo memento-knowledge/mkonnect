@@ -3,6 +3,7 @@ package gitsync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"maps"
 	"math/rand/v2"
@@ -83,6 +84,7 @@ type clientOptions struct {
 	mirrorsRoot     string
 	drainTimeout    time.Duration
 	statusInterval  time.Duration
+	replicaHost     string // raw pin value; canonicalised by NewClient
 }
 
 // defaultStatusInterval is the minimum spacing between statuses sent because syncs finished. Each
@@ -100,6 +102,14 @@ const defaultRunSaveInterval = 5 * time.Second
 // sent immediately and the last state is always flushed within one interval. The default is one second.
 func WithStatusInterval(d time.Duration) Option {
 	return func(o *clientOptions) { o.statusInterval = d }
+}
+
+// WithReplicaHost pins the one replica host (`host` or `host:port`, https implied) the connector may
+// push to; see ParseReplicaHost for the accepted form. The daemon passes the value of
+// GIT_SYNC_REPLICA_HOST, read once at startup. The default, and the result of an invalid value, is
+// not pinned: the connector then rejects every configuration and never syncs.
+func WithReplicaHost(host string) Option {
+	return func(o *clientOptions) { o.replicaHost = host }
 }
 
 // WithGitRunner replaces how git is executed. The default runs the real git binary in the locked-down
@@ -136,6 +146,11 @@ type Client struct {
 	sched        *scheduler
 	drainTimeout time.Duration
 
+	// replicaHost is the canonical "host:port" the connector may push to ("" = not pinned, in which
+	// case every configuration is rejected). It is written once in NewClient and never changed, so it
+	// is read without a lock.
+	replicaHost string
+
 	// limits holds the effective schedule and resource limits. It starts as DefaultLimits and is
 	// replaced as a whole by whatever resolves a configuration's limits (ResolveLimits); until that
 	// is wired in, the defaults apply. Read it through effectiveLimits.
@@ -165,7 +180,10 @@ type Client struct {
 	mu             sync.Mutex
 	configAccepted bool
 	configVersion  json.RawMessage
-	repos          map[string]repoState // by repo_id
+	// configErr is set while the most recent git_sync_config was rejected as a whole, and cleared when
+	// a later one is accepted. See rejectConfig.
+	configErr *proto.GitSyncConfigError
+	repos     map[string]repoState // by repo_id
 	// runs is what is remembered of each repository's attempts (see runRecord), by repo_id. It is
 	// loaded from runStore at startup and written back after every change. It is guarded by mu, like
 	// repos, so a status is built from one consistent view of both.
@@ -209,6 +227,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
+	replicaHost := pinReplicaHost(o.replicaHost)
 	c := &Client{
 		cfg:            cfg,
 		local:          local,
@@ -220,6 +239,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		runSaveEvery:   o.runSaveInterval,
 		drainTimeout:   o.drainTimeout,
 		statusInterval: o.statusInterval,
+		replicaHost:    replicaHost,
 	}
 	c.runs = c.runStore.load()
 	c.mgr = newManager(defaultSyncConcurrency,
@@ -251,6 +271,23 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		ReadLimit:         gitSyncReadLimit,
 	}, keyStore, c)
 	return c
+}
+
+// pinReplicaHost canonicalises the configured pin and logs the effective state once, loudly when
+// there is none. An unset or invalid pin yields "" (not pinned). The log carries only the canonical
+// pin or a fixed reason, never the raw value.
+func pinReplicaHost(raw string) string {
+	host, err := ParseReplicaHost(raw)
+	switch {
+	case err == nil:
+		slog.Info("replica host pinned", "host", host)
+		return host
+	case errors.Is(err, ErrReplicaHostNotSet):
+		slog.Error(ReplicaHostEnv + " is not set: the connector will reject every configuration and will not sync until a replica host is pinned")
+	default:
+		slog.Error("invalid replica host pin: the connector will reject every configuration and will not sync", "reason", err.Error())
+	}
+	return ""
 }
 
 // Run connects and maintains the connection with backoff until ctx is cancelled. It also runs the
@@ -320,8 +357,10 @@ func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string
 			// token refresh, and a fetch of an unchanged repository is cheap. Syncs are marked
 			// before the status is built, so the status already reports them as syncing.
 			c.startSyncs(ctx, c.syncableRepos())
-			c.emitStatus(ctx, s, dispatchStatusTimeout)
 		}
+		// Accepted or rejected, report at once: a rejection is carried as config_error so the
+		// platform learns promptly that the configuration it sent is not in effect.
+		c.emitStatus(ctx, s, dispatchStatusTimeout)
 	case "git_sync_now":
 		var msg proto.GitSyncNowMsg
 		if err := json.Unmarshal(raw, &msg); err != nil {
@@ -359,6 +398,12 @@ func (c *Client) resolveTask(repoID string) (syncTask, bool) {
 	r, ok := c.repos[repoID]
 	c.mu.Unlock()
 	if !ok || !r.matched || r.replicaURL == "" || c.local == nil {
+		return syncTask{}, false
+	}
+	// Second layer of the replica-host pin: applyConfig only retains a URL on the pinned host, but a
+	// sync is the point at which the push token leaves the process, so re-check it here.
+	if _, v := checkReplicaURL(r.replicaURL, c.replicaHost); v != replicaOK {
+		slog.Error("refusing to sync: the replica URL is not on the pinned replica host", "repo_id", repoID)
 		return syncTask{}, false
 	}
 	origin, ok := c.local.Get(r.provider)

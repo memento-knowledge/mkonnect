@@ -71,6 +71,10 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 	c.mu.Lock()
 	cv := cloneRaw(c.configVersion)
 	accepted := c.configAccepted
+	var configErr *proto.GitSyncConfigError
+	if c.configErr != nil {
+		configErr = &proto.GitSyncConfigError{ConfigVersion: cloneRaw(c.configErr.ConfigVersion), Reason: c.configErr.Reason}
+	}
 	snapshot := make([]repoState, 0, len(c.repos))
 	for _, r := range c.repos {
 		snapshot = append(snapshot, r)
@@ -113,6 +117,7 @@ func (c *Client) buildStatus() proto.GitSyncStatusMsg {
 		Sequence:      c.seq.Add(1),
 		BootID:        c.bootID,
 		Repositories:  repos,
+		ConfigError:   configErr,
 	}
 	if earliest != nil {
 		s := earliest.UTC().Format(time.RFC3339)
