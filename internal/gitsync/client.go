@@ -137,7 +137,6 @@ func WithDrainTimeout(d time.Duration) Option {
 type Client struct {
 	cfg    *config.Config
 	gw     *gateway.Client
-	local  *Store
 	prober OriginProber
 	now    func() time.Time
 	bootID string
@@ -188,6 +187,17 @@ type Client struct {
 	// a later one is accepted. See rejectConfig.
 	configErr *proto.GitSyncConfigError
 	repos     map[string]repoState // by repo_id
+	// providers is the local provider configuration in force. It is replaced as a whole by
+	// setProviders, and only together with the rebinding of every repository in repos, under mu: a
+	// reader holding mu sees repositories bound to exactly this set. providerGen draws the generation
+	// numbers of its entries; providerEpoch counts replacements, so work started against one set can
+	// tell it has been superseded.
+	providers     *providerSet
+	providerGen   uint64
+	providerEpoch uint64
+	// attempts registers the sync attempt running for each repository (claimTask), so a replaced
+	// credential can cancel the ones that use it.
+	attempts map[string]*attempt
 	// runs is what is remembered of each repository's attempts (see runRecord), by repo_id. It is
 	// loaded from runStore at startup and written back after every change. It is guarded by mu, like
 	// repos, so a status is built from one consistent view of both.
@@ -208,6 +218,13 @@ type Client struct {
 	connSender gateway.Sender
 	// connGen counts connections, so work started on one can tell it has been superseded.
 	connGen uint64
+	// probeCancel stops the origin probe now running, if any; see maybeProbe.
+	probeCancel context.CancelFunc
+	// runCtx is the process-lifetime context Run was given, which bounds the syncs a reload starts.
+	runCtx context.Context
+
+	// afterClaimRead, when set by a test, runs inside claimTask's critical section.
+	afterClaimRead func()
 
 	// statusMu serialises build-and-send so a heartbeat cannot send a stale snapshot after the read
 	// loop has already sent a newer one, and so the sequence number matches wire order.
@@ -233,11 +250,11 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 	replicaHost := pinReplicaHost(o.replicaHost)
 	c := &Client{
 		cfg:            cfg,
-		local:          local,
 		prober:         prober,
 		now:            now,
 		bootID:         bootID,
 		repos:          map[string]repoState{},
+		attempts:       map[string]*attempt{},
 		runStore:       newRunStateStore(root),
 		runSaveEvery:   o.runSaveInterval,
 		drainTimeout:   o.drainTimeout,
@@ -245,13 +262,15 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		gc:             newMirrorGC(),
 		replicaHost:    replicaHost,
 	}
+	c.providers = buildProviderSet(local, emptyProviders(), c.nextProviderGen)
 	defaults := DefaultLimits()
 	c.limits.Store(&defaults)
 	c.runs = c.runStore.load()
 	c.mgr = newManager(defaultSyncConcurrency,
 		syncDeps{mirrors: Mirrors{Root: root}, run: o.run, runOut: o.runOut, now: now, limits: c.effectiveLimits},
 		syncHooks{
-			resolve:   c.resolveTask,
+			syncable:  c.syncable,
+			claim:     c.claimTask,
 			begin:     c.beginSync,
 			started:   c.startAttempt,
 			finish:    c.finishAndReschedule,
@@ -298,10 +317,21 @@ func pinReplicaHost(raw string) string {
 // periodic resync scheduler for as long as it runs, and returns only after that has stopped. The
 // mirror cleanup loop runs alongside; Wait confirms it has stopped.
 func (c *Client) Run(ctx context.Context) {
+	c.rememberRunCtx(ctx)
 	stop := c.sched.start(ctx)
 	defer stop()
 	c.startMirrorGC(ctx)
 	c.gw.Run(ctx)
+}
+
+// rememberRunCtx records the process-lifetime context (Run's, and the one the gateway hands
+// HandleMessage), which bounds the syncs a reload of the providers starts. The first one wins.
+func (c *Client) rememberRunCtx(ctx context.Context) {
+	c.mu.Lock()
+	if c.runCtx == nil {
+		c.runCtx = ctx
+	}
+	c.mu.Unlock()
 }
 
 // effectiveLimits returns the limits in force: the defaults until a configuration supplies others.
@@ -354,6 +384,7 @@ func (c *Client) OnDraining(ctx context.Context) {
 
 // HandleMessage dispatches the git-sync inbound messages.
 func (c *Client) HandleMessage(ctx context.Context, s gateway.Sender, typ string, raw json.RawMessage) {
+	c.rememberRunCtx(ctx)
 	switch typ {
 	case "git_sync_config":
 		accepted := c.applyConfig(raw)
@@ -400,35 +431,6 @@ func (c *Client) startSyncs(ctx context.Context, repoIDs []string) {
 	c.mgr.enqueue(ctx, repoIDs)
 }
 
-// resolveTask snapshots what a sync of repoID needs, or reports that the repository is not (or no
-// longer) syncable. It is the manager's view of the configured set, taken under mu.
-func (c *Client) resolveTask(repoID string) (syncTask, bool) {
-	c.mu.Lock()
-	r, ok := c.repos[repoID]
-	c.mu.Unlock()
-	if !ok || !r.matched || r.replicaURL == "" || c.local == nil {
-		return syncTask{}, false
-	}
-	// Second layer of the replica-host pin: applyConfig only retains a URL on the pinned host, but a
-	// sync is the point at which the push token leaves the process, so re-check it here.
-	if _, v := checkReplicaURL(r.replicaURL, c.replicaHost); v != replicaOK {
-		slog.Error("refusing to sync: the replica URL is not on the pinned replica host", "repo_id", repoID)
-		return syncTask{}, false
-	}
-	origin, ok := c.local.Get(r.provider)
-	if !ok {
-		return syncTask{}, false
-	}
-	return syncTask{
-		RepoID:         repoID,
-		CanonicalURL:   r.canonicalURL,
-		Origin:         origin,
-		ReplicaURL:     r.replicaURL,
-		PushToken:      r.pushToken,
-		TokenExpiresAt: r.expiresAt,
-	}, true
-}
-
 // beginSync marks repoID as syncing (queued or running), if it is still configured. The task itself
 // is resolved later, when a slot is free, so only the repository is identified here.
 func (c *Client) beginSync(repoID string) {
@@ -458,24 +460,40 @@ func (c *Client) setSyncing(repoID string, syncing bool) {
 func (c *Client) startAttempt(repoID string, t syncTask, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if r, ok := c.repos[repoID]; ok && targetMatches(r, t) {
+	if r, ok := c.repos[repoID]; ok && targetMatches(r, t) && r.bind == t.Bind {
 		r.attemptStartedAt = at
 		c.repos[repoID] = r
 	}
 }
 
-// finishSync records a sync's outcome and clears the syncing mark. A task whose target no longer
-// matches the repository's configuration (the platform reconfigured it mid-sync) is ignored, so a
-// stale result is never attributed to the new target. A pending result means the sync was
-// cancelled; nothing is recorded. Every other result, a failure as much as a success, is a finished
-// attempt and updates the repository's run record, which is then saved: a failure to save is logged
-// by the store and never affects the sync.
-func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
+// finishSync ends repoID's attempt, records its outcome and clears the syncing mark, and reports
+// whether the outcome was kept.
+//
+// A task whose target no longer matches the repository's configuration (the platform reconfigured it
+// mid-sync) is ignored, so a stale result is never attributed to the new target. A task that ran
+// under a credential that has since been superseded is dropped: its outcome (a success as much as a
+// failure) describes a credential that is no longer in force, so it is neither recorded nor counted.
+// That holds whether or not the cancellation reached the sync in time. A pending result means the
+// sync was cancelled; nothing is recorded. Every other result, a failure as much as a success, is a
+// finished attempt and updates the repository's run record, which is then saved: a failure to save
+// is logged by the store and never affects the sync.
+func (c *Client) finishSync(repoID string, t syncTask, res syncResult) bool {
 	c.mu.Lock()
+	superseded := c.endAttemptLocked(repoID)
 	r, ok := c.repos[repoID]
 	if !ok || !targetMatches(r, t) {
 		c.mu.Unlock()
-		return
+		return false
+	}
+	if superseded || r.bind != t.Bind {
+		r.syncing = false
+		r.attemptStartedAt = time.Time{}
+		c.repos[repoID] = r
+		c.mu.Unlock()
+		if res.State != StatePending {
+			slog.Info("discarded the result of a sync that used a superseded credential", "repo_id", repoID)
+		}
+		return false
 	}
 	r.syncing = false
 	r.attemptStartedAt = time.Time{}
@@ -492,6 +510,7 @@ func (c *Client) finishSync(repoID string, t syncTask, res syncResult) {
 	if record {
 		c.markRunsDirty()
 	}
+	return record
 }
 
 // recordAttempt folds a finished attempt into a repository's run record. last_success_at moves only
@@ -595,34 +614,23 @@ func (c *Client) stopRunSaves() {
 
 // finishAndReschedule records a sync's outcome, then lets the scheduler plan the repository's next
 // run from it.
-func (c *Client) finishAndReschedule(repoID string, t syncTask, res syncResult) {
-	c.finishSync(repoID, t, res)
-	c.sched.completed(repoID, t, res)
+func (c *Client) finishAndReschedule(repoID string, t syncTask, res syncResult) bool {
+	kept := c.finishSync(repoID, t, res)
+	if kept {
+		c.sched.completed(repoID, t, res)
+	}
+	return kept
 }
 
 // schedulableTargets returns the sync target of every repository the scheduler may start: exactly
-// those resolveTask would accept. It copies no secret.
+// those claimTask would accept. It copies no secret.
 func (c *Client) schedulableTargets() map[string]targetKey {
-	type candidate struct {
-		id, provider string
-		key          targetKey
-	}
 	c.mu.Lock()
-	candidates := make([]candidate, 0, len(c.repos))
+	defer c.mu.Unlock()
+	out := make(map[string]targetKey, len(c.repos))
 	for id, r := range c.repos {
 		if r.matched && r.replicaURL != "" {
-			candidates = append(candidates, candidate{id, r.provider, targetKey{r.canonicalURL, r.replicaURL}})
-		}
-	}
-	c.mu.Unlock()
-
-	out := make(map[string]targetKey, len(candidates))
-	if c.local == nil {
-		return out
-	}
-	for _, cand := range candidates {
-		if _, ok := c.local.Get(cand.provider); ok {
-			out[cand.id] = cand.key
+			out[id] = targetKey{r.canonicalURL, r.replicaURL}
 		}
 	}
 	return out
@@ -674,8 +682,8 @@ func (c *Client) syncTargets(repoID string) []string {
 	return nil
 }
 
-// syncableRepos returns the sorted repo_ids that can be synced: host-matched to a local provider
-// (resolved at applyConfig time) and carrying a usable replica URL.
+// syncableRepos returns the sorted repo_ids that can be synced: bound to a local provider and
+// carrying a usable replica URL. A replica URL alone is not enough: unbound repositories hold one too.
 func (c *Client) syncableRepos() []string {
 	snapshot := c.snapshotRepos()
 	var out []string

@@ -72,7 +72,10 @@ func (c *Client) RecordResultForTest(repoID, state, errType string) {
 // FinishSyncForTest reports a sync result for the given target as a finishing sync would, so a test
 // can check that a result for a target the platform has since reconfigured is ignored.
 func (c *Client) FinishSyncForTest(repoID, canonicalURL, replicaURL, state, errType string) {
-	c.finishSync(repoID, syncTask{RepoID: repoID, CanonicalURL: canonicalURL, ReplicaURL: replicaURL},
+	c.mu.Lock()
+	bind := c.repos[repoID].bind
+	c.mu.Unlock()
+	c.finishSync(repoID, syncTask{RepoID: repoID, CanonicalURL: canonicalURL, ReplicaURL: replicaURL, Bind: bind},
 		syncResult{State: state, ErrorType: errType})
 }
 

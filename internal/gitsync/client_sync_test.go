@@ -416,7 +416,7 @@ func TestWaitReturnsOnceCancelledSyncsHaveStopped(t *testing.T) {
 	}
 }
 
-func TestApplyConfigRetainsReplicaMaterialForMatched(t *testing.T) {
+func TestApplyConfigRetainsReplicaMaterial(t *testing.T) {
 	c := newTestClient(t, oneProvider)
 	c.HandleMessage(context.Background(), &stubSender{}, "git_sync_config", configJSONRaw("1",
 		repoJSON("repo-a", "https://git.example.com/team/a.git", "", "https://REPLICA.example.com/r/a.git", testPushToken),
@@ -433,10 +433,11 @@ func TestApplyConfigRetainsReplicaMaterialForMatched(t *testing.T) {
 		t.Error("the push token was not retained for a matched repository")
 	}
 
-	// A repository that cannot be synced must not hold a push token it will never use.
+	// A repository whose host has no provider yet keeps its replica material, so that a provider
+	// added by a reload makes it syncable without the platform sending its configuration again.
 	replica, token, found = c.ReplicaMaterialForTest("repo-b")
-	if !found || replica != "" || token != "" {
-		t.Errorf("unmatched repo-b retained replica=%q token-present=%v, want neither", replica, token != "")
+	if want := "https://replica.example.com:443/r/b.git"; !found || replica != want || token != testPushToken {
+		t.Errorf("unmatched repo-b retained replica=%q token-present=%v, want %q and the token", replica, token != "", want)
 	}
 }
 

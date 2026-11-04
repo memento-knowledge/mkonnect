@@ -50,27 +50,41 @@ func validRepoID(id string) bool {
 
 // repoState is the retained state of a configured repository.
 //
-// The raw origin_url string is deliberately NOT retained. When a repository host-matches a local
-// provider, applyConfig resolves and stores the matched provider name plus the validated,
-// re-serialized canonical origin URL. The sync dials canonicalURL directly and never re-parses an
-// unvalidated string with git's URL parser (whose host interpretation can diverge from ours), so
-// the host that was match-checked is byte-for-byte the host that gets contacted.
+// The raw origin_url string is deliberately NOT retained. applyConfig validates it once and keeps the
+// re-serialized canonical URL (originURL) and its host key (originHostKey); which local provider, if
+// any, the repository is bound to is derived from the host key by bindRepo, against whichever provider
+// set is current, and is redone when the provider configuration is reloaded. The sync dials
+// canonicalURL (the originURL of a bound repository) directly and never re-parses an unvalidated
+// string with git's URL parser (whose host interpretation can diverge from ours), so the host that
+// was match-checked is byte-for-byte the host that gets contacted.
 //
-// The push token is retained, in memory only and as a self-redacting Secret, and only for a
-// repository that is host-matched and has a usable replica URL: a repository that can never be
-// synced holds no secret. Hardening it at rest is Phase 4.
+// The push token is retained, in memory only and as a self-redacting Secret, for every repository
+// whose replica configuration is usable, bound or not: a provider added later by a reload makes a
+// repository syncable without the platform sending its configuration again. It is copied into a
+// syncTask only for a bound repository. Hardening it at rest is Phase 4.
 type repoState struct {
-	repoID       string
-	provider     string // matched local provider name, "" when unmatched
-	canonicalURL string // validated, re-serialized origin URL the sync dials, "" when unmatched
-	expiresAt    string // push_token_expires_at (RFC3339), "" when none
-	matched      bool   // origin_url binds to a local provider (resolved once, at applyConfig)
+	repoID    string
+	expiresAt string // push_token_expires_at (RFC3339), "" when none
+	// originURL is the validated, re-serialized origin URL, and originHostKey its scheme://host:port;
+	// both are "" when origin_url is not a valid remote URL.
+	originURL     string
+	originHostKey string
 	// target fingerprints the origin and replica this repository replicates between (see
 	// targetFingerprint), whether or not it can currently be synced.
 	target string
 
-	replicaURL string // validated, re-serialized https replica URL on the pinned host, "" when unmatched or unusable
-	pushToken  Secret // platform push token for replicaURL; empty exactly when replicaURL is
+	// replicaUsable says the replica URL is on the pinned host and the push token is usable. The
+	// replica material below is set exactly when it is.
+	replicaUsable bool
+	replicaURL    string // validated, re-serialized https replica URL on the pinned host, "" when unusable
+	pushToken     Secret // platform push token for replicaURL; empty exactly when replicaURL is
+
+	// Derived by bindRepo from originHostKey and the current provider set; never set elsewhere.
+	bind         binding
+	provider     string // bound local provider name, "" when unbound
+	canonicalURL string // origin URL the sync dials, "" when unbound
+	matched      bool   // origin_url binds to a local provider
+
 	// result is the recorded outcome of the last sync attempt, or the reason the configuration is
 	// unusable. A zero State means no outcome yet, which is reported as pending.
 	result  syncResult
@@ -78,6 +92,29 @@ type repoState struct {
 	// attemptStartedAt is when the attempt now running began, and zero while none is: a queued
 	// repository has not started one. It is in memory only; only finished attempts are persisted.
 	attemptStartedAt time.Time
+}
+
+// bindRepo returns r bound against set: matched exactly when a provider serves its origin's host. A
+// repository whose binding changes (bound, unbound, or bound to another provider or another
+// generation of its credential) starts over: what its last attempt reported was said about a
+// different binding. The invalid-replica result is a property of the configuration rather than of
+// any attempt, so a bound repository with an unusable replica always carries it.
+func bindRepo(r repoState, set *providerSet) repoState {
+	old := r.bind
+	if pe, name, ok := set.match(r.originHostKey); ok {
+		r.bind = binding{provider: name, gen: pe.gen}
+		r.provider, r.canonicalURL, r.matched = name, r.originURL, true
+	} else {
+		r.bind = binding{}
+		r.provider, r.canonicalURL, r.matched = "", "", false
+	}
+	if r.bind != old {
+		r.result = syncResult{}
+	}
+	if r.matched && !r.replicaUsable {
+		r.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
+	}
+	return r
 }
 
 // errInvalidReplica is the detail reported for a matched repository whose replica URL or push token
@@ -100,8 +137,7 @@ func validPushToken(tok Secret) bool {
 // still meaningful. The push token is deliberately not part of it: a refreshed token for the same
 // repository does not invalidate its last result.
 func sameSyncIdentity(a, b repoState) bool {
-	return a.matched == b.matched && a.provider == b.provider &&
-		a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
+	return a.bind == b.bind && a.canonicalURL == b.canonicalURL && a.replicaURL == b.replicaURL
 }
 
 // rejectConfig records that the most recent git_sync_config was rejected as a whole, so the status
@@ -195,35 +231,26 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 			c.rejectConfig(version, proto.GitSyncConfigErrDuplicateRepoID)
 			return false
 		}
-		// Resolve the host-match once here: the local provider set is fixed for the daemon's life
-		// (loaded at startup, no live reload), so the result is stable until the next config and
-		// need not be recomputed on every status. The origin is parsed once: its canonical host key
-		// selects the provider and its canonical URL is retained for the sync to dial.
-		var provider, canonicalURL, originURL string
-		matched := false
+		// Only the origin is validated here. Which provider serves it is decided under c.mu, together
+		// with installing the result, so a reload of the providers cannot slip in between and leave a
+		// stale binding behind.
+		var originURL, originHostKey string
 		if hostKey, fullURL, err := canonicalRemoteURL(r.OriginURL); err == nil {
-			originURL = fullURL
-			if c.local != nil {
-				if name, _, ok := c.local.matchByHostKey(hostKey); ok {
-					provider, canonicalURL, matched = name, fullURL, true
-				}
-			}
+			originURL, originHostKey = fullURL, hostKey
 		}
+		// A repository whose replica is not usable fails on its own, once it is bound (see bindRepo):
+		// the others are independent and halting them all would be disproportionate. (A replica on
+		// another host has already rejected the whole message above.)
+		usable := replicas[i].verdict == replicaOK && validPushToken(r.PushToken)
 		st := repoState{
-			repoID: r.RepoID, provider: provider, canonicalURL: canonicalURL, expiresAt: r.PushTokenExpiresAt, matched: matched,
+			repoID: r.RepoID, expiresAt: r.PushTokenExpiresAt, originURL: originURL, originHostKey: originHostKey,
 			// The replica is empty unless usable, so a repository whose replica is not is a different
 			// target from the one that was synced.
-			target: targetFingerprint(originURL, replicas[i].url),
+			target:        targetFingerprint(originURL, replicas[i].url),
+			replicaUsable: usable,
 		}
-		if matched {
-			// An unusable replica fails this one repository, not the whole message: the others are
-			// independent and halting them all would be disproportionate. (A replica on another host
-			// has already rejected the whole message above.)
-			if replicas[i].verdict == replicaOK && validPushToken(r.PushToken) {
-				st.replicaURL, st.pushToken = replicas[i].url, r.PushToken
-			} else {
-				st.result = syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errInvalidReplica}
-			}
+		if usable {
+			st.replicaURL, st.pushToken = replicas[i].url, r.PushToken
 		}
 		next[r.RepoID] = st
 	}
@@ -235,6 +262,8 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	// sync target unchanged (the platform re-sends config on every token refresh), so a healthy
 	// repository is not reset to pending. A changed target starts over.
 	for id, st := range next {
+		st = bindRepo(st, c.providers)
+		next[id] = st
 		if old, ok := c.repos[id]; ok && sameSyncIdentity(old, st) {
 			if st.result.State == "" {
 				st.result = old.result

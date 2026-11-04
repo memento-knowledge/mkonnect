@@ -30,16 +30,18 @@ const originCheckInterval = 5 * time.Minute
 // the check; a probe that ran to completion is a true observation of the origin and may be kept
 // then. What must never happen is a killed git being read as "unreachable".
 func (c *Client) maybeProbe() {
+	// Everything the probe is made from, and the registration of how to stop it, is taken in one hold
+	// of c.mu. A replacement of the providers (setProviders) also holds it, so it either finds this
+	// probe registered and cancels it, or runs first and the probe is made from the new set: a probe
+	// can never be running with a provider that was already replaced and out of reach of the
+	// cancellation.
 	c.mu.Lock()
 	accepted := c.configAccepted
 	ctx := c.connCtx
 	s := c.connSender
 	gen := c.connGen
-	c.mu.Unlock()
-	if ctx == nil || s == nil || ctx.Err() != nil {
-		return
-	}
-	if c.local == nil || len(c.local.Names()) == 0 {
+	if ctx == nil || s == nil || ctx.Err() != nil || len(c.providers.byName) == 0 {
+		c.mu.Unlock()
 		return
 	}
 	spacing := gateway.DefaultHeartbeatInterval
@@ -47,6 +49,7 @@ func (c *Client) maybeProbe() {
 		spacing = originCheckInterval
 	}
 	if !c.probing.CompareAndSwap(false, true) {
+		c.mu.Unlock()
 		return
 	}
 	start := c.now().UnixNano()
@@ -56,19 +59,37 @@ func (c *Client) maybeProbe() {
 	// catches up: it counts as elapsed.
 	if since := time.Duration(start - c.lastProbe.Load()); since >= 0 && since < spacing-spacing/10 {
 		c.probing.Store(false)
+		c.mu.Unlock()
 		return
 	}
 	c.lastProbe.Store(start)
+	entries := c.providers.entries()
+	epoch := c.providerEpoch
+	probeCtx, cancel := context.WithCancel(ctx)
+	c.probeCancel = cancel
+	c.mu.Unlock()
+
 	go func() {
-		defer c.probing.Store(false)
-		res, ok := c.runProbe(ctx)
-		// Commit only while this probe's connection is still the current one and still open. A probe
-		// cut short by its connection closing, or one overtaken by a newer connection, changes
-		// nothing and gives its cadence slot back, so the next probe is not held off by it.
+		stale := false
+		defer func() {
+			cancel()
+			c.probing.Store(false)
+			if stale {
+				// The providers changed under this probe: its result is discarded and the new set is
+				// probed now, rather than when the cadence next allows.
+				c.maybeProbe()
+			}
+		}()
+		res, ok := c.runProbe(probeCtx, entries)
+		// Commit only while this probe's connection is still the current one and still open, and the
+		// providers it probed are still the ones in force. A probe cut short by its connection
+		// closing, or one overtaken by a newer connection or a changed provider set, changes nothing
+		// and gives its cadence slot back, so the next probe is not held off by it.
 		c.mu.Lock()
 		live := c.connGen == gen && ctx.Err() == nil
+		current := c.providerEpoch == epoch
 		changed := false
-		if live {
+		if live && current {
 			if ok {
 				c.originCheck.Store(&proto.OriginCheck{Result: string(res), CheckedAt: c.now().UTC().Format(rfc3339Nano)})
 				changed = true
@@ -79,8 +100,9 @@ func (c *Client) maybeProbe() {
 			}
 		}
 		c.mu.Unlock()
-		if !live {
+		if !live || !current {
 			c.lastProbe.CompareAndSwap(start, 0)
+			stale = live && !current
 			return
 		}
 		if changed {
@@ -89,19 +111,21 @@ func (c *Client) maybeProbe() {
 	}()
 }
 
-// runProbe probes every configured provider and aggregates worst-to-best (access_denied over
-// unreachable over reachable). ok is false when no provider yielded a usable result (for example
-// git is not installed): a local fault, which maybeProbe logs through here and answers by leaving
-// origin_check absent. A provider that faults while another yields a result is skipped, so the
-// aggregate covers only the providers that could be checked.
-func (c *Client) runProbe(ctx context.Context) (OriginResult, bool) {
+// runProbe probes each of entries and aggregates worst-to-best (access_denied over unreachable over
+// reachable). ok is false when no provider yielded a usable result (for example git is not
+// installed): a local fault, which maybeProbe logs through here and answers by leaving origin_check
+// absent. A provider that faults while another yields a result is skipped, so the aggregate covers
+// only the providers that could be checked. A probe whose context ended says nothing and logs nothing.
+func (c *Client) runProbe(ctx context.Context, entries []LocalEntry) (OriginResult, bool) {
 	rank := map[OriginResult]int{OriginReachable: 0, OriginUnreachable: 1, OriginAccessDenied: 2}
 	worst := OriginReachable
 	any := false
-	for _, e := range c.local.List() {
+	for _, e := range entries {
 		res, err := c.prober.Probe(ctx, e)
 		if err != nil {
-			slog.Warn("origin reachability check could not run", "err", err)
+			if ctx.Err() == nil {
+				slog.Warn("origin reachability check could not run", "err", err)
+			}
 			continue
 		}
 		any = true

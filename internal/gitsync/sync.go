@@ -91,6 +91,9 @@ type syncTask struct {
 	ReplicaURL     string
 	PushToken      Secret
 	TokenExpiresAt string // RFC3339; "" when unknown
+	// Bind is the provider, and generation of its credential, Origin was taken from; the result of
+	// the attempt is kept only while the repository is still bound to it.
+	Bind binding
 }
 
 // syncDeps are the seams a sync needs. Zero timeouts use the defaults.
