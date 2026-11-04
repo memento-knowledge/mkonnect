@@ -38,6 +38,10 @@ const (
 // failure. ErrOriginAccessDenied also covers a repository whose host is not configured locally (the
 // host-match guard); ErrUnclassified is the fallback that carries a sanitised detail so no failure
 // is dropped. See classifyGitFailure for how a failed git invocation maps onto them.
+//
+// ErrReplicaRejected includes a replica refusal over its own size or quota limit. The separate
+// ErrRepositoryOverLimit is reserved for the connector's own repository-size ceiling, a local check
+// that is never inferred from git output (it is not enforced yet).
 const (
 	ErrOriginUnreachable   = "origin_unreachable"
 	ErrOriginAccessDenied  = "origin_access_denied"
