@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // maxRegistrationTokenFileSize bounds how much of REGISTRATION_TOKEN_FILE is read. A
@@ -39,23 +41,18 @@ func readRegistrationTokenFile(path string) (string, error) {
 		return "", errors.New("must be an absolute path")
 	}
 
-	// Stat before opening so a FIFO or device cannot block the open. Stat follows
-	// symlinks, as a Kubernetes Secret mount requires (each key is a symlink into a
-	// ..data directory), so the final path component is deliberately not O_NOFOLLOW.
-	if info, err := os.Stat(path); err != nil {
-		return "", err
-	} else if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", path)
-	}
-
-	f, err := os.Open(path)
+	// Open without O_NOFOLLOW: a Kubernetes Secret mount exposes each key as a symlink
+	// into a ..data directory, so the final path component must be followed. O_NONBLOCK
+	// keeps opening a FIFO from blocking, and every check below is made on the opened
+	// descriptor, so the file validated is the file read (no stat/open race). This
+	// follows the convention of internal/auth/keystore.go.
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("opening %s: %w", path, err)
 	}
-	defer f.Close()
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close() //nolint:errcheck
 
-	// Re-check on the opened descriptor so the validated file is the one read, even
-	// if the path was swapped after the stat above.
 	info, err := f.Stat()
 	if err != nil {
 		return "", err
@@ -75,20 +72,24 @@ func readRegistrationTokenFile(path string) (string, error) {
 		return "", fmt.Errorf("%s is larger than %d bytes", path, maxRegistrationTokenFileSize)
 	}
 
-	// Trim exactly one trailing line ending (as written by editors or `echo`); any
-	// other whitespace is left alone so the token is never silently altered.
-	token := strings.TrimSuffix(string(data), "\n")
-	token = strings.TrimSuffix(token, "\r")
+	// Trim exactly one trailing line ending, "\n" or "\r\n" (as written by editors or
+	// `echo`). A lone trailing "\r" and any other whitespace are left alone so the
+	// token is never silently altered.
+	token, trimmed := strings.CutSuffix(string(data), "\n")
+	if trimmed {
+		token = strings.TrimSuffix(token, "\r")
+	}
 	if token == "" {
 		return "", fmt.Errorf("%s is empty", path)
 	}
 	return token, nil
 }
 
-// tokenFileModeAcceptable mirrors the credential store's policy for files it cannot
-// tighten itself: no access at all for "other" and no write for "group", while group
-// read is allowed because a Kubernetes Secret volume is readable by a non-root
-// process only through the pod's fsGroup.
+// tokenFileModeAcceptable applies the same policy as readOnlyModeAcceptable in
+// internal/creds, which the credential store uses for files it cannot tighten itself:
+// no access at all for "other" and no write for "group", while group read is allowed
+// because a Kubernetes Secret volume is readable by a non-root process only through
+// the pod's fsGroup.
 func tokenFileModeAcceptable(mode os.FileMode) bool {
 	// 0o027 = group-write (0o020) plus all "other" bits (0o007).
 	return mode.Perm()&0o027 == 0

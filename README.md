@@ -99,7 +99,7 @@ Runtime configuration comes from environment variables (internal-tool credential
 | `GATEWAY_URL` | yes | Secure WebSocket URL of the Bridge Gateway. Copy it exactly from the Memento portal; it must use `wss://`. |
 | `CONNECTOR_ID` | yes | Stable UUID identifying this connector instance. |
 | `REGISTRATION_TOKEN` | first run only | One-time token used to register a new connector. Not needed after the private key has been issued and persisted. |
-| `REGISTRATION_TOKEN_FILE` | no | Absolute path to a file containing the registration token, as an alternative to `REGISTRATION_TOKEN` (for example a mounted Kubernetes `Secret`). When set, the file is used and `REGISTRATION_TOKEN` is ignored; if the file cannot be read the connector exits with an error instead of falling back. The file must be a regular file of at most 4 KiB, not accessible by "other" and not writable by group (group read is allowed); a single trailing newline is removed. |
+| `REGISTRATION_TOKEN_FILE` | no | Absolute path to a file containing the registration token, as an alternative to `REGISTRATION_TOKEN` (for example a mounted Kubernetes `Secret`). When set, the file is used and `REGISTRATION_TOKEN` is ignored. The connector exits with an error if the file is missing or unreadable, and does not fall back to `REGISTRATION_TOKEN`; so after the connector has registered, either keep the file in place or unset this variable, because deleting the file while the variable is still set makes startup fail. The file must be a regular file of at most 4 KiB, not accessible by "other" and not writable by group (group read is allowed); a single trailing newline is removed. On Kubernetes, mount the `Secret` with `defaultMode` `0440` or `0400` and set the pod `fsGroup`; the default `0644` is rejected. The Helm chart in this repository still injects `REGISTRATION_TOKEN` through the environment; file support for the chart will follow separately. |
 | `KEY_FILE` | no | Path to the ML-DSA-65 private key file. Defaults to `~/.mkonnect/key`. |
 | `PROTOCOL_VERSION` | no | Wire protocol version to negotiate. Defaults to `v1`. |
 | `CREDS_FILE` | no | Path to the local credential store written by `connector config set`. Defaults to `/data/credentials.json`. |
@@ -194,15 +194,14 @@ printf '\n' >&2
 printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
 unset REGISTRATION_TOKEN
 
-REGISTRATION_TOKEN="$(<"$mkonnect_config_dir/registration.token")"
-export REGISTRATION_TOKEN
+REGISTRATION_TOKEN_FILE="$mkonnect_config_dir/registration.token" \
 GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
 ```
 
-After it has registered, stop the process, then restart without the token:
+The file is owner-only (`0600`), which `REGISTRATION_TOKEN_FILE` requires. After it has registered, stop the process, then restart without the token. Remove the variable together with the file: with `REGISTRATION_TOKEN_FILE` still set, a missing file makes startup fail.
 
 ```bash
-unset REGISTRATION_TOKEN
+unset REGISTRATION_TOKEN_FILE
 rm "$mkonnect_config_dir/registration.token"
 GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
 ```

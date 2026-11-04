@@ -57,6 +57,15 @@ Open the Memento portal, go to **Integrations → On-Prem Connector**, and note:
 The registration token is a one-time secret. It is consumed on first startup; after that the
 connector authenticates with the private key it was issued and the token is no longer needed.
 
+`REGISTRATION_TOKEN_FILE` is an alternative to `REGISTRATION_TOKEN`: an absolute path to an
+owner-only file (group read allowed, no "other" access) that holds the token. When it is set, the
+file is used and `REGISTRATION_TOKEN` is ignored. If the file is missing or unreadable, startup fails
+rather than falling back, so once the connector has registered, keep the file in place or unset
+`REGISTRATION_TOKEN_FILE` before deleting it. On Kubernetes, mount the `Secret` with `defaultMode`
+`0440` or `0400` and set the pod `fsGroup`; the default `0644` is rejected. The Helm chart in this
+repository still injects `REGISTRATION_TOKEN` through the environment; file support for the chart
+will follow separately.
+
 > **Security note:** `GATEWAY_URL` must be `wss://` (TLS). The connector refuses a plaintext
 > `ws://` gateway unless you explicitly set `ALLOW_INSECURE_GATEWAY=true` *and* the host is
 > loopback — an escape hatch intended only for local development.
