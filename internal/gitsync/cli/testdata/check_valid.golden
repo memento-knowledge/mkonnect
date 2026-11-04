@@ -1,0 +1,11 @@
+=== git-sync provider config ===
+  File: <config> (from GIT_SYNC_CONFIG_FILE)
+  Checked as uid N; the connector must run as a user that can read this file.
+
+=== Providers ===
+  NAME    HOST KEY                       AUTH    CREDENTIAL
+  gitea   https://git.example.test:8443  basic   inline token
+  origin  https://git.example.test:443   bearer  inline token
+  public  http://mirror.example.test:80  none    -
+
+OK: 3 providers are valid.

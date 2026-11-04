@@ -1,0 +1,17 @@
+=== git-sync provider config ===
+  File: <config> (from GIT_SYNC_CONFIG_FILE)
+  Checked as uid N; the connector must run as a user that can read this file.
+
+=== Providers ===
+  NAME     HOST KEY                        AUTH  CREDENTIAL
+  epsilon  https://delta.example.test:443  none  -
+
+=== Errors ===
+  [base_url] provider "alpha" (field base_url): base_url must be an absolute http or https URL
+  [provider_name] a provider name has a character at byte 3 outside letters, digits, '.', '_' and '-'
+  [credentials] provider "beta" (field token): token must be at least 16 characters
+  [credentials] provider "delta" (field username): basic authentication requires a username
+  [credentials] provider "eta" (field auth): unsupported authentication mode
+  [base_url] provider "gamma" (field base_url): base_url must use https when an authentication mode is set
+  [credentials] provider "theta" (field username): bearer authentication must not include a username
+  [credentials] provider "zeta" (field auth): credentials require an authentication mode
