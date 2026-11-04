@@ -6,6 +6,6 @@
   (none)
 
 === Repository sync state ===
-  Run state unusable (corrupt): the file is not valid run state. The connector ignores it and records new state after its next sync.
+  Run state unusable (corrupt): the file is not valid run state. A connector starting with this file ignores it; a running one replaces it on its next save.
 
 Enrollment status and failure reasons are visible in the Memento portal.

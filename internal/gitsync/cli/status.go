@@ -19,7 +19,7 @@ const statusUsage = `usage: mkonnect-gitsync connector status [--json] [--absolu
 Shows the replica host pin, the configured providers, and per-repository sync state as last
 recorded by the connector (read from its run-state file; the connector need not be running).
   --json      print only the sync state, as a single JSON object with RFC 3339 UTC timestamps
-  --absolute  print RFC 3339 UTC timestamps in the table instead of relative ones`
+  --absolute  print RFC 3339 UTC timestamps in the table instead of relative ones (no effect with --json)`
 
 // statusJSONVersion is the version of the --json document. Fields are only ever added within a
 // version.
@@ -49,27 +49,39 @@ func runStatus(args []string, w io.Writer) error {
 		return writeRunStateJSON(w, records, dropped, problem)
 	}
 
-	if err := printProviders(w); err != nil {
-		return err
-	}
+	// A provider config that fails to load must not hide the sync state, so its error is returned after
+	// the state is printed.
+	providersErr := printProviders(w)
 	printRunState(w, records, dropped, problem, *absolute)
+	if providersErr != nil {
+		return providersErr
+	}
 	// The CLI and the daemon are separate processes and do not share live state, so enrollment and
 	// the reasons attempts failed are shown in the portal, not here.
 	fmt.Fprintln(w, "\nEnrollment status and failure reasons are visible in the Memento portal.")
 	return nil
 }
 
-// problemText says what an unusable run state file means to the operator. The connector ignores such
-// a file and starts from nothing, so every message ends in the same consequence.
-var problemText = map[gitsync.RunStateProblem]string{
-	gitsync.RunStateEmpty:          "the file is empty",
-	gitsync.RunStateCorrupt:        "the file is not valid run state",
-	gitsync.RunStateUnsupported:    "the file is from an unsupported version",
-	gitsync.RunStateTooManyEntries: "the file has more repositories than the connector accepts",
-	gitsync.RunStateOversized:      "the file is larger than the connector accepts",
-	gitsync.RunStateWorldWritable:  "the file is writable by anyone",
-	gitsync.RunStateNotRegular:     "the path is not a regular file",
-	gitsync.RunStateUnreadable:     "the file cannot be read",
+// problemText says what is wrong with an unusable run state file. For every problem but unreadable
+// the file is one the connector would itself refuse, which printRunState explains.
+func problemText(p gitsync.RunStateProblem) string {
+	switch p {
+	case gitsync.RunStateEmpty:
+		return "the file is empty"
+	case gitsync.RunStateCorrupt:
+		return "the file is not valid run state"
+	case gitsync.RunStateUnsupported:
+		return "the file is from an unsupported version"
+	case gitsync.RunStateTooManyEntries:
+		return "the file has more repositories than the connector accepts"
+	case gitsync.RunStateOversized:
+		return "the file is larger than the connector accepts"
+	case gitsync.RunStateWorldWritable:
+		return "the file is writable by anyone"
+	case gitsync.RunStateNotRegular:
+		return "the path is not a regular file"
+	}
+	return "the file cannot be used"
 }
 
 func printRunState(w io.Writer, records map[string]gitsync.RunRecord, dropped int, problem gitsync.RunStateProblem, absolute bool) {
@@ -77,10 +89,13 @@ func printRunState(w io.Writer, records map[string]gitsync.RunRecord, dropped in
 	switch problem {
 	case gitsync.RunStateOK:
 	case gitsync.RunStateMissing:
-		fmt.Fprintln(w, "  No run state recorded yet: the connector has not finished a sync on this volume.")
+		fmt.Fprintln(w, "  No finished attempt recorded in the directory this command resolved. If the connector has run, check that GIT_SYNC_MIRRORS_DIR (or GIT_SYNC_CONFIG_FILE) matches its environment.")
+		return
+	case gitsync.RunStateUnreadable:
+		fmt.Fprintf(w, "  Run state unreadable (%s): the file cannot be read by this user. Run this command as the user the connector runs as.\n", problem)
 		return
 	default:
-		fmt.Fprintf(w, "  Run state unusable (%s): %s. The connector ignores it and records new state after its next sync.\n", problem, problemText[problem])
+		fmt.Fprintf(w, "  Run state unusable (%s): %s. A connector starting with this file ignores it; a running one replaces it on its next save.\n", problem, problemText(problem))
 		return
 	}
 	if dropped > 0 {
@@ -117,7 +132,7 @@ func printRunState(w io.Writer, records map[string]gitsync.RunRecord, dropped in
   As last recorded by the connector after each finished attempt: it can lag by a few seconds, omits
   attempts in progress and repositories not yet attempted, and may list repositories no longer
   configured. LAST SUCCESS is kept across failed attempts, so a LAST ATTEMPT later than it means the
-  latest attempt did not succeed.`)
+  latest attempt did not succeed (use --absolute to compare; times are whole seconds).`)
 }
 
 // relative renders how long before at t was, to one unit.

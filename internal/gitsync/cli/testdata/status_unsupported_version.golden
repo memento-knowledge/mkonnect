@@ -6,6 +6,6 @@
   (none)
 
 === Repository sync state ===
-  Run state unusable (unsupported_version): the file is from an unsupported version. The connector ignores it and records new state after its next sync.
+  Run state unusable (unsupported_version): the file is from an unsupported version. A connector starting with this file ignores it; a running one replaces it on its next save.
 
 Enrollment status and failure reasons are visible in the Memento portal.

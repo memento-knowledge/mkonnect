@@ -128,23 +128,30 @@ func syncDir(dir string) error {
 }
 
 // RunStateProblem says why a run state file yielded no usable records. The values are logged by the
-// daemon and reported by the operator CLI (including in its JSON), so they are part of the surface:
-// add new ones, never rename.
+// daemon (all but RunStateMissing, which is normal on first start) and reported by the operator CLI,
+// including in its JSON, so they are part of the surface: add new ones, never rename.
 type RunStateProblem string
 
 const (
 	// RunStateOK means the file was read; individual entries may still have been dropped.
 	RunStateOK RunStateProblem = ""
 	// RunStateMissing means there is no file: the connector has not recorded an attempt here.
-	RunStateMissing        RunStateProblem = "missing"
-	RunStateEmpty          RunStateProblem = "empty"
-	RunStateCorrupt        RunStateProblem = "corrupt"
-	RunStateUnsupported    RunStateProblem = "unsupported_version"
+	RunStateMissing RunStateProblem = "missing"
+	// RunStateEmpty is a zero-byte file; RunStateCorrupt is anything else that is not run state JSON.
+	RunStateEmpty   RunStateProblem = "empty"
+	RunStateCorrupt RunStateProblem = "corrupt"
+	// RunStateUnsupported is a file of another format version.
+	RunStateUnsupported RunStateProblem = "unsupported_version"
+	// RunStateTooManyEntries and RunStateOversized are files beyond the bounds the daemon accepts.
 	RunStateTooManyEntries RunStateProblem = "too_many_entries"
 	RunStateOversized      RunStateProblem = "oversized"
-	RunStateWorldWritable  RunStateProblem = "world_writable"
-	RunStateNotRegular     RunStateProblem = "not_regular"
-	RunStateUnreadable     RunStateProblem = "unreadable"
+	// RunStateWorldWritable and RunStateNotRegular are files whose content cannot be trusted to be the
+	// daemon's: one anyone can write, and a symlink, FIFO or directory.
+	RunStateWorldWritable RunStateProblem = "world_writable"
+	RunStateNotRegular    RunStateProblem = "not_regular"
+	// RunStateUnreadable is a file that could not be opened or read, typically a permissions mismatch
+	// between the caller and the daemon.
+	RunStateUnreadable RunStateProblem = "unreadable"
 )
 
 // load reads the state file. It never fails: a missing file is empty state, and a file that cannot be

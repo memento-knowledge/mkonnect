@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -126,6 +127,8 @@ func TestStatusRunStateGolden(t *testing.T) {
 			"repo-hours":  record(`,"last_attempt_at":"2030-01-15T07:00:00Z"`),
 			"repo-days":   record(`,"last_attempt_at":"2030-01-01T12:00:00Z"`),
 			"repo-future": record(`,"last_attempt_at":"2030-01-15T13:00:00Z"`),
+			"repo-47h":    record(`,"last_attempt_at":"2030-01-13T13:00:00Z"`),
+			"repo-48h":    record(`,"last_attempt_at":"2030-01-13T12:00:00Z"`),
 		})), 0o600, []string{"status"}},
 		// An entry with a control character in its branch name is dropped, and counted.
 		{"invalid_entry_dropped", ptr(stateFile(map[string]string{
@@ -147,7 +150,7 @@ func TestStatusRunStateGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("status: %v", err)
 			}
-			if strings.Contains(out, "\x1b") || strings.Contains(out, target) || strings.Contains(out, root) {
+			if i := strings.IndexFunc(out, func(r rune) bool { return (r < 0x20 && r != '\n') || (r >= 0x7f && r <= 0x9f) }); i >= 0 || strings.Contains(out, target) || strings.Contains(out, root) {
 				t.Errorf("output leaks a control character, the target fingerprint, or the state path:\n%s", out)
 			}
 			goldenCompare(t, "status_"+tc.name+".golden", out)
@@ -315,5 +318,52 @@ func TestStatusArguments(t *testing.T) {
 		if out != "" {
 			t.Errorf("%v should print nothing to stdout, got %q", args, out)
 		}
+	}
+}
+
+func TestStatusExplainsStructuralProblems(t *testing.T) {
+	tooMany := &strings.Builder{}
+	tooMany.WriteString(`{"version":1,"repositories":{`)
+	for i := 0; i <= 4096; i++ {
+		if i > 0 {
+			tooMany.WriteByte(',')
+		}
+		tooMany.WriteString(`"repo-` + strconv.Itoa(i) + `":{}`)
+	}
+	tooMany.WriteString(`}}`)
+
+	tests := []struct {
+		name, content, status, text string
+	}{
+		{"too many entries", tooMany.String(), "too_many_entries", "more repositories than the connector accepts"},
+		{"oversized", `{"version":1,"repositories":{},"padding":"` + strings.Repeat("x", 8<<20) + `"}`, "oversized", "larger than the connector accepts"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root := statusEnv(t)
+			writeRunState(t, root, tc.content, 0o600)
+			out, err := runCLI(t, "", "status")
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			if !strings.Contains(out, "Run state unusable ("+tc.status+")") || !strings.Contains(out, tc.text) {
+				t.Errorf("want %q and %q in:\n%s", tc.status, tc.text, out)
+			}
+		})
+	}
+}
+
+func TestStatusShowsSyncStateEvenWhenTheProviderConfigIsBroken(t *testing.T) {
+	root := statusEnv(t)
+	writeRunState(t, root, mixedState, 0o600)
+	if err := os.WriteFile(os.Getenv("GIT_SYNC_CONFIG_FILE"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runCLI(t, "", "status")
+	if err == nil {
+		t.Error("a broken provider config should still be an error")
+	}
+	if !strings.Contains(out, "repo-alpha") || strings.Contains(out, "visible in the Memento portal") {
+		t.Errorf("the sync state should be printed before the error, without the closing note:\n%s", out)
 	}
 }

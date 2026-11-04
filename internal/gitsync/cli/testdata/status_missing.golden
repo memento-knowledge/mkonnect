@@ -6,6 +6,6 @@
   (none)
 
 === Repository sync state ===
-  No run state recorded yet: the connector has not finished a sync on this volume.
+  No finished attempt recorded in the directory this command resolved. If the connector has run, check that GIT_SYNC_MIRRORS_DIR (or GIT_SYNC_CONFIG_FILE) matches its environment.
 
 Enrollment status and failure reasons are visible in the Memento portal.
