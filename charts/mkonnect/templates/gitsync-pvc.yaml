@@ -1,0 +1,17 @@
+{{- if .Values.gitSync.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mkonnect.gitsync.fullname" . }}-data
+  labels:
+    {{- include "mkonnect.gitsync.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.gitSync.persistence.size }}
+  {{- if .Values.gitSync.persistence.storageClass }}
+  storageClassName: {{ .Values.gitSync.persistence.storageClass }}
+  {{- end }}
+{{- end }}

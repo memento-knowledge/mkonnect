@@ -9,3 +9,16 @@ Register this connector via the Memento portal to receive a REGISTRATION_TOKEN,
 then upgrade: helm upgrade ... --set config.registrationToken=<token>
 
 After first connection, the connector stores its ML-DSA-65 key in the PVC at {{ .Values.config.keyFile }}.
+{{ if .Values.gitSync.enabled }}
+git-sync is enabled as deployment {{ include "mkonnect.gitsync.fullname" . }}. It is a separate connector
+with its own connector ID, volume ({{ include "mkonnect.gitsync.fullname" . }}-data) and registration token.
+{{- if not (or .Values.gitSync.config.registrationTokenSecret.name .Values.gitSync.config.registrationToken) }}
+No registration token is mounted. If this connector has not registered yet, supply one with
+gitSync.config.registrationTokenSecret.name (an existing Secret) or --set-file gitSync.config.registrationToken=<file>.
+{{- end }}
+Check that it connected in the Memento portal, then configure origin credentials:
+  kubectl exec -i deploy/{{ include "mkonnect.gitsync.fullname" . }} -- /mkonnect-gitsync connector status
+The provider config is read at startup; restart the deployment after changing it:
+  kubectl rollout restart deployment/{{ include "mkonnect.gitsync.fullname" . }}
+See docs/git-sync.md for details.
+{{ end }}
