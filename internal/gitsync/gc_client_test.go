@@ -33,11 +33,13 @@ type gcSender struct{}
 func (gcSender) Send(context.Context, any) error { return nil }
 
 // newGCClient builds a client with no local providers (so no repository is host-matched and no sync
-// ever starts) whose mirrors root is h.root. The gateway address refuses connections immediately.
+// ever starts) whose mirrors root is h.root. The replica host is pinned, since a client without a pin
+// rejects every configuration. The gateway address refuses connections immediately.
 func newGCClient(t *testing.T, h *gcHarness, clock *gcClock) *Client {
 	t.Helper()
 	cfg := &config.Config{GatewayURL: "ws://127.0.0.1:1", ConnectorID: "gc-test", ProtocolVersion: "v1"}
-	c := NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), nil, nil, clock.now, "boot-test", WithMirrorsRoot(h.root))
+	c := NewClient(cfg, auth.NewKeyStore(filepath.Join(t.TempDir(), "key")), nil, nil, clock.now, "boot-test",
+		WithMirrorsRoot(h.root), WithReplicaHost("replica.example.com"))
 	return c
 }
 
