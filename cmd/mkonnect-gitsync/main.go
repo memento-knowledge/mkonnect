@@ -5,8 +5,7 @@
 //
 // It enrols, handshakes, heartbeats, and mirrors each configured repository: a fetch of its
 // branches and tags from the customer origin into a local mirror, then a push of them to the
-// Memento replica. Packaging and release of this binary are tracked separately
-// (memento-knowledge/mkonnect#48); nothing builds or ships it as an image yet.
+// Memento replica. It ships as its own container image, built from Dockerfile.gitsync.
 package main
 
 import (

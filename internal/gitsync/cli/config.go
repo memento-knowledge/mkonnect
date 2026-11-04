@@ -16,7 +16,7 @@ import (
 const setUsage = `usage: mkonnect-gitsync connector config set <name> --base-url <url> [--auth bearer|basic --token-stdin [--username <username>]]
 
 The token is read from stdin so it never appears in the process list or shell history. In a
-container, run (name and binary path are provisional until packaging):
+container, run:
   docker exec -i <container> /mkonnect-gitsync connector config set <name> --base-url <url> --auth bearer --token-stdin`
 
 // maxTokenBytes bounds the credential read from stdin. A real token is tiny; anything larger is a
