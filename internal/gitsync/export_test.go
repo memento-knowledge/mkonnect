@@ -70,7 +70,7 @@ func (c *Client) MirrorsRootForTest() string { return c.mgr.deps.mirrors.Root }
 // read-only-mount fallback (chmod cannot be made to fail portably as the file's owner). It
 // returns a function that restores the real chmod.
 func SetChmodForTest(fn func(string, os.FileMode) error) func() {
-	prev := chmod
-	chmod = fn
-	return func() { chmod = prev }
+	prev := fchmod
+	fchmod = func(f *os.File, mode os.FileMode) error { return fn(f.Name(), mode) }
+	return func() { fchmod = prev }
 }

@@ -13,30 +13,6 @@ import (
 	"sync"
 )
 
-// chmod is os.Chmod, overridable in tests to exercise the read-only-mount branch of New (as the
-// file's owner, chmod cannot be made to fail portably). Mirrors the seam in internal/creds.
-var chmod = os.Chmod
-
-// ensureOwnerOnly tightens the config file to owner-only before its contents are trusted. If
-// chmod fails — most often a read-only mount such as a Kubernetes Secret — the existing mode is
-// accepted only when it denies world access and group write (group read is allowed for fsGroup
-// Secret mounts). This mirrors the API connector's credential store so the two behave alike.
-func ensureOwnerOnly(path string) error {
-	if err := chmod(path, 0o600); err != nil {
-		info, statErr := os.Stat(path)
-		if statErr != nil || !readOnlyModeAcceptable(info.Mode()) {
-			return fmt.Errorf("git-sync config %s has unsafe permissions and chmod failed; restrict it to the owner, allowing at most group read (e.g. 0600 or 0640)", path)
-		}
-	}
-	return nil
-}
-
-// readOnlyModeAcceptable reports whether a file whose mode could not be corrected to 0600 is
-// still safe: no group-write (0o020) and no "other" bits (0o007).
-func readOnlyModeAcceptable(mode os.FileMode) bool {
-	return mode.Perm()&0o027 == 0
-}
-
 // Store is the provider-keyed, file-backed local config with a write path (used by the operator
 // CLI) and read accessors (used by the connector). It mirrors internal/creds/store.go, with the
 // redaction-safe persistence above.
@@ -52,14 +28,11 @@ type Store struct {
 // rejected so credential selection can never be ambiguous. No error includes a credential value.
 func New(path string) (*Store, error) {
 	s := &Store{path: path, data: map[string]LocalEntry{}}
-	data, err := os.ReadFile(path)
+	data, err := readSecureFile(path, "git-sync config", maxConfigFileSize)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return s, nil
 		}
-		return nil, err
-	}
-	if err := ensureOwnerOnly(path); err != nil {
 		return nil, err
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
