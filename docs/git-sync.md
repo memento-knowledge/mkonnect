@@ -1215,17 +1215,21 @@ again with a new one-time registration token. To pause, stop the workload and ke
    that is retained. Treat disposal of that disk as disposal of a copy of the replicated
    repositories.
 
-4. Delete the Secrets you created yourself. The chart does not remove them. Names are the ones you
-   chose; the examples in this guide use these:
+4. Delete the Secrets you created yourself; the chart does not remove them. The names below are the
+   ones used in the examples in this guide, so use yours if they differ:
 
    ```bash
    kubectl delete secret gitsync-registration-token   # if you did not already remove it
    kubectl delete secret mkonnect-gitsync-providers   # holds your git server credential
    kubectl delete secret mkonnect-gitsync-ca          # if you mounted a CA bundle
-   rm -r "${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"   # registration.token and any other local copies
    ```
 
-   These are the names used in the examples above; use yours if they differ.
+   Then delete the files kept on your workstation (`registration.token`, and any other local copy of
+   the credential):
+
+   ```bash
+   rm -r "${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"
+   ```
 
    A registration token you passed with `--set-file` is also in earlier Helm release revisions (see
    the note in [Remove the registration token](#remove-the-registration-token)); to purge it,
