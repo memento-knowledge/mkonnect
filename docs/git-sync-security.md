@@ -128,7 +128,8 @@ git-sync logs to standard error. The log contains:
   the key file or the provider configuration file) and the name of a setting that is wrong.
 
 Your git server credential and the replica push token are held in self-redacting types and are
-not written to the log. Repository IDs are restricted to a safe character set. Treat the log as
+not written to the log. If a server repeats a credential back in an error message, the text it sent
+is not reported, and the credential is also removed from git's output before it is read. Repository IDs are restricted to a safe character set. Treat the log as
 operational data: it identifies your connector and gateway, though not your git servers' host
 names or repository paths.
 

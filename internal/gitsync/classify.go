@@ -38,6 +38,12 @@ var (
 	remoteHeaderRE = regexp.MustCompile(`^(To|From) \S+$`)
 	bracketRE      = regexp.MustCompile(`\[[^\]]*\]`)
 	reasonRE       = regexp.MustCompile(`\(([^()]*)\)\s*$`)
+
+	// remoteTextRE finds where a line turns into text the remote end chose: "fatal: remote error: <msg>"
+	// (an ERR packet), "error: remote unpack failed: <msg>", or a "remote: <msg>" sideband line. A
+	// server can put anything there, including the credential it was sent, so rawDetail keeps the
+	// label and withholds the text.
+	remoteTextRE = regexp.MustCompile(`(?i)(^remote:|\bremote (?:error|unpack failed):)\s*\S.*$`)
 )
 
 var (
@@ -211,6 +217,7 @@ func rawDetail(err error, stderr []byte) string {
 	if line == "" && err != nil {
 		line = err.Error()
 	}
+	line = remoteTextRE.ReplaceAllString(line, "${1} <text from the remote withheld>")
 	line = quotedRE.ReplaceAllString(line, "''")
 	line = urlRE.ReplaceAllString(line, "<url>")
 	line = pathRE.ReplaceAllString(line, "${1}<path>")

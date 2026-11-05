@@ -1,12 +1,9 @@
 package gitsync
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -37,142 +34,11 @@ type Store struct {
 // Any failure after the file was located is a *LoadError (use errors.As) carrying the files involved.
 // The files of a successful load are available from Sources.
 func New(path string) (*Store, error) {
-	s := &Store{path: path, data: map[string]LocalEntry{}}
-	sources := sourceSet{}
-	fail := func(err error) (*Store, error) { return nil, &LoadError{Sources: sources.sorted(), err: err} }
-
-	cfg, err := readProviderConfig(path, maxConfigFileSize, rejectForeignConfigOwner)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			s.sources = sourceSet{path: {Path: path}}
-			return s, nil
-		}
-		sources.add(Source{Path: path})
-		return fail(err)
+	res := loadConfig(path)
+	if len(res.issues) > 0 {
+		return nil, &LoadError{Sources: res.sources.sorted(), err: res.issues[0]}
 	}
-	sources.add(newSource(path, cfg.data))
-
-	dec := json.NewDecoder(bytes.NewReader(cfg.data))
-	dec.DisallowUnknownFields()
-	var dc map[string]diskEntry
-	if err := dec.Decode(&dc); err != nil {
-		var syntaxErr *json.SyntaxError
-		if errors.As(err, &syntaxErr) {
-			return fail(fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset))
-		}
-		return fail(fmt.Errorf("git-sync config %s is not valid: %w", path, err))
-	}
-	// Reject anything after the first JSON value (a second value or trailing garbage), so a
-	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return fail(fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path))
-	}
-	names := slices.Sorted(maps.Keys(dc))
-
-	// Record every well-formed token file now, so a failed load still reports the files a retry
-	// should watch (including one that does not exist yet).
-	usesTokenFile := false
-	for _, name := range names {
-		// Any token_file key counts, even an empty one: that config is rejected below, and until then it
-		// must be held to the stricter owner rule.
-		if de := dc[name]; de.TokenFile != nil {
-			usesTokenFile = true
-			if tf := *de.TokenFile; validateTokenFilePath(tf) == nil {
-				sources.add(Source{Path: tf})
-			}
-		}
-	}
-	// A config that names token files decides which local file is sent to which host, so it must not
-	// be editable by anyone else. This is checked on the descriptor the config was read from, before
-	// any token file is opened. A config with only inline tokens is judged by rejectForeignConfigOwner.
-	warnWhile(cfg.foreignOwner && !usesTokenFile, "owner", path,
-		"credential file is owned by another user; restrict it to the user running the connector (a future release will refuse to start)", "file", "git-sync config", "path", path)
-	if cfg.foreignOwner && usesTokenFile {
-		return fail(fmt.Errorf("git-sync config %s uses token_file but is owned by another user; it must be owned by the user running the connector or by root", path))
-	}
-
-	// First pass: everything that does not need a credential.
-	hostKeys := make(map[string]string, len(dc))
-	entries := make(map[string]LocalEntry, len(dc))
-	for _, name := range names {
-		de := dc[name]
-		if err := validateProviderName(name); err != nil {
-			return fail(fmt.Errorf("git-sync config %s: %w", path, err))
-		}
-		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(strVal(de.Token)), TokenFile: strVal(de.TokenFile)}
-		if err := validateCredentialSource(de); err != nil {
-			return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
-		}
-		if err := e.validateSettings(); err != nil {
-			return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
-		}
-		if e.TokenFile == "" {
-			if err := e.validateToken(); err != nil {
-				return fail(fmt.Errorf("provider %q is invalid: %w", name, err))
-			}
-		}
-		hk, err := canonicalHostKey(e.BaseURL)
-		if err != nil {
-			return fail(fmt.Errorf("provider %q is invalid: base_url %w", name, err))
-		}
-		if other, ok := hostKeys[hk]; ok {
-			return fail(fmt.Errorf("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name))
-		}
-		hostKeys[hk] = name
-		entries[name] = e
-	}
-
-	// Second pass: read the token files. A file shared by several providers is read once, so they
-	// all see the same bytes.
-	contents := map[string][]byte{}
-	for _, name := range names {
-		e := entries[name]
-		if e.TokenFile == "" {
-			continue
-		}
-		what := fmt.Sprintf("provider %q token_file", name)
-		raw, ok := contents[e.TokenFile]
-		if !ok {
-			raw, err = tokenFileReader(e.TokenFile, what)
-			if err != nil {
-				return fail(err)
-			}
-			contents[e.TokenFile] = raw
-			sources.add(newSource(e.TokenFile, raw))
-		}
-		token, problem := tokenFileValue(raw)
-		if problem != "" {
-			return fail(fmt.Errorf("%s %s %s", what, e.TokenFile, problem))
-		}
-		e.Token = Secret(token)
-		if err := e.validateToken(); err != nil {
-			return fail(fmt.Errorf("%s %s: %w", what, e.TokenFile, err))
-		}
-		entries[name] = e
-	}
-	s.data = entries
-	s.sources = sources
-	return s, nil
-}
-
-// validateCredentialSource checks, on a provider as written in the config file, that its credential
-// comes from exactly one place: with an authentication mode, one of token and token_file (never
-// both). It goes by which keys are present, not by whether they hold a value, so that an explicitly
-// empty token_file is an error and cannot pass as an absent one. It also checks the token_file path,
-// which is printed in messages.
-func validateCredentialSource(de diskEntry) error {
-	hasToken, hasFile := de.Token != nil, de.TokenFile != nil
-	switch {
-	case hasToken && hasFile:
-		return errors.New("set only one of token and token_file")
-	case hasFile && *de.TokenFile == "":
-		return errors.New("token_file must not be empty")
-	case hasFile:
-		return validateTokenFilePath(*de.TokenFile)
-	case de.Auth != "" && !hasToken:
-		return errors.New("an authentication mode requires a token or a token_file")
-	}
-	return nil
+	return &Store{path: path, data: res.entries, sources: res.sources}, nil
 }
 
 // Sources returns the files the last load read, sorted by path: the config file (listed even when it

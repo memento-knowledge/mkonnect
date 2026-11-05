@@ -1,5 +1,5 @@
 // Package cli implements the git-sync connector's operator command line: `config set`, `list`,
-// `remove`, and `status`. It mirrors the API connector's CLI (internal/cli) — the credential comes
+// `remove`, `check`, and `status`. It mirrors the API connector's CLI (internal/cli) — the credential comes
 // on stdin, never on the command line — but writes git-sync's own provider-keyed local config.
 package cli
 
@@ -40,7 +40,7 @@ func Run(args []string, stdin io.Reader, w io.Writer) error {
 
 func runConfig(args []string, stdin io.Reader, w io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: mkonnect-gitsync connector config <set|list|remove> [args...]")
+		return errors.New("usage: mkonnect-gitsync connector config <set|list|remove|check> [args...]")
 	}
 	switch args[0] {
 	case "set":
@@ -49,8 +49,10 @@ func runConfig(args []string, stdin io.Reader, w io.Writer) error {
 		return runConfigList(w)
 	case "remove":
 		return runConfigRemove(args[1:], w)
+	case "check":
+		return runConfigCheck(args[1:], w)
 	default:
-		return fmt.Errorf("unknown config command %q; use set, list, or remove", args[0])
+		return fmt.Errorf("unknown config command %q; use set, list, remove, or check", args[0])
 	}
 }
 
@@ -77,7 +79,9 @@ func runConfigSet(args []string, stdin io.Reader, w io.Writer) error {
 			fmt.Fprintln(w, setUsage)
 			return nil
 		}
-		return err
+		// The flag package's text quotes the offending argument ("invalid boolean value "<x>"" for
+		// --token-stdin=<x>), which here may be a token typed in the wrong place, so it is not repeated.
+		return errors.New("invalid flags; run `config set -h` for usage, and pass the token on stdin with --token-stdin")
 	}
 
 	// Reject a token passed on the command line, where it would be visible in the process list.

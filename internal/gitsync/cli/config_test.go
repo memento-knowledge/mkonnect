@@ -246,3 +246,19 @@ func TestConfigListMarksTokenFileProviderAndSetKeepsIt(t *testing.T) {
 		t.Errorf("config set must keep the token_file reference and not inline the token: %s", raw)
 	}
 }
+
+// A flag the parser rejects must not be echoed back: a token typed where a flag value belongs would
+// otherwise reach the error output.
+func TestConfigSetFlagErrorsDoNotEchoArguments(t *testing.T) {
+	withConfig(t)
+	const typed = "typed-in-the-wrong-place-0123456789"
+	for _, arg := range []string{"--token-stdin=" + typed, "--" + typed, "--base-url"} {
+		_, err := runCLI(t, "", "config", "set", "origin", "--base-url", "https://git.example.com/", arg)
+		if err == nil {
+			t.Fatalf("%q should be rejected", arg)
+		}
+		if strings.Contains(err.Error(), typed) {
+			t.Errorf("error for %q repeats the argument: %v", arg, err)
+		}
+	}
+}

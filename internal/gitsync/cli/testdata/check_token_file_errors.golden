@@ -1,0 +1,14 @@
+=== git-sync provider config ===
+  File: <config> (from GIT_SYNC_CONFIG_FILE)
+  Checked as uid N; the connector must run as a user that can read this file.
+
+=== Providers ===
+  NAME    HOST KEY                    AUTH    CREDENTIAL
+  f-fine  https://f.example.test:443  bearer  token_file
+
+=== Errors ===
+  [credentials] provider "a-missing" (field token_file): token_file <dir>/absent could not be opened: no such file or directory
+  [credentials] provider "b-writable" (field token_file): token_file <dir>/writable is writable by group or others; restrict it to the owner, allowing at most read access for the group (e.g. 0600, 0640 or 0440)
+  [credentials] provider "c-crlf" (field token_file): token_file <dir>/crlf ends with a carriage return (CRLF line ending); save it with a single LF line ending
+  [credentials] provider "d-empty" (field token_file): token_file <dir>/empty is empty
+  [credentials] provider "e-short" (field token_file): token_file <dir>/short: token must be at least 16 characters

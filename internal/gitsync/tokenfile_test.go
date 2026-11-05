@@ -36,8 +36,8 @@ func tokenFileConfig(t *testing.T, provider, tokenFile string) string {
 	return string(b)
 }
 
-// writeFile writes content at exactly mode (the umask cannot loosen or tighten it).
-func writeFile(t *testing.T, dir, name, content string, mode os.FileMode) string {
+// writeModeFile writes content at exactly mode (the umask cannot loosen or tighten it).
+func writeModeFile(t *testing.T, dir, name, content string, mode os.FileMode) string {
 	t.Helper()
 	p := filepath.Join(dir, name)
 	if err := os.WriteFile(p, []byte(content), mode); err != nil {
@@ -98,7 +98,7 @@ func TestNewTokenFileAccepts(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureSlog(t)
 			dir := t.TempDir()
-			tf := writeFile(t, dir, "token", tt.content, tt.mode)
+			tf := writeModeFile(t, dir, "token", tt.content, tt.mode)
 			s, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "internal-git", tf)))
 			if err != nil {
 				t.Fatalf("load: %v", err)
@@ -149,7 +149,7 @@ func TestNewTokenFileRejects(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logs := captureSlog(t)
-			tf := writeFile(t, t.TempDir(), "token", tt.content, tt.mode)
+			tf := writeModeFile(t, t.TempDir(), "token", tt.content, tt.mode)
 			s, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "internal-git", tf)))
 			if err == nil {
 				t.Fatalf("load succeeded (store %v), want an error containing %q", s, tt.want)
@@ -171,7 +171,7 @@ func TestNewTokenFileFileKinds(t *testing.T) {
 
 	t.Run("symlink to an acceptable file is followed", func(t *testing.T) {
 		dir := t.TempDir()
-		target := writeFile(t, dir, "target", tok, 0o600)
+		target := writeModeFile(t, dir, "target", tok, 0o600)
 		link := filepath.Join(dir, "link")
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
@@ -188,7 +188,7 @@ func TestNewTokenFileFileKinds(t *testing.T) {
 	t.Run("a symlink does not hide an unsafe target", func(t *testing.T) {
 		dir := t.TempDir()
 		// The link itself is 0777 on most systems; the target's mode is what counts.
-		target := writeFile(t, dir, "target", tok, 0o666)
+		target := writeModeFile(t, dir, "target", tok, 0o666)
 		link := filepath.Join(dir, "link")
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
@@ -276,7 +276,7 @@ func TestNewTokenFileOwner(t *testing.T) {
 				e = 0
 			}
 			defer gitsync.SetOwnerForTest(owners(tt.owners), e)()
-			tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-owner", 0o600)
+			tf := writeModeFile(t, t.TempDir(), "token", tokenSentinel+"-owner", 0o600)
 			_, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "p", tf)))
 			switch {
 			case tt.wantErr == "" && err != nil:
@@ -313,7 +313,7 @@ func TestNewTokenFileOwner(t *testing.T) {
 
 func TestNewTokenFileSettingErrors(t *testing.T) {
 	dir := t.TempDir()
-	good := writeFile(t, dir, "good", tokenSentinel+"-settings", 0o600)
+	good := writeModeFile(t, dir, "good", tokenSentinel+"-settings", 0o600)
 	missing := filepath.Join(dir, "absent")
 	entry := func(extra string) string {
 		return `{"p": {"base_url": "https://git.example.test/", ` + extra + `}}`
@@ -344,7 +344,7 @@ func TestNewTokenFileSettingErrors(t *testing.T) {
 		{"basic without a username is rejected before the file is opened", entry(`"auth": "basic", "token_file": "` + missing + `"`), "requires a username", "could not be opened"},
 		{"unknown auth is rejected before the file is opened", entry(`"auth": "oauth", "token_file": "` + missing + `"`), "unsupported authentication mode", "could not be opened"},
 		{"duplicate host is rejected before any file is opened", `{"a": {"base_url": "https://git.example.test/", "auth": "bearer", "token_file": "` + missing + `"}, "b": {"base_url": "https://git.example.test/x"}}`, "same host", "could not be opened"},
-		{"an unknown field is still rejected", entry(`"auth": "bearer", "token_files": "` + good + `"`), "token_files", ""},
+		{"an unknown field is still rejected, without repeating its name", entry(`"auth": "bearer", "token_files": "` + good + `"`), "unknown field", "token_files"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -363,7 +363,7 @@ func TestNewTokenFileSettingErrors(t *testing.T) {
 }
 
 func TestNewTokenFileSharedByProviders(t *testing.T) {
-	tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-shared\n", 0o600)
+	tf := writeModeFile(t, t.TempDir(), "token", tokenSentinel+"-shared\n", 0o600)
 	cfg := writeConfig(t, fmt.Sprintf(`{
 		"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": %[1]q},
 		"b": {"base_url": "https://git-b.example.test/", "auth": "basic", "username": "svc", "token_file": %[1]q}
@@ -403,8 +403,8 @@ func TestSources(t *testing.T) {
 
 	t.Run("config and token files, sorted, with change detection", func(t *testing.T) {
 		dir := t.TempDir()
-		tfB := writeFile(t, dir, "b-token", tokenSentinel+"-b", 0o600)
-		tfA := writeFile(t, dir, "a-token", tokenSentinel+"-a", 0o600)
+		tfB := writeModeFile(t, dir, "b-token", tokenSentinel+"-b", 0o600)
+		tfA := writeModeFile(t, dir, "a-token", tokenSentinel+"-a", 0o600)
 		cfg := writeConfig(t, fmt.Sprintf(`{
 			"b": {"base_url": "https://git-b.example.test/", "auth": "bearer", "token_file": %q},
 			"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": %q},
@@ -446,7 +446,7 @@ func TestSources(t *testing.T) {
 	})
 
 	t.Run("Sources never expose a fingerprint when formatted", func(t *testing.T) {
-		tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-fmt", 0o600)
+		tf := writeModeFile(t, t.TempDir(), "token", tokenSentinel+"-fmt", 0o600)
 		s, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "p", tf)))
 		if err != nil {
 			t.Fatal(err)
@@ -469,7 +469,7 @@ func TestSources(t *testing.T) {
 
 	t.Run("a failed load reports the files involved, including one that is not there yet", func(t *testing.T) {
 		dir := t.TempDir()
-		present := writeFile(t, dir, "present", tokenSentinel+"-present", 0o600)
+		present := writeModeFile(t, dir, "present", tokenSentinel+"-present", 0o600)
 		later := filepath.Join(dir, "later")
 		cfg := writeConfig(t, fmt.Sprintf(`{
 			"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": %q},
@@ -539,7 +539,7 @@ func sourcesEqual(a, b []gitsync.Source) bool { return slices.Equal(a, b) }
 // `config set` or `config remove` must never copy the credential into git-sync.json.
 func TestStoreSavePreservesTokenFile(t *testing.T) {
 	const tok = tokenSentinel + "-save"
-	tf := writeFile(t, t.TempDir(), "token", tok+"\n", 0o600)
+	tf := writeModeFile(t, t.TempDir(), "token", tok+"\n", 0o600)
 	path := writeConfig(t, fmt.Sprintf(`{
 		"filed": {"base_url": "https://git-f.example.test/", "auth": "bearer", "token_file": %q},
 		"inline": {"base_url": "https://git-i.example.test/", "auth": "bearer", "token": "inline-token-0123456789"}
@@ -597,7 +597,7 @@ func TestStoreSetRejectsTokenFile(t *testing.T) {
 // Replacing a token-file provider through Set is an explicit operator action and persists an inline
 // token, as it always has.
 func TestStoreSetReplacesTokenFileProviderWithInlineToken(t *testing.T) {
-	tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-replace", 0o600)
+	tf := writeModeFile(t, t.TempDir(), "token", tokenSentinel+"-replace", 0o600)
 	path := writeConfig(t, tokenFileConfig(t, "p", tf))
 	s, err := gitsync.New(path)
 	if err != nil {
@@ -616,7 +616,7 @@ func TestStoreSetReplacesTokenFileProviderWithInlineToken(t *testing.T) {
 // reloads the config does not repeat it, and it comes back if the file is loosened again.
 func TestNewTokenFileReadWarningIsLoggedOnce(t *testing.T) {
 	logs := captureSlog(t)
-	tf := writeFile(t, t.TempDir(), "token", tokenSentinel+"-once", 0o644)
+	tf := writeModeFile(t, t.TempDir(), "token", tokenSentinel+"-once", 0o644)
 	cfg := writeConfig(t, tokenFileConfig(t, "p", tf))
 	load := func() {
 		t.Helper()
@@ -655,7 +655,7 @@ func TestNewTokenFileDirectoryWarning(t *testing.T) {
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatal(err)
 	}
-	tf := writeFile(t, dir, "token", tokenSentinel+"-dir", 0o600)
+	tf := writeModeFile(t, dir, "token", tokenSentinel+"-dir", 0o600)
 	if _, err := gitsync.New(writeConfig(t, tokenFileConfig(t, "p", tf))); err != nil {
 		t.Fatalf("a world-writable directory must warn, not reject: %v", err)
 	}
@@ -668,8 +668,8 @@ func TestNewTokenFileDirectoryWarning(t *testing.T) {
 // file nobody references any more is gone, and one still referenced keeps its fingerprint.
 func TestSourcesAfterWritesDropUnreferencedTokenFiles(t *testing.T) {
 	dir := t.TempDir()
-	tfA := writeFile(t, dir, "a-token", tokenSentinel+"-a", 0o600)
-	tfB := writeFile(t, dir, "b-token", tokenSentinel+"-b", 0o600)
+	tfA := writeModeFile(t, dir, "a-token", tokenSentinel+"-a", 0o600)
+	tfB := writeModeFile(t, dir, "b-token", tokenSentinel+"-b", 0o600)
 	path := writeConfig(t, fmt.Sprintf(`{
 		"a": {"base_url": "https://git-a.example.test/", "auth": "bearer", "token_file": %q},
 		"b": {"base_url": "https://git-b.example.test/", "auth": "bearer", "token_file": %q}
