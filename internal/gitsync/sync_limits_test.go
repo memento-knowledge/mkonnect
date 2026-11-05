@@ -95,7 +95,8 @@ func TestNoPackSettingsWhenTheLimitsAreUnset(t *testing.T) {
 	syncRepo(context.Background(), d, testTask())
 	for _, c := range f.calls {
 		for _, kv := range envConfig(c.env) {
-			if strings.HasPrefix(kv, "pack.") || strings.HasPrefix(kv, "gc.") || strings.HasPrefix(kv, "maintenance.") {
+			// The foreground-maintenance settings are unconditional; see maintenanceConfig.
+			if strings.HasPrefix(kv, "pack.") {
 				t.Errorf("%s carries %q with no limits set", c.sub(), kv)
 			}
 		}
@@ -304,20 +305,21 @@ func TestCeilingIsCheckedAfterTheFetchAndTheEmptyOriginGuard(t *testing.T) {
 	}
 }
 
-func TestCeilingMakesFetchMaintenanceForeground(t *testing.T) {
+func TestFetchMaintenanceIsAlwaysForeground(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		lim  Limits
-		want bool
-	}{{"ceiling set", Limits{MaxRepositoryMB: 10}, true}, {"no ceiling", Limits{}, false}} {
+	}{{"ceiling set", Limits{MaxRepositoryMB: 10}}, {"no ceiling", Limits{}}} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &fakeGit{}
 			d := limitsDeps(t, f, tc.lim)
 			syncRepo(context.Background(), d, testTask())
 			for _, c := range f.calls {
-				has := slices.Contains(envConfig(c.env), "gc.autoDetach=false")
-				if want := tc.want && c.sub() == "fetch"; has != want {
-					t.Errorf("%s: gc.autoDetach=false present = %v, want %v", c.sub(), has, want)
+				for _, key := range []string{"gc.autoDetach=false", "maintenance.autoDetach=false"} {
+					has := slices.Contains(envConfig(c.env), key)
+					if want := c.sub() == "fetch"; has != want {
+						t.Errorf("%s: %s present = %v, want %v", c.sub(), key, has, want)
+					}
 				}
 			}
 		})

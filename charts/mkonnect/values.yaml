@@ -140,7 +140,7 @@ gitSync:
   #   { "internal-git": { "base_url": "https://git.example.com",
   #                       "auth": "bearer", "token": "<access-token>" } }
   # It is mounted read-only OUTSIDE the data volume, so `connector config set`
-  # cannot write to it; manage it by updating the Secret and restarting the pod.
+  # cannot write to it; manage it by updating the Secret; the connector reloads it without a restart.
   # When secretName is empty the connector uses a writable /data/git-sync.json
   # that you manage with `connector config set`.
   # Mirrors are always stored under /data/mirrors (GIT_SYNC_MIRRORS_DIR is set

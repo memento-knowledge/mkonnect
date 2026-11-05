@@ -43,6 +43,12 @@ func main() {
 		os.Exit(0)
 	}
 
+	// SIGHUP re-reads the provider configuration (see the reload loop below). It is claimed this early
+	// so that one arriving during the slower startup steps is held until the client exists, rather than
+	// taking the signal's default action, which is to terminate the process.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mkonnect-gitsync: configuration error: %v\n", err)
@@ -92,8 +98,9 @@ func main() {
 	log.Printf("mkonnect-gitsync starting — connector=%s gateway=%s protocol=%s version=%s providers=%d",
 		cfg.ConnectorID, cfg.GatewayURL, cfg.ProtocolVersion, version.Version, len(local.Names()))
 
-	// There is no SIGHUP reload: the local provider config is read once at startup, so a change
-	// (including a revoked credential) takes effect on restart. A reload path is a Phase 4 item.
+	// The provider config is watched while the daemon runs: a change to it (a revoked or rotated
+	// credential included) takes effect within seconds, and SIGHUP applies one at once. The replica
+	// host pin, the registration token file and the key file are read once, here, and need a restart.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -102,6 +109,16 @@ func main() {
 	// client logs the effective pin, or why there is none, without echoing the raw value.
 	client := gitsync.NewClient(cfg, auth.NewKeyStore(cfg.KeyFile), local, gitsync.NewGitProber(), nil, bootID,
 		gitsync.WithReplicaHost(os.Getenv(gitsync.ReplicaHostEnv)))
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-hup:
+				client.Reload()
+			}
+		}
+	}()
 	client.Run(ctx)
 
 	// Cancelling ctx kills each running git (its own process group, so a terminal Ctrl-C does not

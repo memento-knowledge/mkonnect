@@ -24,7 +24,7 @@ Check in the Memento portal that it connected, then configure the credential for
   kubectl -n {{ .Release.Namespace }} exec -i deploy/{{ $name }} -- /mkonnect-gitsync connector config set <name> --base-url https://<git-host> --auth bearer --token-stdin
   kubectl -n {{ .Release.Namespace }} exec -i deploy/{{ $name }} -- /mkonnect-gitsync connector status
 {{- end }}
-The provider config is read at startup; restart the deployment after changing it:
-  kubectl -n {{ .Release.Namespace }} rollout restart deployment/{{ $name }}
+A change to the provider config is picked up without a restart (a changed Secret reaches the pod after the kubelet's delay). To make git-sync re-read it now:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ $name }} -- kill -HUP 1
 See docs/git-sync.md for details.
 {{ end }}

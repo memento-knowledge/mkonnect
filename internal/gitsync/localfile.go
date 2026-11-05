@@ -97,6 +97,10 @@ type providerConfigFile struct {
 	// owner could not be determined). The caller decides whether that is fatal, because it depends on
 	// what the file asks for (see rejectForeignConfigOwner).
 	foreignOwner bool
+	// loose reports that the file's mode is wider than the connector accepts and was not (or could
+	// not be) tightened. Only a look (readProviderConfigMode with tighten false) returns a file in
+	// that state; it is part of what the look saw, so a change of mode alone is noticed.
+	loose bool
 }
 
 // readProviderConfig reads the provider config under the config policy.
@@ -113,6 +117,15 @@ type providerConfigFile struct {
 // Advisory only (a warning, never a rejection): the directory lets other users rename entries
 // within it.
 func readProviderConfig(path string, maxSize int64, rejectForeign bool) (providerConfigFile, error) {
+	return readProviderConfigMode(path, maxSize, rejectForeign, true)
+}
+
+// readProviderConfigMode is readProviderConfig with the choice of whether it may touch the file. With
+// tighten false (a look, as the live reload polls with) it changes nothing and logs nothing: a mode
+// that the real read would tighten is reported in loose instead of being judged, because whether it
+// can be tightened is for that read to find out. Every other rule is the same, so a look and a read
+// of the same file agree about everything but the mode.
+func readProviderConfigMode(path string, maxSize int64, rejectForeign, tighten bool) (providerConfigFile, error) {
 	const what = "git-sync config"
 	var out providerConfigFile
 	data, err := readVetted(path, what, maxSize, func(f *os.File, info os.FileInfo) error {
@@ -127,10 +140,14 @@ func readProviderConfig(path string, maxSize int64, rejectForeign bool) (provide
 			if !readOnlyModeAcceptable(info.Mode()) {
 				return fmt.Errorf("%s %s is owned by another user and has unsafe permissions; it must be owned by the user running the connector or by root, with at most group read (e.g. 0600 or 0640)", what, path)
 			}
+		} else if !tighten {
+			out.loose = !readOnlyModeAcceptable(info.Mode())
 		} else if err := fchmod(f, 0o600); err != nil && !readOnlyModeAcceptable(info.Mode()) {
 			return fmt.Errorf("%s %s has unsafe permissions and chmod failed; restrict it to the owner, allowing at most group read (e.g. 0600 or 0640)", what, path)
 		}
-		warnWorldWritableDir(path, what)
+		if tighten {
+			warnWorldWritableDir(path, what)
+		}
 		return nil
 	})
 	out.data = data
@@ -167,10 +184,21 @@ func readTokenFile(path, what string) ([]byte, error) {
 		// The cause is deliberately not wrapped: New treats errors.Is(err, fs.ErrNotExist) from the
 		// config file as "no config yet, empty store", and a missing token file must never be mistaken
 		// for that by a caller that copies the idiom.
-		return nil, fmt.Errorf("%s %s could not be opened: %v", what, path, pe.Err)
+		err := fmt.Errorf("%s %s could not be opened: %v", what, path, pe.Err)
+		if errors.Is(pe.Err, fs.ErrNotExist) {
+			return nil, &tokenFileMissingError{err: err}
+		}
+		return nil, err
 	}
 	return data, err
 }
+
+// tokenFileMissingError is the error for a token file that does not exist. It is deliberately not
+// errors.Is(fs.ErrNotExist) (see readTokenFile); the loader recognises it by type, so that a reload
+// can tell a credential that was removed from one that could not be read.
+type tokenFileMissingError struct{ err error }
+
+func (e *tokenFileMissingError) Error() string { return e.err.Error() }
 
 // readOnlyModeAcceptable reports whether a file whose mode could not be corrected to 0600 is
 // still safe: no group-write (0o020) and no "other" bits (0o007).

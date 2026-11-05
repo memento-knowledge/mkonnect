@@ -210,6 +210,10 @@ type canaryScenario struct {
 	tweak func(r *canaryRun)
 	// wantState and wantType are the expected outcome of the sync.
 	wantState, wantType string
+	// reload, when set, runs after the first sync has finished and its outcome has been checked. It
+	// changes the provider configuration under the running connector; whatever it makes the run
+	// handle is then searched for the credentials like everything else.
+	reload func(t *testing.T, ctx context.Context, r *canaryRun, c *gitsync.Client)
 }
 
 func TestCanaryNeverLeaks(t *testing.T) {
@@ -249,6 +253,13 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		{
 			name: "replica reflects the push token", auth: "bearer", wantState: gitsync.StateError,
 			tweak: func(r *canaryRun) { r.replica.update(func(s *canaryServer) { s.reflect = true }) },
+		},
+		{
+			// The credential is rotated in the provider file under the running connector, and the file is
+			// then broken with the old credential pasted into it as a key. Both credentials, and the
+			// error the unusable file produces, must stay out of everything.
+			name: "reload rotates the credential, then meets an unusable file", auth: "bearer", wantState: gitsync.StateOK,
+			reload: rotateThenBreakProviderFile,
 		},
 		{
 			// The origin tries to send the connector to the replica, hoping the origin credential follows.
@@ -369,6 +380,10 @@ func runCanaryScenario(t *testing.T, sc canaryScenario) {
 
 	if r.status.State != sc.wantState || (sc.wantType != "" && r.status.ErrorType != sc.wantType) {
 		t.Fatalf("outcome = %s/%s (%q), want %s/%s", r.status.State, r.status.ErrorType, r.status.ErrorDetail, sc.wantState, sc.wantType)
+	}
+
+	if sc.reload != nil {
+		sc.reload(t, ctx, r, c)
 	}
 
 	// What the operator CLI prints, with the connector's environment.
@@ -562,5 +577,53 @@ func writeFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	}
 	if err := os.WriteFile(path, data, mode); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// rotateThenBreakProviderFile rotates the origin credential by rewriting the provider file under the
+// running connector, waits for the connector to sync with the new one, and then replaces the file with
+// one it cannot use that carries the old credential as a key.
+func rotateThenBreakProviderFile(t *testing.T, ctx context.Context, r *canaryRun, c *gitsync.Client) {
+	t.Helper()
+	oldCanary := r.originCanary
+	newCanary := newCanary(t, true)
+	r.originCanary = newCanary
+	r.originNeedles = append(r.originNeedles, canaryNeedles(newCanary, "")...)
+
+	c.SetReloadTimingForTest(10*time.Millisecond, 10*time.Millisecond)
+	stop := c.StartReloadForTest(ctx)
+	t.Cleanup(stop)
+
+	// The origin now accepts only the new credential, so a sync that succeeds used it.
+	r.origin.update(func(s *canaryServer) { s.wantAuth = "Bearer " + newCanary })
+	before := len(r.git.all())
+	entry := map[string]string{"base_url": r.origin.URL, "auth": "bearer", "token": newCanary}
+	writeFile(t, r.cfgPath, mustJSON(t, map[string]any{"origin": entry}), 0o600)
+
+	waitFor(t, func() bool { return slices.Contains(r.origin.headers(), "Bearer "+newCanary) })
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		_ = c.OnHeartbeat(ctx, r.sender)
+		if st := repoStatusNow(t, r.sender, "repo-a"); st.State == gitsync.StateOK && c.IdleForTest() &&
+			c.ProviderTokenForTest("origin") == newCanary {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the connector did not sync with the rotated credential")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, inv := range r.git.all()[before:] {
+		if sub := subcommand(inv.argv); slices.Contains(networkSubcommands, sub) && leak(strings.Join(inv.env, "\x00"), canaryNeedles(oldCanary, "")) != "" {
+			t.Errorf("git %s was started with the old credential after the rotation", sub)
+		}
+	}
+
+	// An unusable file: the old credential, pasted as a key, must not come back out in a log or an error.
+	writeFile(t, r.cfgPath, []byte(`{"origin":{"base_url":"`+r.origin.URL+`","`+oldCanary+`":1}}`), 0o600)
+	waitFor(t, func() bool { return strings.Contains(r.logs.String(), "cannot be used") })
+	time.Sleep(100 * time.Millisecond)
+	if c.ProviderTokenForTest("origin") != newCanary {
+		t.Error("an unusable provider file replaced the configuration in force")
 	}
 }

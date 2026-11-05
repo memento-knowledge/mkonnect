@@ -91,6 +91,11 @@ type syncTask struct {
 	ReplicaURL     string
 	PushToken      Secret
 	TokenExpiresAt string // RFC3339; "" when unknown
+	// Bind is the provider, and generation of its credential, Origin was taken from; the result of
+	// the attempt is kept only while the repository is still bound to it.
+	Bind binding
+	// AttemptSeq identifies the registration claimTask made for this task; see attempt.seq.
+	AttemptSeq uint64
 }
 
 // syncDeps are the seams a sync needs. Zero timeouts use the defaults.
@@ -257,7 +262,7 @@ func (d syncDeps) originEnv(home string, t syncTask) []string {
 func (d syncDeps) fetchEnv(home string, t syncTask, lim Limits) []string {
 	cfg := credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token)
 	cfg = append(cfg, packConfig(lim)...)
-	cfg = append(cfg, maintenanceConfig(lim)...)
+	cfg = append(cfg, maintenanceConfig()...)
 	return gitConfigEnv(gitBaseEnv(home), cfg)
 }
 
@@ -302,7 +307,9 @@ func (d syncDeps) updateMirror(ctx context.Context, home string, t syncTask, lim
 		if err == nil {
 			return nil, nil
 		}
-		if !isCorruptMirror(stderr) {
+		// A fetch that was cancelled says nothing about the mirror: its stderr may still match a
+		// corruption marker, and rebuilding would throw away a healthy mirror.
+		if ctx.Err() != nil || !isCorruptMirror(stderr) {
 			return stderr, err
 		}
 		if rmErr := os.RemoveAll(dir); rmErr != nil {
@@ -334,6 +341,11 @@ func (d syncDeps) runBounded(ctx context.Context, timeout time.Duration, what st
 // runBoundedOut is runBounded with git's standard output streamed to stdout. Without the output seam
 // it runs through run and the output is discarded.
 func (d syncDeps) runBoundedOut(ctx context.Context, timeout time.Duration, what string, argv, env []string, dir string, stdout io.Writer) ([]byte, error) {
+	// A cancelled sync must not start another git: with a superseded credential in its environment,
+	// that would be one more process using it.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var stderr []byte

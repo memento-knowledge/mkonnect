@@ -14,11 +14,17 @@ const defaultSyncConcurrency = 4
 
 // syncHooks connect the manager to the connector's state without the manager knowing about it.
 type syncHooks struct {
-	// resolve returns a snapshot of the task to run for repoID, or false when the repository is not
-	// (or no longer) syncable. It is called only once a concurrency slot is held, immediately before
-	// the sync starts, so a repository that queued behind others runs with the token and target it
-	// has when it runs, not the ones it had when it was queued.
-	resolve func(repoID string) (syncTask, bool)
+	// syncable reports whether repoID could be synced now. It only gates what enqueue starts; it
+	// copies no secret and takes no claim on anything.
+	syncable func(repoID string) bool
+	// claim returns the task to run for repoID, or false when the repository is not (or no longer)
+	// syncable. It is called only once a concurrency slot is held, immediately before the sync starts,
+	// so a repository that queued behind others runs with the token and target it has when it runs,
+	// not the ones it had when it was queued. The returned context bounds the attempt: it is derived
+	// from parent and is cancelled if the credential the task carries is superseded, which is why the
+	// task and the context are produced together, in one step that cannot be interleaved with the
+	// change of credential. finish must be called for every successful claim.
+	claim func(parent context.Context, repoID string) (syncTask, context.Context, bool)
 	// begin marks the repository as syncing (queued or running). It runs synchronously inside
 	// enqueue, so a status built right after enqueue returns already reports it.
 	begin func(repoID string)
@@ -26,10 +32,11 @@ type syncHooks struct {
 	// once a concurrency slot is held, immediately before the sync, so a repository that is merely
 	// queued has no attempt in flight. May be nil.
 	started func(repoID string, t syncTask, at time.Time)
-	// finish records the outcome and clears the syncing mark. A pending result means the sync was
-	// cancelled and nothing should be recorded. The implementation must ignore a task whose target
-	// no longer matches the repository's current configuration.
-	finish func(repoID string, t syncTask, r syncResult)
+	// finish ends the claim and records the outcome, clearing the syncing mark. A pending result
+	// means the sync was cancelled and nothing should be recorded. The implementation must ignore a
+	// task whose target no longer matches the repository's current configuration, and drop the
+	// result of one whose credential has been superseded. It reports whether the result was kept.
+	finish func(repoID string, t syncTask, r syncResult) bool
 	// release clears the syncing mark of a repository that did not run (cancelled while queued, no
 	// longer syncable, or suspended), recording nothing.
 	release func(repoID string)
@@ -85,7 +92,7 @@ func (m *manager) resize(limit int) { m.slots.resize(limit) }
 // context, not a connection's, so a reconnect does not kill a long fetch.
 func (m *manager) enqueue(ctx context.Context, repoIDs []string) {
 	for _, id := range repoIDs {
-		if _, ok := m.hooks.resolve(id); !ok {
+		if !m.hooks.syncable(id) {
 			continue
 		}
 		m.launch(ctx, id, true)
@@ -101,7 +108,7 @@ func (m *manager) enqueueScheduled(ctx context.Context, id string) bool {
 	if ctx.Err() != nil || m.hooks.suspended() || m.busy(id) {
 		return false
 	}
-	if _, ok := m.hooks.resolve(id); !ok {
+	if !m.hooks.syncable(id) {
 		return false
 	}
 	return m.launch(ctx, id, false)
@@ -168,8 +175,13 @@ func (m *manager) runOnce(ctx context.Context, id string) {
 		m.hooks.release(id)
 		return
 	}
-	task, ok := m.hooks.resolve(id)
-	if !ok || m.hooks.suspended() {
+	if m.hooks.suspended() {
+		m.hooks.release(id)
+		m.hooks.changed()
+		return
+	}
+	task, attemptCtx, ok := m.hooks.claim(ctx, id)
+	if !ok {
 		m.hooks.release(id)
 		m.hooks.changed()
 		return
@@ -180,12 +192,14 @@ func (m *manager) runOnce(ctx context.Context, id string) {
 	if m.hooks.started != nil {
 		m.hooks.started(id, task, start)
 	}
-	res := syncRepo(ctx, m.deps, task)
+	res := syncRepo(attemptCtx, m.deps, task)
 	res.Stats.StartedAt = start
 	res.Stats.Duration = m.deps.now().Sub(start)
-	m.hooks.finish(id, task, res)
+	kept := m.hooks.finish(id, task, res)
 	if res.State != StatePending {
-		logOutcome(id, res, res.Stats.Duration)
+		if kept {
+			logOutcome(id, res, res.Stats.Duration)
+		}
 		m.hooks.changed()
 	}
 }

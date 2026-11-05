@@ -32,28 +32,34 @@ func newHookLog() *hookLog {
 
 func (h *hookLog) hooks() syncHooks {
 	return syncHooks{
-		resolve: func(id string) (syncTask, bool) {
+		syncable: func(id string) bool {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return !h.skip[id]
+		},
+		claim: func(ctx context.Context, id string) (syncTask, context.Context, bool) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			if h.skip[id] {
-				return syncTask{}, false
+				return syncTask{}, nil, false
 			}
 			t := testTask()
 			t.RepoID = id
 			if tok, ok := h.tokens[id]; ok {
 				t.Origin.Token = Secret(tok)
 			}
-			return t, true
+			return t, ctx, true
 		},
 		begin: func(id string) {
 			h.mu.Lock()
 			h.begun = append(h.begun, id)
 			h.mu.Unlock()
 		},
-		finish: func(id string, _ syncTask, r syncResult) {
+		finish: func(id string, _ syncTask, r syncResult) bool {
 			h.mu.Lock()
 			h.finished[id] = append(h.finished[id], r)
 			h.mu.Unlock()
+			return true
 		},
 		release: func(id string) {
 			h.mu.Lock()

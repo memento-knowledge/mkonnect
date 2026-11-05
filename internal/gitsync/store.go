@@ -19,6 +19,9 @@ type Store struct {
 	path    string
 	data    map[string]LocalEntry
 	sources sourceSet
+	// digest identifies what the load read (see sourcesDigest); the live reload compares later reads
+	// against it. Zero for a store that was not loaded from files.
+	digest digest
 }
 
 // New loads the provider config from path. A missing file yields an empty store and no error. A
@@ -38,7 +41,7 @@ func New(path string) (*Store, error) {
 	if len(res.issues) > 0 {
 		return nil, &LoadError{Sources: res.sources.sorted(), err: res.issues[0]}
 	}
-	return &Store{path: path, data: res.entries, sources: res.sources}, nil
+	return &Store{path: path, data: res.entries, sources: res.sources, digest: sourcesDigest(res.sources.sorted(), res.loose)}, nil
 }
 
 // Sources returns the files the last load read, sorted by path: the config file (listed even when it

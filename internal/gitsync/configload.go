@@ -89,6 +89,12 @@ type loadedConfig struct {
 	// missing says the file does not exist, which is not an error: the connector then has no providers.
 	missing bool
 	issues  []ConfigIssue
+	// loose: a look found the config file's mode wider than accepted (see providerConfigFile.loose).
+	loose bool
+	// missingToken lists the providers whose token_file does not exist, among those that otherwise
+	// loaded (their token file is the only thing wrong with them). A reload drops them and keeps the
+	// rest; it is empty whenever the load failed for any other reason.
+	missingToken []string
 	// sources are the files involved: the config (listed even when missing) and every token file it
 	// names, with a fingerprint of the bytes actually read. It is filled in even when the load fails.
 	sources sourceSet
@@ -107,14 +113,20 @@ var knownConfigFields = []string{"base_url", "auth", "username", "token", "token
 // credential (name, credential source, settings, inline token, host). The second reads the token
 // files, and runs only if the first found nothing wrong, so a configuration that will be refused
 // anyway opens no token file at all.
-func loadConfig(path string) loadedConfig {
+func loadConfig(path string) loadedConfig { return loadConfigMode(path, true) }
+
+// loadConfigMode is loadConfig with the choice of whether it may touch the config file: with tighten
+// false it neither changes the file's mode nor logs about it (see readProviderConfigMode), which is
+// how the live reload looks for a change without side effects. Token files are never modified either
+// way, and their warnings are logged once per file.
+func loadConfigMode(path string, tighten bool) loadedConfig {
 	res := loadedConfig{entries: map[string]LocalEntry{}, hostKeys: map[string]string{}, sources: sourceSet{}}
 	fail := func(class IssueClass, msg string, err error) loadedConfig {
 		res.issues = append(res.issues, ConfigIssue{Class: class, Message: msg, err: err})
 		return res
 	}
 
-	cfg, err := readProviderConfig(path, maxConfigFileSize, rejectForeignConfigOwner)
+	cfg, err := readProviderConfigMode(path, maxConfigFileSize, rejectForeignConfigOwner, tighten)
 	if err != nil {
 		res.sources.add(Source{Path: path})
 		if os.IsNotExist(err) {
@@ -124,6 +136,7 @@ func loadConfig(path string) loadedConfig {
 		return fail(IssueFile, err.Error(), err)
 	}
 	res.sources.add(newSource(path, cfg.data))
+	res.loose = cfg.loose
 
 	dc, issue := decodeConfig(path, cfg.data)
 	if issue != nil {
@@ -227,6 +240,7 @@ func loadConfig(path string) loadedConfig {
 	// Second pass: read the token files. A file shared by several providers is read once, so they all
 	// see the same bytes.
 	contents := map[string][]byte{}
+	var missingToken []string
 	for _, name := range names {
 		e, ok := pending[name]
 		if !ok {
@@ -243,6 +257,10 @@ func loadConfig(path string) loadedConfig {
 			raw, err = tokenFileReader(e.TokenFile, "token_file")
 			if err != nil {
 				tokenFileIssue(err.Error())
+				var missing *tokenFileMissingError
+				if errors.As(err, &missing) {
+					missingToken = append(missingToken, name)
+				}
 				continue
 			}
 			contents[e.TokenFile] = raw
@@ -259,6 +277,11 @@ func loadConfig(path string) loadedConfig {
 			continue
 		}
 		res.entries[name] = e
+	}
+	// Only a configuration whose every problem is a token file that is not there reports them as
+	// such: a reload then drops those providers and keeps the rest.
+	if len(missingToken) == len(res.issues) {
+		res.missingToken = missingToken
 	}
 	return res
 }

@@ -5,7 +5,8 @@
 //
 // The local credential surface here is intentionally minimal: a credential is an inline token or
 // the path of a file holding it, vetted as described on readProviderConfig and readTokenFile.
-// At-rest encryption and live reload are future work.
+// At-rest encryption is future work. The provider configuration, token files included, is reloaded
+// while the daemon runs; see reload.go.
 package gitsync
 
 import (

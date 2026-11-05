@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -192,15 +193,40 @@ func runGitOut(ctx context.Context, argv, env []string, dir string, stdout io.Wr
 	cmd.Stderr = stderr
 	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Cancellation asks the whole group to stop (SIGTERM) and kills whatever is left after a short
+	// grace. A bare SIGKILL skips git's cleanup of its lock files, and a lock left behind in the
+	// mirror fails the next fetch ("cannot lock ref"), which is the very sync a credential rotation
+	// starts straight after cancelling this one.
+	var (
+		mu        sync.Mutex
+		cancelled bool
+		pgid      int
+		grace     *time.Timer
+	)
 	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		mu.Lock()
+		defer mu.Unlock()
+		if cmd.Process == nil {
+			return nil
 		}
+		cancelled, pgid = true, cmd.Process.Pid
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		grace = time.AfterFunc(gitKillGrace, func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
 		return nil
 	}
 	err := cmd.Run()
+	mu.Lock()
+	if cancelled {
+		// The parent is gone; sweep any helper that ignored SIGTERM so none outlives the sync.
+		grace.Stop()
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	}
+	mu.Unlock()
 	return stderr.Bytes(), err
 }
+
+// gitKillGrace is how long a cancelled git has, after SIGTERM, to clean up before it is killed.
+const gitKillGrace = time.Second
 
 // truncationMarker stands in for the middle of a limitedBuffer's output when it was cut.
 const truncationMarker = "\n[... output truncated ...]\n"
