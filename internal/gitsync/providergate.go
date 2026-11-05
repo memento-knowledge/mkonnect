@@ -225,7 +225,9 @@ func (g *providerGates) retain(inUse map[binding]struct{}, repos map[string]targ
 		}
 	}
 	for repo, b := range maps.Clone(g.passes) {
-		if _, ok := g.gates[b]; !ok {
+		_, gated := g.gates[b]
+		_, configured := repos[repo]
+		if !gated || !configured {
 			delete(g.passes, repo)
 		}
 	}

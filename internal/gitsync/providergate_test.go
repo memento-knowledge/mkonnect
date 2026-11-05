@@ -479,3 +479,17 @@ func TestGateImmediateSyncDoesNotPostponeTheProbe(t *testing.T) {
 		t.Fatalf("dispatched %v when the gate elapsed, want one probe", p1)
 	}
 }
+
+// A pass belongs to one request for one repository. If the repository is removed and a repository of
+// the same ID is added again while the gate stays closed, the old pass must not let it through.
+func TestGateRemovedRepositoryLeavesNoPassBehind(t *testing.T) {
+	h, _ := gated(t)
+	if !h.s.admitManual("b") {
+		t.Fatal("not admitted")
+	}
+	h.bindRepos(map[string]binding{"a": gateP1, "c": gateP1, "d": gateP2}) // b removed; p1 stays gated
+	h.bindRepos(map[string]binding{"a": gateP1, "b": gateP1, "c": gateP1, "d": gateP2})
+	if h.s.mayClaim("b", gateP1) {
+		t.Fatal("a pass granted to the removed b let the re-added b through the closed gate")
+	}
+}
