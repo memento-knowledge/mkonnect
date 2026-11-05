@@ -37,32 +37,15 @@ func ReadConfig(path string) LoadedConfig {
 	warnings := modeWarnings(path)
 	res := loadConfigMode(path, false)
 	rep := buildReport(path, res, warnings)
-	// The connector tightens a loose file itself and refuses it only when it cannot. Without
-	// trying, work out whether it could: a loose file it cannot tighten is one it would refuse.
-	if res.loose && cannotTighten(path) {
-		msg := "the file's mode is wider than the connector accepts and cannot be tightened (the file is on a read-only file system, or owned by another user); the connector would refuse it. Restrict it to the owner, allowing at most group read (for example 0600 or 0640)"
+	// The connector tightens a loose file at startup where it can, and refuses it where it cannot. Whether
+	// it can depends on the owner, the file system, attributes and policy, and the only sure way to find
+	// out is to change the file, which preflight does not do. A loose file is therefore reported as a
+	// failure, not a warning: preflight does not claim a host is ready when it cannot establish it.
+	if res.loose {
+		msg := "the file's mode is wider than the connector accepts. The connector tightens it to 0600 at startup where it can and otherwise refuses it, and preflight cannot tell which without changing the file. Restrict it to the owner, allowing at most group read (for example chmod 600), and run preflight again"
 		rep.Issues = append(rep.Issues, ConfigIssue{Class: IssueFile, Message: msg, err: errors.New(msg)})
 	}
 	return LoadedConfig{Report: rep, entries: res.entries}
-}
-
-// cannotTighten reports whether the connector's attempt to chmod the config file to 0600 would fail,
-// by making the same call (through the same fchmod the loader uses) with the file's CURRENT mode. That
-// is subject to every restriction the real call is (not the owner, a read-only mount, an immutable
-// attribute, an ACL or security-module policy) and changes nothing but the file's change time, so
-// preflight can answer for the file as it stands without touching its mode or content. When the
-// file cannot even be opened and examined, it cannot be shown to be tightenable, so it counts as not.
-func cannotTighten(path string) bool {
-	f, err := os.Open(path)
-	if err != nil {
-		return true
-	}
-	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return true
-	}
-	return fchmod(f, info.Mode()) != nil
 }
 
 // CanCreateDir reports whether the connector's user could create path as a directory: its nearest

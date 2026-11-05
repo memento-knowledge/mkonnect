@@ -645,7 +645,7 @@ func TestPreflightProviderConfig(t *testing.T) {
 			t.Errorf("warnings must not fail the run: %v", err)
 		}
 	})
-	t.Run("a loose file mode warns and the file is left alone", func(t *testing.T) {
+	t.Run("a loose file mode fails, skips the origins, and the file is left alone", func(t *testing.T) {
 		basicsEnv(t)
 		path := os.Getenv("GIT_SYNC_CONFIG_FILE")
 		writeProviders(t, path, `{}`)
@@ -653,7 +653,8 @@ func TestPreflightProviderConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		doc, _, _ := runPreflightJSON(t)
-		wantStatus(t, doc, "provider-config", "warn")
+		wantStatus(t, doc, "provider-config", "fail")
+		wantStatus(t, doc, "origins", "skip")
 		info, err := os.Stat(path)
 		if err != nil {
 			t.Fatal(err)

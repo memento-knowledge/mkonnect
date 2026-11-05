@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 )
 
@@ -142,11 +141,13 @@ func TestReadConfigNeverChangesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ReadConfig(path)
-	if len(cfg.Report.Issues) != 0 || len(cfg.Report.Providers) != 1 {
+	// A loose mode is a failure (see TestReadConfigLooseModeIsAFailure) and is also reported as a
+	// warning with the mode it has; the provider itself is still read.
+	if len(cfg.Report.Issues) != 1 || len(cfg.Report.Providers) != 1 {
 		t.Fatalf("report = %+v", cfg.Report)
 	}
 	if len(cfg.Report.Warnings) != 1 {
-		t.Errorf("a loose mode should be a warning: %v", cfg.Report.Warnings)
+		t.Errorf("the loose mode should be named in a warning: %v", cfg.Report.Warnings)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -221,64 +222,44 @@ func TestCanCreateDir(t *testing.T) {
 	}
 }
 
-func TestCannotTighten(t *testing.T) {
-	own := writeTemp(t, "{}")
-	if cannotTighten(own) {
-		t.Error("a file the user owns on a writable file system can be tightened")
-	}
-	info, err := os.Stat(own)
-	if err != nil || info.Mode().Perm() != 0o644 {
-		t.Errorf("the probe changed the file's mode: %v %v", info.Mode().Perm(), err)
-	}
-	// A file that cannot be examined is not shown to be tightenable.
-	if !cannotTighten(filepath.Join(t.TempDir(), "absent")) {
-		t.Error("a path that cannot be opened must count as not tightenable")
-	}
-	// A file that belongs to someone else: the real call, with the file's current mode, is refused.
-	if _, err := os.Stat("/etc/hosts"); err == nil && os.Geteuid() != 0 && !cannotTighten("/etc/hosts") {
-		t.Error("a root-owned file cannot be chmod-ed by an ordinary user")
-	}
-}
-
-func TestReadConfigLooseFileWhenChmodIsDenied(t *testing.T) {
+func TestReadConfigLooseModeIsAFailure(t *testing.T) {
 	body := `{"a": {"base_url": "https://a.example.test/", "auth": "bearer", "token": "tok-0123456789abcdef"}}`
-	path := writeTemp(t, body) // mode 0644: wider than the connector accepts, owned by this user
-	if err := os.Chmod(path, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	for _, tt := range []struct {
 		name     string
-		chmodErr error // what the chmod the connector would make returns
+		mode     os.FileMode
 		wantFail bool
 	}{
-		{"chmod works: the connector tightens it, so a warning only", nil, false},
-		{"read-only file system", syscall.EROFS, true},
-		{"not permitted (another owner, an immutable file, a policy)", syscall.EPERM, true},
-		{"denied by an ACL or security policy", syscall.EACCES, true},
+		{"owner only", 0o600, false},
+		{"group read, as a mounted Secret has", 0o640, false},
+		{"owner read only", 0o400, false},
+		{"world readable", 0o644, true},
+		{"group writable", 0o660, true},
+		{"world writable", 0o666, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			prev := fchmod
-			var gotMode os.FileMode
-			fchmod = func(f *os.File, m os.FileMode) error { gotMode = m; return tt.chmodErr }
-			t.Cleanup(func() { fchmod = prev })
-
-			cfg := ReadConfig(path)
-			if gotMode.Perm() != 0o644 {
-				t.Errorf("the probe must use the file's current mode, used %o", gotMode.Perm())
+			path := writeTemp(t, body)
+			if err := os.Chmod(path, tt.mode); err != nil {
+				t.Fatal(err)
 			}
+			cfg := ReadConfig(path)
+			p := &fakeProber{}
+			out := cfg.ProbeOrigins(context.Background(), p)
 			if tt.wantFail {
 				if len(cfg.Report.Issues) != 1 || cfg.Report.Issues[0].Class != IssueFile {
 					t.Fatalf("issues = %+v, want one file issue", cfg.Report.Issues)
 				}
-				p := &fakeProber{}
-				if out := cfg.ProbeOrigins(context.Background(), p); out != nil || len(p.seen) != 0 {
-					t.Error("a refused configuration must not be probed")
+				if out != nil || len(p.seen) != 0 {
+					t.Error("a loose file must not be probed")
 				}
-				return
+			} else {
+				if len(cfg.Report.Issues) != 0 || len(out) != 1 {
+					t.Errorf("issues=%v outcomes=%v, want an accepted config that is probed", cfg.Report.Issues, out)
+				}
 			}
-			if len(cfg.Report.Issues) != 0 || len(cfg.Report.Warnings) != 1 {
-				t.Errorf("issues=%v warnings=%v, want only the mode warning", cfg.Report.Issues, cfg.Report.Warnings)
+			// Whatever the verdict, the file is exactly as it was.
+			info, err := os.Stat(path)
+			if err != nil || info.Mode().Perm() != tt.mode {
+				t.Errorf("the file's mode changed to %o (%v), want %o", info.Mode().Perm(), err, tt.mode)
 			}
 		})
 	}
