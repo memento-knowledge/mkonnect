@@ -35,6 +35,15 @@ git-sync syncs a repository:
 The first sync of a repository downloads all of its history; later syncs transfer only what
 changed.
 
+git-sync replicates branches and tags only, so the contents of **Git LFS** objects are not copied:
+the replica receives the small pointer files, not the large files they name. A repository that
+appears to use LFS still syncs and stays `ok`, but its status carries the warning
+`lfs_not_replicated`. The check is a cheap local heuristic: it looks for a `filter=lfs` rule in the
+`.gitattributes` at the root of the default branch's latest commit, so it can miss a repository
+whose rules live elsewhere and can flag one that has a rule but no LFS files. It contacts nothing
+and never fails a sync. The warning is dropped by the first sync that finds no such rule. It is not kept across a
+restart, so it is absent until the first sync after one, and a repository in `error` does not show it.
+
 git-sync does not decide which repositories to sync: the platform sends the full list, and
 git-sync syncs nothing until it has received one. When a repository disappears from that list, git-sync
 removes its local mirror after a grace period (see [Mirror cleanup](#mirror-cleanup)).
@@ -107,7 +116,8 @@ error, the release most likely has no git-sync image.
   (see [Mirror cleanup](#mirror-cleanup)), so leave room for those as well.
 - **Scratch space** (`/tmp`): holds each sync's empty home directory and git's own temporary
   files, not the mirrors, so it is much smaller than the data volume. It must be backed by disk,
-  not memory. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
+  not memory. It is `/tmp` unless `GIT_SYNC_TMP_DIR` (or, failing that, `TMPDIR`) names another
+  directory, which must be an absolute path: git-sync does not start with a relative one. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
   `gitSync.tmp.sizeLimit` if you see `local_disk_exhausted` for `/tmp`.
 - **Concurrency and memory:** by default up to four repositories sync at once; the others wait their turn
   (see [Concurrency](#concurrency)). A very large repository, or a large first sync, can exceed the
@@ -604,8 +614,8 @@ While syncing is suspended for a critical update, a rotation still stops the syn
 credential, but the repository is next synced when the suspension ends and its schedule falls due.
 
 Each reload that changes something re-runs the check that the configured git servers are reachable.
-`connector status` lists the configured providers and the replica host the process sees in its
-environment; the state of enrollment and of each repository is shown in the Memento portal.
+`connector status` shows what a command-line session can see (see [Verify](#verify)); the state of
+enrollment and the reason a repository failed are shown in the Memento portal.
 
 ## Verify
 
@@ -622,6 +632,20 @@ git-sync should register and connect within a few seconds.
   the image; the log says `origin reachability check could not run`). After you add repositories,
   each shows its sync state, when it last succeeded, and the outcome of its last attempt (see
   [Run state](#run-state)).
+- **Command line:** `connector status` prints the replica host pin as the process sees it in its
+  environment, the configured providers (credentials masked), and, for each repository, when it was
+  last attempted and last succeeded, how long that took, how many refs it pushed, the time of the
+  newest commit across the branches and tags at your git server, and its default branch. It reads the [run state](#run-state) file, so it works
+  while git-sync is stopped, but it cannot show a sync in progress or why an attempt failed:
+  `LAST ATTEMPT` later than `LAST SUCCESS` means the latest attempt did not succeed. `--absolute`
+  prints timestamps instead of "5m ago", and `--json` prints only the sync state as a JSON object
+  with UTC timestamps. Run it as the user git-sync runs as and with the same environment, or it may
+  read a different directory (it says so when it finds no state).
+
+  ```bash
+  docker exec -i mkonnect-gitsync /mkonnect-gitsync connector status
+  ```
+
 - **Docker logs:**
 
   ```bash
@@ -638,6 +662,15 @@ git-sync should register and connect within a few seconds.
 The Kubernetes startup probe only checks that the binary starts. It says nothing about the
 configuration: a pod can be `Running` and `Ready` while git-sync is not syncing (for example
 because its configuration was rejected). Always check the logs and the portal.
+
+Each repository is in one of four states in the portal:
+
+| State | Meaning |
+|---|---|
+| `pending` | Configured, but not synced yet: since git-sync started, or since the repository's origin, replica or credential changed. It stays `pending` while syncing is suspended. An earlier last-success time, if there is one, is still shown. |
+| `syncing` | A sync is queued or running. A repository waiting for a free slot is `syncing` too. |
+| `ok` | The last sync succeeded. It may carry a warning such as `lfs_not_replicated`. |
+| `error` | The last sync failed, or the repository cannot be synced at all (no provider for its host, or an unusable replica configuration), with one of the types in [Troubleshooting](#troubleshooting). |
 
 If a repository shows an error, see [Troubleshooting](#troubleshooting).
 
@@ -769,14 +802,14 @@ range and rejects the whole configuration if one is outside it (see
 [Rejected configuration](#rejected-configuration-config_error)). A limit the configuration leaves out
 goes back to its default. These are applied:
 
-| Limit | Default | Effect |
-|---|---|---|
-| Interval | 15 minutes | How often each repository is synced. |
-| Concurrency | 4 | How many repositories sync at once. Changing it never interrupts a running sync: raising it starts waiting repositories at once, lowering it only holds back new starts until enough syncs finish. |
-| Push timeout | 30 minutes | How long one push to the replica may run before it is reported as `push_timeout`. The fetch from your git server keeps its fixed 30-minute limit. |
-| Pack threads, pack window memory | git's own | Passed to git as `pack.threads` and `pack.windowMemory`, for the fetch and the push, to bound CPU and memory on a small host. |
-| Repository size ceiling | none | After a fetch, a mirror larger than the ceiling is not pushed and the repository is reported as `repository_over_limit`. The check is on the mirror's size on disk, after the fetch: a repository far over the ceiling is still downloaded once, and its mirror is kept so the next fetch is incremental. The error repeats until git has reclaimed enough space or the ceiling is raised. |
-| Push batch size | none | A push that would write more refs than this is made in batches of at most that many refs, so a very large repository is not sent in one request (see below). |
+| Limit | Default | Accepted | Effect |
+|---|---|---|---|
+| Interval | 15 minutes | 60 s to 24 h | How often each repository is synced. |
+| Concurrency | 4 | 1 to 32 | How many repositories sync at once. Changing it never interrupts a running sync: raising it starts waiting repositories at once, lowering it only holds back new starts until enough syncs finish. |
+| Push timeout | 30 minutes | 60 s to 24 h | How long one push to the replica may run before it is reported as `push_timeout`. The fetch from your git server keeps its fixed 30-minute limit. |
+| Pack threads, pack window memory | git's own | 0 to 64 threads; 0 or 16 to 65536 MiB | Passed to git as `pack.threads` and `pack.windowMemory`, for the fetch and the push, to bound CPU and memory on a small host. |
+| Repository size ceiling | none | 0 (none), or 1 MiB to 10 TiB | After a fetch, a mirror larger than the ceiling is not pushed and the repository is reported as `repository_over_limit`. The check is on the mirror's size on disk, after the fetch: a repository far over the ceiling is still downloaded once, and its mirror is kept so the next fetch is incremental. The error repeats until git has reclaimed enough space or the ceiling is raised. |
+| Push batch size | none | 0 (none), or 100 to 100000 refs | A push that would write more refs than this is made in batches of at most that many refs, so a very large repository is not sent in one request (see below). |
 
 When pushes are batched, git-sync first asks the replica what a push would change (a request that
 sends no data), writes the changed branches and tags in batches, and only after **every batch has
@@ -1025,11 +1058,13 @@ clears the error.
 | `local config load failed` mentions a `token_file` | The message names the problem and, except for the owner of the configuration file itself (`uses token_file but is owned by another user`: `chown` it to uid 65532 or `root`), the provider: `set only one of token and token_file`; `an authentication mode requires a token or a token_file`; `token_file must not be empty`; `token_file must be an absolute path`; `could not be opened` (the volume or Secret is not mounted, the path is wrong, or the file is not readable by the user running git-sync: for a Kubernetes Secret, check `fsGroup`); `is not a regular file`; `is writable by group or others` (use `0600`, `0640` or `0440`); `is owned by another user` (the owner must be uid 65532, the user running git-sync, or `root`; for a bind mount, `chown` the host file); `is empty`; `ends with a carriage return` (re-save with LF line endings); `has more than one line`; `contains control or invisible characters`; `has leading or trailing whitespace`; `is larger than the 4096-byte limit`. `connector config list`, `set`, `remove` and `status` fail the same way, so fix the file first, even to remove a provider. Run them as the user that runs git-sync: as `root` in a container (`docker exec -u 0`), files owned by uid 65532 count as owned by another user. |
 | Log warns `credential file is readable by group or other users` | Expected for a Docker secret (`0444`) or a Kubernetes Secret. Where you control the mode, tighten it to `0600`; the connector starts either way. |
 | Log warns `credential file is owned by another user` for the provider configuration | The connector starts for now, but a later release will refuse to. Make the user running git-sync (uid 65532 in the image) or `root` own the file. |
-| Start fails with `temp directory … is not writable` | `/tmp` is not writable by uid 65532. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
+| Start fails with `temp directory … is not writable` or `… is not usable`, or with `GIT_SYNC_TMP_DIR must be an absolute path` | The scratch directory (`GIT_SYNC_TMP_DIR`, else `TMPDIR`, else `/tmp`) is not writable by uid 65532, cannot be created, or is a relative path. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |
 | A credential change did not take effect | git-sync reloads the provider configuration while it runs. Look in its log for `local provider configuration reloaded`, or for `the git-sync config cannot be used` with its reason (it then keeps the previous configuration). On Kubernetes the kubelet delivers an updated Secret to the pod after a delay, often a minute or more. See [Reloading the provider configuration](#reloading-the-provider-configuration). |
 | `connector config set` fails on Kubernetes | A mounted provider-config Secret is read-only. Update the Secret (git-sync reloads it without a restart), or unset `gitSync.providerConfig.secretName` to manage the file with the CLI. |
+| A repository is `ok` but carries the warning `lfs_not_replicated` | It appears to use Git LFS (a `filter=lfs` rule in the root `.gitattributes` of the default branch). git-sync copies branches and tags only, so the replica holds the LFS pointer files and not the large files. This is not an error and nothing needs fixing on your side; if the repository does not use LFS (a rule left in `.gitattributes`), remove the rule and the warning clears at the next sync. |
+| `connector status` says no finished attempt is recorded, or lists fewer repositories than the portal | It reads the run state of the directory it resolves from its own environment. Run it in the same container, as the user git-sync runs as, with the same `GIT_SYNC_MIRRORS_DIR` / `GIT_SYNC_CONFIG_FILE`. A repository that has not finished an attempt since its origin or replica last changed is not listed. See [Verify](#verify). |
 | Log warns that syncing needs git 2.31 or newer | The image does not contain a usable git. Use an official image for your release ID. |
 
 ### Rejected configuration (`config_error`)
