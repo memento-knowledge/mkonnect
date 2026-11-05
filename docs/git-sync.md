@@ -11,7 +11,7 @@ hardened, see [git-sync security and data handling](git-sync-security.md).
 
 git-sync is a **separate connector** from the API connector described in the
 [Installation guide](installation.md). It has its own image, its own connector ID, its own
-registration token, its own private key, and its own volume. You can run both on the same host or
+registration token, its own signing key, and its own volume. You can run both on the same host or
 cluster; they share nothing.
 
 ## How it works
@@ -84,7 +84,7 @@ and used only for requests to your git server. It is never sent to Memento.
 | Release ID / chart version | image tag / `--version` | Pin an explicit version; never a moving tag. |
 
 The registration token is a one-time secret: it is consumed on first startup, after which the
-connector authenticates with the private key it was issued. git-sync reads the token **from a
+connector authenticates with the signing key it was issued. git-sync reads the token **from a
 file** (`REGISTRATION_TOKEN_FILE`), not from an environment variable, so it does not show up in
 `docker inspect` or in the pod specification. The file must be a regular file of at most 4 KiB that
 is not accessible by others and not writable by its group.
@@ -108,10 +108,10 @@ error, the release most likely has no git-sync image.
 
 ### Verify the image signature
 
-Releases after the one that introduced signing carry a [Sigstore](https://docs.sigstore.dev/cosign/signing/overview/)
+A release carries a [Sigstore](https://docs.sigstore.dev/cosign/signing/overview/)
 signature on the image digest, made by this repository's release workflow, and a build provenance
-attestation. Signing is best effort, so a release can have an image without them: verification
-tells you which. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3.1 or
+attestation only if it was built after signing was added (releases up to and including
+20261022.0 are not signed) and its best-effort signing step succeeded: verification tells you which. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3.1 or
 newer:
 
 ```bash
@@ -212,7 +212,7 @@ docker run -d --name mkonnect-gitsync --restart unless-stopped \
 
 Notes:
 
-- `gitsync-data` is where the private key (`/data/gitsync-key`), the provider configuration
+- `gitsync-data` is where the signing key (`/data/gitsync-key`), the provider configuration
   (`/data/git-sync.json`), the mirrors (`/data/mirrors`), and the run state
   (`/data/mirrors/run-state.json`, see [Data on the volume](#data-on-the-volume)) live. Removing it
   deletes all of them.
@@ -250,7 +250,7 @@ the defaults for git-sync) would be missing.
 > **Warning: always keep the git-sync values on an upgrade.** `helm upgrade` without
 > `--reset-then-reuse-values` or a `-f` values file that repeats your `gitSync.*` settings resets
 > `gitSync.enabled` to `false`. Helm then **deletes the git-sync Deployment and its
-> `PersistentVolumeClaim`, which holds the connector's private key and all mirrors**, and the
+> `PersistentVolumeClaim`, which holds the connector's signing key and all mirrors**, and the
 > connector would have to be registered again with a new one-time token. The chart deliberately
 > does not mark the claim to be kept, so that uninstalling really removes the key and the
 > mirrors.
@@ -977,7 +977,7 @@ bare mirror, and one small file records what happened to each repository.
 
 | Path | Contents |
 |---|---|
-| `/data/gitsync-key` | The private key issued at registration. |
+| `/data/gitsync-key` | The signing key issued at registration. |
 | `/data/git-sync.json` | The provider configuration, unless it is mounted from a Secret. |
 | `/data/mirrors/<64 hex characters>.git` | The bare mirror of one repository. |
 | `/data/mirrors/run-state.json` | The [run state](#run-state). |
@@ -1113,7 +1113,7 @@ pull if that release has no git-sync image. If you pinned `gitSync.image.tag`, u
 
 > **Warning:** keep `--reset-then-reuse-values` (or repeat all your `gitSync.*` values with `-f`)
 > on every upgrade. A plain `helm upgrade` resets `gitSync.enabled` to `false`, which deletes the
-> git-sync Deployment **and its volume with the private key and all mirrors**; you would then have
+> git-sync Deployment **and its volume with the signing key and all mirrors**; you would then have
 > to register the connector again with a new token. See [Uninstalling](#uninstalling).
 
 > **Downgrading:** a release older than the one that introduced `token_file` rejects the field as
@@ -1144,12 +1144,12 @@ again with a new one-time registration token. To pause, stop the workload and ke
 | What | Docker | Kubernetes (Helm) | Holds |
 |---|---|---|---|
 | Workload | container `mkonnect-gitsync` | Deployment `mkonnect-gitsync` (for a release named `mkonnect`) and its pod | no data of its own |
-| Data volume | volume `gitsync-data` | PersistentVolumeClaim `mkonnect-gitsync-data` | signing key, provider configuration (if you used `connector config set`), the mirrors (a full copy of the history behind every replicated branch and tag), and the run state |
+| Data volume | volume `gitsync-data` | PersistentVolumeClaim `mkonnect-gitsync-data` | signing key, the provider configuration (if you kept it on the volume, for example with `connector config set`), the mirrors (a full copy of the history behind every replicated branch and tag), and the run state |
 | Scratch volume | volume `gitsync-tmp` | `emptyDir`, removed with the pod | temporary files of syncs in progress |
-| Registration token | volume `gitsync-secrets` and file `registration.env`, if you did not already [remove them](#remove-the-registration-token) | Secret `gitsync-registration-token` (the name you chose), or the chart's `<release>-gitsync-registration` | the one-time token |
+| Registration token | volume `gitsync-secrets` and file `registration.env`, if you did not already [remove them](#remove-the-registration-token) | Secret `gitsync-registration-token` (the name you chose) or the Secret the chart created (named `<release fullname>-gitsync-registration`, for example `mkonnect-gitsync-registration`; Helm deletes it with the Deployment), and the file `registration.token` in the git-sync directory on your workstation | the one-time token |
 | Provider configuration and git credential | `gitsync-data`, and any volume you mounted for a `token_file` (for example `gitsync-git-credential`) | the Secret you mounted as the provider configuration, and any Secret behind a `token_file` | your git server credential, in cleartext |
 | CA bundle for git | the file you mounted | the Secret named by `gitSync.caBundle.secretName` | public certificates only |
-| Settings | `gitsync.env` in the git-sync directory on the host | the `gitSync.*` values in the Helm release (and in any values file you keep) | the gateway URL, connector ID and replica host; no credential |
+| Settings | `gitsync.env` in the git-sync directory on the host | the `gitSync.*` values in the Helm release and its history, and in any values file you keep | the gateway URL, connector ID and replica host; also the registration token, if you passed it with `--set-file` |
 | Image | on the host that ran it | on each node that ran it | the git-sync image |
 
 ### Docker
@@ -1164,12 +1164,13 @@ again with a new one-time registration token. To pause, stop the workload and ke
    key and mirrors.
 
 2. Remove the container and delete the volumes. This deletes the signing key, the provider
-   configuration, every mirror and the run state. Remove `gitsync-secrets` and
-   `gitsync-git-credential` only if they still exist; `docker volume ls` shows them.
+   configuration, every mirror and the run state. `docker volume ls` shows which of the other
+   volumes still exist.
 
    ```bash
    docker rm mkonnect-gitsync
-   docker volume rm gitsync-data gitsync-tmp gitsync-secrets
+   docker volume rm gitsync-data gitsync-tmp
+   docker volume rm gitsync-secrets          # only if you have not already removed the registration token
    docker volume rm gitsync-git-credential   # only if you created it for a token_file
    ```
 
@@ -1187,7 +1188,8 @@ again with a new one-time registration token. To pause, stop the workload and ke
 ### Kubernetes (Helm)
 
 1. To pause only, scale the Deployment down. The claim and its data remain, and
-   `--replicas=1` resumes it:
+   `--replicas=1` resumes it. The chart fixes the replica count at 1, so a later `helm upgrade` or
+   a GitOps sync can start git-sync again:
 
    ```bash
    kubectl scale deployment/mkonnect-gitsync --replicas=0
@@ -1218,9 +1220,12 @@ again with a new one-time registration token. To pause, stop the workload and ke
 
    ```bash
    kubectl delete secret gitsync-registration-token   # if you did not already remove it
-   kubectl delete secret <provider-config-secret>     # holds your git server credential
-   kubectl delete secret <ca-bundle-secret>           # if you mounted a CA bundle
+   kubectl delete secret mkonnect-gitsync-providers   # holds your git server credential
+   kubectl delete secret mkonnect-gitsync-ca          # if you mounted a CA bundle
+   rm -r "${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"   # registration.token and any other local copies
    ```
+
+   These are the names used in the examples above; use yours if they differ.
 
    A registration token you passed with `--set-file` is also in earlier Helm release revisions (see
    the note in [Remove the registration token](#remove-the-registration-token)); to purge it,
@@ -1240,6 +1245,10 @@ the source:
   backups and in snapshots of the data volume.
 - Because the credential is held only on your side, there is nothing to revoke on the Memento side
   for it.
+- git-sync's own signing key authenticates the connector to the gateway. A copy of it that survives
+  in a backup or a snapshot of the data volume could still be used to authenticate as this connector
+  until the connector is removed, so also remove the connector in the portal (below) and treat old
+  volume backups and snapshots as sensitive.
 - If you rotated the credential earlier, make sure the old one is also revoked.
 
 ### What remains on the Memento side

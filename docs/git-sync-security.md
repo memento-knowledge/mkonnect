@@ -9,8 +9,9 @@ against [`internal/gitsync`](../internal/gitsync) and [`cmd/mkonnect-gitsync`](.
 
 ## Summary
 
-- git-sync is **outbound-only**. It listens on no port, has no Service, and the chart denies all
-  ingress to its pods.
+- git-sync is **outbound-only**. It listens on no port, has no Service, and the chart, by default
+  (`gitSync.networkPolicy.enabled`, with a CNI that enforces `NetworkPolicy`), denies all ingress to
+  its pods.
 - It **reads** from your git server and **writes** to exactly one Memento replica host, which you
   pin at install time.
 - It replicates **branches and tags only** (`refs/heads/*` and `refs/tags/*`).
@@ -21,17 +22,24 @@ against [`internal/gitsync`](../internal/gitsync) and [`cmd/mkonnect-gitsync`](.
 - The process runs as an unprivileged user with a read-only root filesystem and no Linux
   capabilities.
 - Release images are built by this repository's release workflow and are meant to be signed, with
-  build provenance. Signing is new and has not yet run in a release; see [Supply chain](#supply-chain).
+  build provenance. Releases up to and including 20261022.0 are not signed; see
+  [Supply chain](#supply-chain).
 
 ## Network destinations
 
 | Destination | Port | Direction | Purpose |
 |---|---|---|---|
-| Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`), unless that URL names another port | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration. |
+| Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`), unless that URL names another port | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration and requests for an immediate sync. |
 | Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. |
 | Your git server(s): the base URL(s) you configure as providers | as in each base URL (443 for `https://`) | outbound | Read-only `git ls-remote` and `git fetch`. |
 | Container registry (`public.ecr.aws`) | 443 | outbound, from the container runtime or the cluster nodes, and from where you run `helm` | Pulling the image at install and upgrade, and, on Kubernetes, pulling the Helm chart (`oci://public.ecr.aws/...`). The running git-sync process does not contact it. |
 | DNS | 53 | outbound | Name resolution. |
+
+Verifying a release before you install it is done by you, from your own machine, not by git-sync.
+It needs `github.com` (the release metadata, and build provenance attestations) and, for the
+signature, Sigstore's public infrastructure, as described in the
+[cosign documentation](https://docs.sigstore.dev/cosign/system_config/installation/); none of that
+is contacted by the running connector.
 
 There are no inbound connections. Exact gateway and replica host names are given in the
 installation instructions for your tenant; they are not listed here because they are specific to
@@ -75,9 +83,14 @@ For each configured repository, one sync does the following:
    written, they go in batches, and the removals are made by one final push only once every batch
    has succeeded (see [Limits the platform can send](git-sync.md#limits-the-platform-can-send)).
 
-Repository data travels directly between your git server, git-sync, and the replica over HTTPS.
-The gateway tunnel carries only control messages: configuration from the platform, and status
-(repository IDs, states, error types) from the connector.
+Repository data travels directly between your git server, git-sync, and the replica. The push to
+the replica is always HTTPS. The fetch from your git server uses the scheme of the base URL you
+configure; a provider with a credential must be `https://`, and only a provider without one may be
+`http://`. The gateway tunnel carries only control messages: configuration from the platform
+(including the replica push URL and push token for each repository), a request for an immediate
+sync (`git_sync_now`), and status (repository IDs, states, error types) from the connector. The
+platform can request an immediate sync at any time; git-sync does not rate-limit those requests
+beyond folding them into one rerun per repository.
 
 ### What the replica receives
 
@@ -147,8 +160,8 @@ names or repository paths.
 | Credential | Held by | How it is protected | Lifetime |
 |---|---|---|---|
 | Registration token | Issued for your tenant at registration; delivered to git-sync as a file | Mounted read-only, mode `0440` in Kubernetes (group-readable through the pod's `fsGroup`); in Docker, a `0600` file owned by uid 65532 in a dedicated volume mounted read-only. git-sync refuses a token file that is accessible by others or writable by its group. Delivered as a file in both, so it is not shown by `docker inspect` or in the pod specification (see the note on `REGISTRATION_TOKEN` above). | One time; remove after registration. |
-| Signing key | Generated by the gateway at registration; stored by git-sync | Owner-only file on the data volume (git-sync refuses a key file that others can access); the signing key is never sent again. Each reconnect proves possession by signing a challenge. | Until you delete the volume. |
-| Git server credential | You | Stored in the provider configuration, or in a file the configuration names (`token_file`; refused when group or others can write it or another user owns it). Used only for requests to the matching git server. On Kubernetes, prefer a Secret you manage. | Until you rotate or revoke it at your git server. |
+| Signing key | Generated by the gateway at registration; stored by git-sync | Owner-only file on the data volume (git-sync refuses a key file with any group or other permission); the signing key is never sent again. Each reconnect proves possession by signing a challenge. | Until you delete the volume. |
+| Git server credential | You | Stored in the provider configuration, or in a file the configuration names (`token_file`; refused when group or others can write it, or when its owner is neither the user running git-sync nor root). Used only for requests to the matching git server. On Kubernetes, prefer a Secret you manage. | Until you rotate or revoke it at your git server. |
 | Replica push token | Issued by the platform per repository | Memory only; sent only to the pinned replica host; carries an expiry that git-sync checks before pushing. | Has an expiry; refreshed by the platform while connected. |
 
 Both git credentials reach `git` as configuration in the child process's environment, scoped to
@@ -302,7 +315,8 @@ Limits to be aware of:
 - **What you run.** The git-sync image is built from [`Dockerfile.gitsync`](../Dockerfile.gitsync) by
   this repository's release workflow, from a release tag. It holds the `mkonnect-gitsync` binary
   (built with `CGO_ENABLED=0`), `git` and CA certificates on an Alpine base, and runs as uid 65532;
-  the package manager is removed in the build. The Alpine base is pinned by digest; `git` and
+  the package manager is removed in the build. The runtime Alpine base is pinned by digest (the Go
+  builder stage, which does not ship in the image, is pinned by tag only); `git` and
   `ca-certificates` are resolved from Alpine's package index at build time, so the image as a whole
   is not bit-for-bit reproducible, and the build fails if `git` is older than 2.31.
 - **Pin by digest.** Each release records the image digests in `release-metadata.json`. Use the
@@ -316,17 +330,16 @@ Limits to be aware of:
   [Verify the image signature](git-sync.md#verify-the-image-signature) and
   [RELEASING.md](../RELEASING.md#image-signatures-and-provenance). git-sync never checks them. Keyless
   signatures are recorded in Sigstore's public transparency log.
-- **Signing has not run in a release yet.** The signing step was added after the most recent release
-  at the time this page was written (20261022.0), whose workflow does not contain it. Verifying that
-  release or any earlier one will fail because there is nothing to verify, not because it was
-  tampered with. Signing is also best effort: it is a separate job that cannot block or undo a
-  release, and whether the public registry accepts the signature artifacts has not yet been
-  confirmed. So a signed image is not guaranteed even from a later release. Verify the digest you
-  will run and treat a failure for an unsigned release as "unsigned", not as a clean bill of health
-  or as proof of tampering. Check [RELEASING.md](../RELEASING.md#image-signatures-and-provenance) for the
-  current position.
-- **What is not signed.** The signing covers the container images. The Helm chart is not signed by
-  this workflow; each release publishes it with a SHA-256 checksum file, and you can read its templates
+- **Releases up to and including 20261022.0 are not signed.** The signing step was added after
+  that release, whose workflow does not contain it, so it has no signature and no provenance
+  attestation. Verifying it, or any earlier release, fails because there is nothing to verify, not
+  because it was tampered with. Signing is also best effort: it is a separate job that cannot block
+  or undo a release, and whether the public registry accepts the signature artifacts has not been
+  confirmed (see [RELEASING.md](../RELEASING.md#image-signatures-and-provenance)). So a signed image
+  is not guaranteed even from a later release. Verify the digest you will run, and treat a failed
+  verification as "unsigned", not as proof of tampering and not as a clean bill of health.
+- **What is not signed.** Signing and provenance cover the container images. The Helm chart has
+  neither; each release publishes it with a SHA-256 checksum file, and you can read its templates
   in [`charts/mkonnect`](../charts/mkonnect).
 - **Code checks.** This repository's CI runs the Go tests with the race detector, `staticcheck` and
   `govulncheck` on changes.
