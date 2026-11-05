@@ -59,7 +59,13 @@ type syncResult struct {
 	State       string
 	ErrorType   string
 	ErrorDetail string
-	Warnings    []string
+	// OriginCredentialRejected says the origin refused the provider credential itself during the fetch
+	// (not a repository the credential cannot see): the failure is shared by every repository that uses
+	// it, so the scheduler holds them back together (see providerGates). It is never set for a provider
+	// without a credential, where the same message only means the repository is private. It is internal
+	// and not reported.
+	OriginCredentialRejected bool
+	Warnings                 []string
 	// WarningsUndecided says this attempt could not determine its warnings (see detectLFS), so
 	// finishSync keeps the previous attempt's rather than reporting none.
 	WarningsUndecided bool
@@ -157,7 +163,8 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 			return syncResult{State: StatePending}
 		}
 		typ, detail := classifyGitFailure(originSide, err, stderr, false)
-		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
+		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail,
+			OriginCredentialRejected: typ == ErrOriginAccessDenied && t.Origin.Auth != "" && originCredentialRejected(stderr)}
 	}
 
 	// Never prune the replica from a mirror with nothing to send: an origin that advertises no

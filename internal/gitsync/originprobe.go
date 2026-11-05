@@ -63,7 +63,7 @@ func (c *Client) maybeProbe() {
 		return
 	}
 	c.lastProbe.Store(start)
-	entries := c.providers.entries()
+	targets := c.providers.probeTargets()
 	epoch := c.providerEpoch
 	probeCtx, cancel := context.WithCancel(ctx)
 	c.probeCancel = cancel
@@ -80,7 +80,7 @@ func (c *Client) maybeProbe() {
 				c.maybeProbe()
 			}
 		}()
-		res, ok := c.runProbe(probeCtx, entries)
+		res, ok := c.runProbe(probeCtx, targets)
 		// Commit only while this probe's connection is still the current one and still open, and the
 		// providers it probed are still the ones in force. A probe cut short by its connection
 		// closing, or one overtaken by a newer connection or a changed provider set, changes nothing
@@ -111,20 +111,26 @@ func (c *Client) maybeProbe() {
 	}()
 }
 
-// runProbe probes each of entries and aggregates worst-to-best (access_denied over unreachable over
-// reachable). ok is false when no provider yielded a usable result (for example git is not
+// runProbe probes each of targets and aggregates worst-to-best (access_denied over unreachable over
+// reachable). A provider whose credential the origin has just refused (see providerGates) is not
+// dialled: the check would only add another failed login every few minutes, and the answer is already
+// known. ok is false when no provider yielded a usable result (for example git is not
 // installed): a local fault, which maybeProbe logs through here and answers by leaving origin_check
 // absent. A provider that faults while another yields a result is skipped, so the aggregate covers
 // only the providers that could be checked. A probe whose context ended says nothing and logs nothing.
-func (c *Client) runProbe(ctx context.Context, entries []LocalEntry) (OriginResult, bool) {
+func (c *Client) runProbe(ctx context.Context, targets []probeTarget) (OriginResult, bool) {
 	rank := map[OriginResult]int{OriginReachable: 0, OriginUnreachable: 1, OriginAccessDenied: 2}
 	worst := OriginReachable
 	any := false
-	for _, e := range entries {
+	for _, t := range targets {
 		if ctx.Err() != nil {
 			return "", false
 		}
-		res, err := c.prober.Probe(ctx, e)
+		res := OriginAccessDenied
+		var err error
+		if !c.sched.gates.held(t.bind) {
+			res, err = c.prober.Probe(ctx, t.entry)
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("origin reachability check could not run", "err", err)

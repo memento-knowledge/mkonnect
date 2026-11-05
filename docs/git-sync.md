@@ -730,8 +730,10 @@ The platform sends no timer, so git-sync re-syncs every repository on its own sc
   previous sync, a slow repository is never synced back to back.
 - **Immediate syncs.** An accepted configuration (the platform may re-send it, for example to renew
   push tokens) and an immediate-sync request from Memento both start a sync at once, whatever the
-  schedule or the backoff below says. If the repository is already syncing, one more sync follows
-  when it ends, however many requests arrived.
+  schedule or the backoff below says, except that a credential the origin has just refused holds
+  back the repositories that use it (see [A rejected credential holds back every repository that
+  uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it)). If the repository is
+  already syncing, one more sync follows when it ends, however many requests arrived.
 - **The platform can change the interval.** The configuration it sends may carry an interval from
   60 seconds to 24 hours; one that omits it gets the 15-minute default. A new interval applies
   without a restart. A value outside the range rejects the whole configuration with
@@ -771,6 +773,41 @@ Three failure types wait the longest delay straight away, from the **first** fai
 `origin_access_denied`, `credential_rejected`, and `push_token_expired` (at least one hour, or the
 interval if that is longer, plus the extra). Retrying sooner cannot succeed until a credential or the
 configuration changes, and repeated failed logins can lock a service account out.
+
+#### A rejected credential holds back every repository that uses it
+
+Your git server credential belongs to a provider, not to a repository. When the origin refuses the
+credential itself (HTTP 401, `Authentication failed`, or a request for a credential that git-sync
+had none to give), retrying from every repository only adds failed logins to the service account's
+history. So git-sync holds back **all repositories that use that provider's credential**, not just
+the one that failed:
+
+- For an hour from the rejection (the interval, if that is longer), nothing that uses the credential
+  is started: not a scheduled sync, and not a sync that a configuration or a restart had queued
+  behind the one that failed. A held-back repository keeps its last reported state and starts again
+  by itself.
+- When the hour is over, **one** repository tries, preferring one that has not just failed. If the
+  origin accepts the credential, the others resume at once; if it refuses it again, they wait
+  another hour from that refusal. The waits do not add up.
+- A repository's own failures stay its own. A 403 or a 404 (`origin_access_denied` for a repository
+  the credential cannot see), `origin_unreachable`, and the replica-side errors do not hold back
+  other repositories, and neither does a provider without a credential. Some git servers answer 401
+  for a repository the credential cannot access; if one repository does that, it holds back the
+  others on its provider until its access is fixed.
+- A **new credential** in the provider configuration lifts the hold straight away (see
+  [Reloading the provider configuration](#reloading-the-provider-configuration)), as does any sync
+  that succeeds. Rotating a different provider's credential changes nothing here.
+- An **immediate sync** from Memento for one repository is still tried once, at most once a minute
+  per repository. A request for all repositories at once starts none of the held-back ones.
+- The log says `origin rejected the provider credential` when the hold starts, `sync deferred` for a
+  sync it stopped, `probing a provider credential the origin refused` for the one retry, and
+  `provider credential accepted again` when it ends.
+
+The hold is kept in memory, like the rest of the backoff. After a restart each repository may try
+once, but a sync still waiting for a free slot when the first rejection comes back is stopped. The
+reachability check shown in the portal (see [Verify](#verify)) uses the same credential every few
+minutes, so it is held back too: while a credential is held it reports `access_denied` for that
+provider without contacting the server.
 
 A successful sync clears the backoff. A repository whose origin or replica changes in a new
 configuration starts again with a fresh schedule; a configuration that leaves them unchanged (for
@@ -1034,7 +1071,7 @@ clears the error.
 
 | Symptom or error type | Likely cause and fix |
 |---|---|
-| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
+| `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. When the server refused the credential itself (401), the other repositories of that provider wait too; see [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it). It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. |
 | `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |

@@ -38,11 +38,24 @@ type schedEnv struct {
 	clock   *schedClock
 	fetches atomic.Int32
 	failing atomic.Bool
-	gate    atomic.Pointer[chan struct{}]
-	ctx     context.Context
+	// failStatus is the HTTP status a failing fetch reports; zero means 403.
+	failStatus atomic.Int32
+	gate       atomic.Pointer[chan struct{}]
+	ctx        context.Context
+	// providerPath is the provider configuration file the client was started from.
+	providerPath string
+	// limits, when set, is sent as the configuration's "limits" object.
+	limits string
 }
 
+const schedProviderJSON = `{"origin":{"base_url":"https://git.example.com/"}}`
+
 func newSchedEnv(t *testing.T, now func() time.Time) *schedEnv {
+	t.Helper()
+	return newSchedEnvProviders(t, now, schedProviderJSON)
+}
+
+func newSchedEnvProviders(t *testing.T, now func() time.Time, providerJSON string) *schedEnv {
 	t.Helper()
 	e := &schedEnv{clock: &schedClock{t: schedT0}}
 	if now == nil {
@@ -61,15 +74,20 @@ func newSchedEnv(t *testing.T, now func() time.Time) *schedEnv {
 			}
 		}
 		if e.failing.Load() {
-			return []byte("fatal: unable to access 'https://git.example.com/group/repo-a/': The requested URL returned error: 403"), errExit
+			status := e.failStatus.Load()
+			if status == 0 {
+				status = 403
+			}
+			return []byte(fmt.Sprintf("fatal: unable to access 'https://git.example.com/group/repo-a/': The requested URL returned error: %d", status)), errExit
 		}
 		return nil, nil
 	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "git-sync.json")
-	if err := os.WriteFile(path, []byte(`{"origin":{"base_url":"https://git.example.com/"}}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(providerJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	e.providerPath = path
 	local, err := New(path)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +119,11 @@ func (e *schedEnv) configure(replicaSuffix string, ids ...string) {
 	for i, id := range ids {
 		repos[i] = fmt.Sprintf(`{"repo_id":%q,"origin_url":"https://git.example.com/group/%s.git","replica_push_url":"https://replica.example.com/r/%s%s.git","push_token":"push-token-abcdefghij"}`, id, id, id, replicaSuffix)
 	}
-	raw := `{"type":"git_sync_config","config_version":1,"repositories":[` + strings.Join(repos, ",") + `]}`
+	limits := ""
+	if e.limits != "" {
+		limits = `"limits":` + e.limits + `,`
+	}
+	raw := `{"type":"git_sync_config","config_version":1,` + limits + `"repositories":[` + strings.Join(repos, ",") + `]}`
 	e.c.HandleMessage(e.ctx, schedStubSender{}, "git_sync_config", []byte(raw))
 }
 

@@ -125,7 +125,7 @@ func (h *schedHarness) taskFor(id string) syncTask {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	k := h.repos[id]
-	return syncTask{RepoID: id, CanonicalURL: k.canonicalURL, ReplicaURL: k.replicaURL}
+	return syncTask{RepoID: id, CanonicalURL: k.canonicalURL, ReplicaURL: k.replicaURL, Bind: k.bind}
 }
 
 func (h *schedHarness) complete(id string, res syncResult) {

@@ -55,7 +55,8 @@ type schedHooks struct {
 	// interval applies at once.
 	limits func() Limits
 	// now returns the current time. For production it must be time.Now unmodified, so due times keep
-	// their monotonic reading and survive a wall-clock step.
+	// their monotonic reading and survive a wall-clock step. now and limits are also called by the
+	// claim check, with the client's lock held, so they must never take it.
 	now func() time.Time
 	// rand returns a value in [0, 1) for jitter and staggering.
 	rand func() float64
@@ -90,7 +91,8 @@ type schedEntry struct {
 // One goroutine ticks; each tick starts the repositories whose next-due time has passed. The next
 // run of a repository is its last completion plus the interval (with jitter); consecutive failures
 // stretch it (see backoffFloor). A repository that is already syncing is skipped, never queued
-// behind itself.
+// behind itself. The repositories that share a credential the origin refused are held back together
+// (see providerGates).
 //
 // The mutex is held while hooks.enqueue runs, so a dispatch and the entry update that follows it
 // are atomic with respect to a completion. The lock order is always scheduler -> client/manager,
@@ -103,10 +105,14 @@ type scheduler struct {
 	mu           sync.Mutex
 	entries      map[string]*schedEntry
 	wasSuspended bool
+
+	// gates holds back the repositories of a credential the origin refused; see providerGates. It has
+	// its own lock, below mu in the lock order, so the manager's claim check can reach it too.
+	gates *providerGates
 }
 
 func newScheduler(h schedHooks) *scheduler {
-	return &scheduler{hooks: h, tick: schedulerTick, entries: map[string]*schedEntry{}}
+	return &scheduler{hooks: h, tick: schedulerTick, entries: map[string]*schedEntry{}, gates: newProviderGates()}
 }
 
 // start runs the scheduling loop until ctx is cancelled or the returned stop is called. stop waits
@@ -155,6 +161,13 @@ func (s *scheduler) reconcile() {
 		}
 		s.entries[id] = &schedEntry{key: want[id], base: now, r: s.draw(), staggered: true}
 	}
+	// A replaced credential is a new binding, so its repositories never see the old gate; this only
+	// stops the gates of bindings nothing uses from piling up.
+	inUse := make(map[binding]struct{}, len(want))
+	for _, k := range want {
+		inUse[k.bind] = struct{}{}
+	}
+	s.gates.retain(inUse, want)
 }
 
 // completed records a finished sync. A cancelled sync (State pending) says nothing about the
@@ -171,18 +184,30 @@ func (s *scheduler) completed(repoID string, t syncTask, res syncResult) {
 		return
 	}
 	success := res.State == StateOK
+	now := s.hooks.now()
 	if success {
 		e.failures, e.lastErr = 0, ""
+		if s.gates.succeeded(e.key.bind, res.Stats.StartedAt) {
+			slog.Info("provider credential accepted again; its repositories resume", "repo_id", repoID)
+		}
 	} else {
 		e.failures++
 		e.lastErr = res.ErrorType
+		if res.OriginCredentialRejected {
+			tier := max(effectiveInterval(s.hooks.limits()), backoffCap)
+			if s.gates.arm(e.key.bind, now, tier) {
+				slog.Info("origin rejected the provider credential again; its repositories keep waiting", "repo_id", repoID, "retry_after", tier)
+			} else {
+				slog.Warn("origin rejected the provider credential; its other repositories wait before retrying", "repo_id", repoID, "retry_after", tier)
+			}
+		}
 	}
 	// The first sync after configuration is the immediate one the configuration triggered. Its
 	// success keeps the staggered spread, so repositories configured together do not fall due
 	// together just because their first syncs finished at similar times.
 	e.staggered = success && !e.synced
 	e.synced = true
-	e.base, e.r = s.hooks.now(), s.draw()
+	e.base, e.r = now, s.draw()
 }
 
 // poll starts every repository that is due. While syncing is suspended it does nothing at all: it
@@ -210,15 +235,51 @@ func (s *scheduler) poll(ctx context.Context) {
 		}
 		due = s.dueIDs(now, l)
 	}
+	// A repository whose credential the origin refused waits for the gate. When the gate has elapsed
+	// the repositories behind it are candidates for its single probe, tried after the rest.
+	var halfOpen []string
 	for _, id := range due {
-		if s.hooks.enqueue(ctx, id) {
-			slog.Debug("scheduled sync started", "repo_id", id)
-			// Measure from the dispatch until the run reports, so a run that never does (it was
-			// released, or cancelled) is not dispatched again on every tick.
-			e := s.entries[id]
-			e.base, e.r, e.notBefore = now, s.draw(), time.Time{}
+		switch s.gates.state(s.entries[id].key.bind, now) {
+		case gateClosed:
+			continue
+		case gateHalfOpen:
+			halfOpen = append(halfOpen, id)
+			continue
 		}
+		s.dispatch(ctx, id, now, nil)
 	}
+	// Prefer a repository that has not itself just failed: if the credential is fine and the rejection
+	// was about one repository, the probe that succeeds is what releases the others.
+	slices.SortStableFunc(halfOpen, func(a, b string) int { return s.entries[a].failures - s.entries[b].failures })
+	for _, id := range halfOpen {
+		b := s.entries[id].key.bind
+		if s.gates.state(b, now) != gateHalfOpen {
+			continue // a probe on this credential was already started this tick
+		}
+		window := effectiveInterval(l)
+		undo := s.gates.beginProbe(b, id, now, window)
+		if !s.dispatch(ctx, id, now, undo) {
+			continue
+		}
+		slog.Info("probing a provider credential the origin refused", "repo_id", id)
+	}
+}
+
+// dispatch starts a scheduled sync of id and reports whether the manager did. If it did not, undo (if
+// any) takes back what was granted for it.
+func (s *scheduler) dispatch(ctx context.Context, id string, now time.Time, undo func()) bool {
+	if !s.hooks.enqueue(ctx, id) {
+		if undo != nil {
+			undo()
+		}
+		return false
+	}
+	slog.Debug("scheduled sync started", "repo_id", id)
+	// Measure from the dispatch until the run reports, so a run that never does (it was released, or
+	// cancelled) is not dispatched again on every tick.
+	e := s.entries[id]
+	e.base, e.r, e.notBefore = now, s.draw(), time.Time{}
+	return true
 }
 
 // dueIDs returns, sorted, the repositories whose next run is at or before now. Only those are
@@ -245,6 +306,42 @@ func (s *scheduler) nextDue(repoID string) (time.Time, bool) {
 	}
 	return e.due(l), true
 }
+
+// admitManual reports whether an immediate-sync request for repoID may start a sync now, and if its
+// provider's gate is closed grants the one pass that lets exactly that sync claim (see
+// providerGates.admitManual). A repository the scheduler does not know is not held back. The request
+// is not a dispatch, so it neither advances the repository's schedule nor is held to it.
+func (s *scheduler) admitManual(repoID string) bool {
+	s.mu.Lock()
+	e, ok := s.entries[repoID]
+	var b binding
+	if ok {
+		b = e.key.bind
+	}
+	s.mu.Unlock()
+	if !ok {
+		return true
+	}
+	admitted := s.gates.admitManual(b, repoID, s.hooks.now())
+	if !admitted {
+		slog.Warn("immediate sync not started: the provider credential was rejected and this repository was just let through once", "repo_id", repoID)
+	}
+	return admitted
+}
+
+// mayClaim reports whether repoID may start a sync with the credential b now: it may unless that
+// credential's gate is closed and the repository has no pass. The manager asks as a sync claims its
+// task, so a sync that waited for a slot sees a rejection that arrived while it waited.
+func (s *scheduler) mayClaim(repoID string, b binding) bool {
+	if !s.gates.claim(b, repoID, s.hooks.now(), effectiveInterval(s.hooks.limits())) {
+		slog.Info("sync deferred: the provider credential was rejected by the origin", "repo_id", repoID)
+		return false
+	}
+	return true
+}
+
+// releasePass drops the pass of a repository whose sync did not run.
+func (s *scheduler) releasePass(repoID string) { s.gates.dropPass(repoID) }
 
 // draw returns a random value in [0, 1), whatever the source returns.
 func (s *scheduler) draw() float64 {

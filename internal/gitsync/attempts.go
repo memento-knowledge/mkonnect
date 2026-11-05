@@ -94,6 +94,12 @@ func (c *Client) claimTask(parent context.Context, repoID string) (syncTask, con
 		slog.Error("refusing to sync: an attempt is already running for the repository", "repo_id", repoID)
 		return syncTask{}, nil, false
 	}
+	// A credential the origin refused holds back every repository that uses it, including the syncs a
+	// configuration queued behind this one. Checked here, where the sync starts, not when it was
+	// queued, and last, so a refusal above does not use up a repository's pass.
+	if !c.sched.mayClaim(repoID, r.bind) {
+		return syncTask{}, nil, false
+	}
 	ctx, cancel := context.WithCancelCause(parent)
 	c.attempts[repoID] = &attempt{seq: task.AttemptSeq, bind: r.bind, cancel: cancel, done: make(chan struct{})}
 	return task, ctx, true

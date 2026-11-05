@@ -490,6 +490,7 @@ func (c *Client) beginSync(repoID string) {
 
 // releaseSync clears repoID's syncing mark for a sync that did not run, recording nothing.
 func (c *Client) releaseSync(repoID string) {
+	c.sched.releasePass(repoID)
 	c.setSyncing(repoID, false)
 }
 
@@ -720,6 +721,12 @@ func (c *Client) handleSyncNow(msg proto.GitSyncNowMsg) []string {
 	targets := c.syncTargets(msg.RepoID)
 	if msg.RepoID != "" && len(targets) == 0 {
 		slog.Warn("git_sync_now for a repository that cannot be synced", "repo_id", msg.RepoID)
+		return nil
+	}
+	// A request for one repository gets one attempt even while its provider's credential is held back
+	// (rate-limited per repository). A request for all of them does not: it cannot be told apart from
+	// a loop, and each repository on a held-back credential would cost the origin a failed login.
+	if msg.RepoID != "" && !c.sched.admitManual(msg.RepoID) {
 		return nil
 	}
 	slog.Info("git_sync_now received", "repo_count", len(targets))
