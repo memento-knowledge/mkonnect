@@ -241,3 +241,47 @@ func writeTemp(t *testing.T, body string) string {
 	}
 	return path
 }
+
+func TestReadConfigLooseFileOnAReadOnlyFilesystem(t *testing.T) {
+	body := `{"a": {"base_url": "https://a.example.test/", "auth": "bearer", "token": "tok-0123456789abcdef"}}`
+	path := writeTemp(t, body) // mode 0644: wider than the connector accepts, owned by this user
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name     string
+		readOnly bool
+		wantFail bool
+	}{
+		{"writable file system: the connector tightens it, so a warning only", false, false},
+		{"read-only file system: the connector cannot tighten it and refuses it", true, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			prev := onReadOnlyFS
+			onReadOnlyFS = func(string) bool { return tt.readOnly }
+			t.Cleanup(func() { onReadOnlyFS = prev })
+
+			cfg := ReadConfig(path)
+			if tt.wantFail {
+				if len(cfg.Report.Issues) != 1 || cfg.Report.Issues[0].Class != IssueFile {
+					t.Fatalf("issues = %+v, want one file issue", cfg.Report.Issues)
+				}
+				p := &fakeProber{}
+				if out := cfg.ProbeOrigins(context.Background(), p); out != nil || len(p.seen) != 0 {
+					t.Error("a refused configuration must not be probed")
+				}
+				return
+			}
+			if len(cfg.Report.Issues) != 0 || len(cfg.Report.Warnings) != 1 {
+				t.Errorf("issues=%v warnings=%v, want only the mode warning", cfg.Report.Issues, cfg.Report.Warnings)
+			}
+		})
+	}
+}
+
+func TestOnReadOnlyFSIsFalseForAWritableDirectory(t *testing.T) {
+	if onReadOnlyFS(writeTemp(t, "{}")) {
+		t.Error("a file in a writable temp directory is not on a read-only file system")
+	}
+}

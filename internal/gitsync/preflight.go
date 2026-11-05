@@ -47,18 +47,37 @@ func ReadConfig(path string) LoadedConfig {
 }
 
 // cannotTighten reports whether the connector's attempt to chmod the config file to 0600 would
-// fail: it needs to own the file (or be root) and the file system must not be read-only.
+// fail: it needs to own the file (or be root) and the file system must not be read-only. When that
+// cannot be established it says the file cannot be tightened: a loose file that might be refused is
+// reported as refused rather than waved through.
 func cannotTighten(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
-		return false
+		return true
 	}
 	if euid := effectiveUID(); euid != 0 {
 		if uid, ok := fileOwnerUID(info); !ok || uid != euid {
 			return true
 		}
 	}
-	return unix.Access(path, unix.W_OK) == unix.EROFS
+	return onReadOnlyFS(path)
+}
+
+// readOnlyMountFlag is the bit of statfs's flags that marks a read-only mount: ST_RDONLY on Linux
+// and MNT_RDONLY on macOS and the BSDs, both 1.
+const readOnlyMountFlag = 1
+
+// onReadOnlyFS reports whether path is on a read-only file system or mount (a read-only bind mount, a
+// Kubernetes Secret volume, or `docker run --read-only` with the file in the image). It asks two ways,
+// because neither alone is definitive: access(2) reports EROFS for a write check on such a path, and
+// statfs carries the mount's own read-only flag. It is a variable so a test can stand in for a
+// read-only mount.
+var onReadOnlyFS = func(path string) bool {
+	if unix.Access(path, unix.W_OK) == unix.EROFS {
+		return true
+	}
+	var st unix.Statfs_t
+	return unix.Statfs(path, &st) == nil && uint64(st.Flags)&readOnlyMountFlag != 0
 }
 
 // CanCreateDir reports whether the connector's user could create path as a directory: its nearest
