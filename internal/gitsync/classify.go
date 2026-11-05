@@ -157,6 +157,26 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	return ErrUnclassified, rawDetail(err, stderr)
 }
 
+// credentialMarkers are the git messages that say the credential itself was refused or was not
+// supplied. "403 forbidden" is deliberately absent: a forge answers 403 (and 404) for a repository a
+// valid credential cannot reach, which is that repository's problem and not the credential's.
+var credentialMarkers = []string{
+	"authentication failed", "could not read username", "could not read password",
+	"terminal prompts disabled", "401 unauthorized", "http basic: access denied",
+}
+
+// originCredentialRejected reports whether the stderr of a failed origin invocation says the credential
+// was refused, which is what the repositories sharing it have in common (see providerGates). Only
+// git's own lines count: a "remote:" line is text the origin chose. A failure that does not say so
+// reads as false, which leaves the repository to its own backoff.
+func originCredentialRejected(stderr []byte) bool {
+	s := localLines(matchText(stderr))
+	if m := httpStatusRE.FindStringSubmatch(s); m != nil && m[1] == "401" {
+		return true
+	}
+	return containsAny(s, credentialMarkers)
+}
+
 // scrubRefLines removes what a remote controls but is not an explanation: the "To <url>" / "From
 // <url>" header lines, and the ref names in per-ref status lines. A rejected ref keeps its status
 // and git's parenthesised reason (" ! [remote rejected] main -> main (hook declined)" becomes
