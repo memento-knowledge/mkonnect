@@ -102,7 +102,7 @@ error, the release most likely has no git-sync image.
 Releases after the one that introduced signing carry a [Sigstore](https://docs.sigstore.dev/cosign/signing/overview/)
 signature on the image digest, made by this repository's release workflow, and a build provenance
 attestation. Signing is best effort, so a release can have an image without them: verification
-tells you which. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or
+tells you which. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3.1 or
 newer:
 
 ```bash
@@ -115,7 +115,7 @@ cosign verify "public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
   --certificate-github-workflow-trigger push
 ```
 
-or, for the provenance, with the GitHub CLI (it does not need the registry to hold a signature):
+or, for the provenance, with the GitHub CLI 2.49 or newer (it does not need the registry to hold a signature):
 
 ```bash
 gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \

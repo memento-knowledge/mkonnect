@@ -35,7 +35,12 @@ run() {
   rm -f "$tmpdir/state"
   COSIGN="$tmpdir/cosign" FAKE_LOG="$tmpdir/log" FAKE_STATE="$tmpdir/state" "$@" 2>"$tmpdir/stderr"
 }
-fail() { printf 'FAIL: %s\n' "$*" >&2; sed 's/^/  log: /' "$tmpdir/log" >&2; exit 1; }
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  sed 's/^/  log: /' "$tmpdir/log" >&2
+  sed 's/^/  stderr: /' "$tmpdir/stderr" >&2
+  exit 1
+}
 count() { grep -c -- "$1" "$tmpdir/log" || true; }
 
 # Not yet signed: verify (fails), sign, verify (passes).

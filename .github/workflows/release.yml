@@ -485,7 +485,8 @@ jobs:
   # registry feature) must never block or undo a release, so the job is marked continue-on-error with
   # a timeout and runs after the GitHub Release is published. It signs the digests the earlier jobs
   # exported (never a tag), and each image is signed in its own step, so a failure to sign one does not
-  # stop the other. The git-sync image is signed only when its job exported a well-formed digest for the
+  # stop the other. Provenance is attested independently of the signatures, so a registry that refuses
+  # the signature artifacts still leaves provenance in GitHub's store. The git-sync image is signed only when its job exported a well-formed digest for the
   # expected repository, exactly the condition under which the publish job records it as published.
   # See RELEASING.md ("Image signatures and provenance").
   sign-images:
@@ -582,6 +583,7 @@ jobs:
         if: always()
         env:
           RESULTS: >-
+            image-selection=${{ steps.images.outcome }}:true
             connector-signature=${{ steps.sign_connector.outcome }}:${{ steps.images.outputs.connector_digest != '' }}
             gitsync-signature=${{ steps.sign_gitsync.outcome }}:${{ steps.images.outputs.gitsync_digest != '' }}
             connector-provenance=${{ steps.attest_connector.outcome }}:${{ steps.images.outputs.connector_digest != '' }}
@@ -594,6 +596,6 @@ jobs:
             outcome=${r#*=}; outcome=${outcome%%:*}
             wanted=${r##*:}
             if [ "$wanted" = true ] && { [ "$outcome" = failure ] || [ "$outcome" = skipped ]; }; then
-              echo "::warning::$name did not complete ($outcome). The release itself is not affected; see RELEASING.md (Image signatures and provenance)."
+              echo "::warning::$name did not complete ($outcome). The release itself is not affected; see RELEASING.md (Image signatures and provenance) for what this means for consumers."
             fi
           done

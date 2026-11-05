@@ -59,10 +59,16 @@ verify() {
     --certificate-github-workflow-trigger push >/dev/null
 }
 
-if verify 2>/dev/null; then
+precheck=$(mktemp)
+trap 'rm -f "$precheck"' EXIT
+if verify 2>"$precheck"; then
   printf 'already signed by this workflow identity: %s\n' "$ref"
   exit 0
 fi
+# Not (verifiably) signed yet. Show why, so a transient failure of the check is not mistaken for
+# an unsigned image in the log.
+printf 'no valid signature found before signing (this is expected for a new release); cosign said:\n' >&2
+sed 's/^/  /' "$precheck" >&2
 
 printf 'signing %s\n' "$ref"
 "$cosign" sign --yes "$ref"
