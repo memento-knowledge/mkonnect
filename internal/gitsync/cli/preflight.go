@@ -181,8 +181,8 @@ func tally(results []checkResult) map[checkStatus]int {
 func printPreflight(w io.Writer, results []checkResult, counts map[checkStatus]int) {
 	fmt.Fprintln(w, "=== git-sync preflight ===")
 	fmt.Fprintf(w, "  Checked as uid %d, with this process's environment. No connector data or token is sent to the Memento\n", os.Geteuid())
-	fmt.Fprintln(w, "  platform, and no credential is sent anywhere but to the git server it belongs to. The platform sees only")
-	fmt.Fprintln(w, "  a body-less request to the gateway and an unauthenticated request to the replica host.")
+	fmt.Fprintln(w, "  platform, and no credential is sent anywhere but to the git server it belongs to. The only requests made")
+	fmt.Fprintln(w, "  are a body-less one to the gateway and an unauthenticated one to the pinned replica host.")
 	fmt.Fprintln(w)
 	for _, r := range results {
 		label := strings.ToUpper(string(r.Status))

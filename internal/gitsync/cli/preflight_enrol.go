@@ -68,6 +68,11 @@ func checkKeyFile() (res checkResult, state enrolment) {
 	case err == nil && found:
 		r.Status = statusPass
 		r.Detail = fmt.Sprintf("%s holds the signing key, and only its owner can access it: this connector is already enrolled", path)
+		if !filepath.IsAbs(path) {
+			r.Status = statusWarn
+			r.Detail += fmt.Sprintf("; %s is a relative path, resolved against the working directory of whatever runs this check, which may not be the connector's", gitsync.KeyFileEnv)
+			r.Remedy = "set " + gitsync.KeyFileEnv + " to an absolute path"
+		}
 		if owner, ok := fileOwner(path); ok && owner != os.Geteuid() {
 			r.Status = statusWarn
 			r.Detail = fmt.Sprintf("%s holds the signing key (this connector is already enrolled), but it is owned by uid %d, not by uid %d, who ran this check; the connector can read it only if it runs as its owner", path, owner, os.Geteuid())
@@ -80,6 +85,12 @@ func checkKeyFile() (res checkResult, state enrolment) {
 		r.Detail = fmt.Sprintf("%s exists but other users can access it: the connector refuses a signing key that is not owner-only, and cannot connect", path)
 		r.Remedy = "run `chmod 600` on it as its owner and do not delete it (see \"Restoring the key file mode\" in the git-sync guide), then run preflight again; preflight does not change it"
 		return r, enrolled
+	case errors.Is(err, syscall.ENOTDIR):
+		// A path component is a file: no key can exist there, and none can be saved.
+		r.Status = statusFail
+		r.Detail = fmt.Sprintf("%s cannot exist: a directory in its path is a file, so no signing key can be saved there", path)
+		r.Remedy = "check " + gitsync.KeyFileEnv + " for a typo, and point it at a file inside a directory on a persistent writable volume"
+		return r, notEnrolled
 	case errors.Is(err, fs.ErrPermission):
 		r.Status = statusFail
 		r.Detail = fmt.Sprintf("%s cannot be read by uid %d, so whether the connector is enrolled is not known", path, os.Geteuid())
@@ -159,16 +170,12 @@ func keyProbeVerdict(err error, dir string) (checkStatus, string, string) {
 // checkRegistrationToken judges where the connector would get its one-time registration token. It
 // applies the daemon's own rules to REGISTRATION_TOKEN_FILE (absolute path, regular file, at most
 // group read, within the size limit, not empty), which the daemon enforces at every start, so a
-// bad file fails even for a connector that is already enrolled. A key that cannot be judged leaves
-// enrolment unknown, and the check is skipped. Whether the token is accepted is
+// bad file fails even for a connector that is already enrolled, and whether or not the key could be
+// judged. A key that cannot be judged leaves enrolment unknown: a usable setting is then skipped,
+// because whether a token is needed is not known. Whether the token is accepted is
 // the gateway's to say at registration and is never asked here.
 func checkRegistrationToken(state enrolment) checkResult {
 	r := checkResult{ID: "registration-token"}
-	if state == enrolmentUnknown {
-		r.Status = statusSkip
-		r.Detail = "not checked: whether the connector is enrolled is not known (see key-file)"
-		return r
-	}
 	src, err := config.CheckRegistrationToken()
 	switch {
 	case err != nil:
@@ -186,6 +193,10 @@ func checkRegistrationToken(state enrolment) checkResult {
 			r.Detail = "REGISTRATION_TOKEN_FILE is not usable: the connector would not start"
 			r.Remedy = "it must be an absolute path to a regular file of at most 4096 bytes that is not empty, readable only by its owner (mode 0600), or also by its group (0640 or 0440): no access for others and no write for the group"
 		}
+	case state == enrolmentUnknown:
+		// The file is sound, but whether it is needed depends on a key that could not be judged.
+		r.Status = statusSkip
+		r.Detail = "not fully checked: whether the connector is enrolled is not known (see key-file), so whether a token is needed is not known; the token settings themselves are usable"
 	case state == enrolled && src == config.RegistrationTokenNone:
 		r.Status = statusPass
 		r.Detail = "no registration token is configured, and none is needed: the connector is already enrolled"

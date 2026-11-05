@@ -411,12 +411,13 @@ host.
 A check that cannot run because an earlier one failed is shown as `SKIP`, with the reason; a
 skipped check is not a pass. The origin checks are skipped while `git`, `tmpdir` or
 `provider-config` fails, because the probe needs all three; `replica-https` needs `git` and `tmpdir`
-and a valid pin, and is skipped while the replica's name does not resolve. `registration-token` is
-skipped when the key file cannot be judged, because whether the connector is enrolled is then not
-known.
+and a valid pin, and is skipped while the replica's name does not resolve. When the key file
+cannot be judged, `registration-token` still reports an unusable token file, but is otherwise
+skipped, because whether a token is needed is then not known. The replica checks are skipped
+while the pin or the proxy settings are not valid.
 
-**What it does not do.** It does not enrol, register, authenticate to the gateway, send connector
-data, or contact the Memento replica, and it is not a dry-run sync. Its only request to the platform
+**What it does not do.** It does not enrol, register, authenticate to the gateway or send connector
+data, and it is not a dry-run sync. Its only request to the platform
 is the body-less `HEAD` described above, and the unauthenticated request to the replica host
 described in the table. It does not check with the platform that the connector ID or the
 registration token is valid. Whether the connector can push to the replica is reported by

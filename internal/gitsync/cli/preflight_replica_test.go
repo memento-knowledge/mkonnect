@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -152,6 +153,33 @@ func TestPreflightReplicaSkipsAndDNS(t *testing.T) {
 			t.Errorf("detail: %q", c.Detail)
 		}
 	})
+}
+
+func TestPreflightReplicaThroughAProxy(t *testing.T) {
+	readyEnv(t)
+	proxy, _ := url.Parse("http://proxy.example.net:3128")
+	t.Cleanup(cli.SetPreflightEnvForTest(nil, func() *http.Transport {
+		tr := cli.GatewayTransportForTest()
+		tr.Proxy = func(*http.Request) (*url.URL, error) { return proxy, nil }
+		return tr
+	}, func(context.Context, string) ([]string, error) {
+		t.Error("the name must not be looked up when a proxy applies")
+		return nil, nil
+	}))
+	p := &scriptedReplica{result: gitsync.OriginReachable}
+	t.Cleanup(cli.SetReplicaProberForTest(p))
+	doc, out, _ := runPreflightJSON(t)
+	dns := wantStatus(t, doc, "replica-dns", "pass")
+	if !strings.Contains(dns.Detail, "proxy.example.net:3128") {
+		t.Errorf("replica-dns detail: %q", dns.Detail)
+	}
+	https := wantStatus(t, doc, "replica-https", "pass")
+	if !strings.Contains(https.Detail, "through the proxy at proxy.example.net:3128") {
+		t.Errorf("replica-https detail: %q", https.Detail)
+	}
+	if strings.Contains(out, "user:") {
+		t.Error("proxy user information must not be shown")
+	}
 }
 
 // A real git against a local TLS server standing in for the replica: what the push stack would meet,

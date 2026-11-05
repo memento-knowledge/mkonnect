@@ -2,6 +2,8 @@ package cli_test
 
 import (
 	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -92,7 +94,6 @@ func TestPreflightConnectorID(t *testing.T) {
 }
 
 func TestPreflightRegistrationTokenFile(t *testing.T) {
-	notRoot(t)
 	tests := []struct {
 		name   string
 		file   func(t *testing.T) string
@@ -101,7 +102,8 @@ func TestPreflightRegistrationTokenFile(t *testing.T) {
 		{"owner only", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o600) }, "pass"},
 		{"group read", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o640) }, "pass"},
 		{"kubernetes secret mode", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o440) }, "pass"},
-		{"no trailing newline", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o600) }, "pass"},
+		{"trailing newline", func(t *testing.T) string { return writeTokenFile(t, testRegToken+"\n", 0o600) }, "pass"},
+		{"windows line ending", func(t *testing.T) string { return writeTokenFile(t, testRegToken+"\r\n", 0o600) }, "pass"},
 		{"world readable", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o644) }, "fail"},
 		{"group writable", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o660) }, "fail"},
 		{"world writable", func(t *testing.T) string { return writeTokenFile(t, testRegToken, 0o666) }, "fail"},
@@ -116,6 +118,9 @@ func TestPreflightRegistrationTokenFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "unreadable" {
+				notRoot(t)
+			}
 			basicsEnv(t)
 			path := tt.file(t)
 			t.Setenv("REGISTRATION_TOKEN_FILE", path)
@@ -210,21 +215,40 @@ func TestPreflightEnrolledNeedsNoToken(t *testing.T) {
 }
 
 func TestPreflightKeyFilePresent(t *testing.T) {
-	notRoot(t)
 	t.Run("owner only", func(t *testing.T) {
 		readyEnv(t)
 		path := enrolledKey(t)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
 		doc, out, err := runPreflightJSON(t)
 		wantStatus(t, doc, "key-file", "pass")
 		if err != nil {
 			t.Errorf("unexpected failure: %v", err)
 		}
-		_ = path
-		if strings.Contains(out, "PRIVATE") {
+		if strings.Contains(out, hex.EncodeToString(raw[:32])) || strings.Contains(out, base64.StdEncoding.EncodeToString(raw[:32])) {
 			t.Error("key material in the output")
 		}
 	})
-	for _, mode := range []os.FileMode{0o640, 0o644, 0o660, 0o604, 0o666, 0o604} {
+	t.Run("a relative KEY_FILE is flagged", func(t *testing.T) {
+		readyEnv(t)
+		t.Chdir(t.TempDir())
+		_, priv, err := mldsa65.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := auth.NewKeyStore("key").Save(priv); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("KEY_FILE", "key")
+		doc, _, _ := runPreflightJSON(t)
+		c := wantStatus(t, doc, "key-file", "warn")
+		if c.Remedy == nil || !strings.Contains(c.Detail, "relative") {
+			t.Errorf("detail %q remedy %v", c.Detail, c.Remedy)
+		}
+	})
+	for _, mode := range []os.FileMode{0o640, 0o644, 0o660, 0o604, 0o666} {
 		t.Run(fmt.Sprintf("mode %04o fails closed and is left alone", mode), func(t *testing.T) {
 			basicsEnv(t)
 			path := enrolledKey(t)
@@ -272,7 +296,18 @@ func TestPreflightKeyFilePresent(t *testing.T) {
 			t.Errorf("want a failure whose remedy says not to delete the key: %v %v", err, c.Remedy)
 		}
 	})
+	t.Run("a damaged key does not hide an unusable token file", func(t *testing.T) {
+		basicsEnv(t)
+		if err := os.WriteFile(os.Getenv("KEY_FILE"), []byte("not a key"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("REGISTRATION_TOKEN_FILE", filepath.Join(t.TempDir(), "absent"))
+		doc, _, _ := runPreflightJSON(t)
+		wantStatus(t, doc, "key-file", "fail")
+		wantStatus(t, doc, "registration-token", "fail")
+	})
 	t.Run("unreadable", func(t *testing.T) {
+		notRoot(t)
 		basicsEnv(t)
 		path := enrolledKey(t)
 		if err := os.Chmod(path, 0o000); err != nil {
@@ -352,7 +387,14 @@ func TestPreflightKeyDirectory(t *testing.T) {
 		}
 		t.Setenv("KEY_FILE", filepath.Join(notADir, "gitsync-key"))
 		doc, _, _ := runPreflightJSON(t)
-		wantStatus(t, doc, "key-file", "fail")
+		c := wantStatus(t, doc, "key-file", "fail")
+		if strings.Contains(c.Detail, "damaged") || !strings.Contains(c.Detail, "cannot exist") {
+			t.Errorf("a path typo must not read as a lost key: %q", c.Detail)
+		}
+		if c.Remedy != nil && strings.Contains(*c.Remedy, "registered again") {
+			t.Errorf("a path typo must not send the operator to a new token: %q", *c.Remedy)
+		}
+		wantStatus(t, doc, "registration-token", "pass")
 	})
 	t.Run("the default path is the daemon's", func(t *testing.T) {
 		basicsEnv(t)
