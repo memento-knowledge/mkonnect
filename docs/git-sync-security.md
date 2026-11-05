@@ -66,10 +66,10 @@ For each configured repository, one sync does the following:
    misbehaving origin from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
    no longer exists on your git server is removed from the replica. When the platform sets a push
-   batch size and the mirror holds more refs than that, the push is made in batches (after a
-   request that sends no data to learn what would change), and the removals are made by one final
-   push only once every batch has succeeded (see
-   [Limits the platform can send](git-sync.md#limits-the-platform-can-send)).
+   batch size and the mirror holds more refs than that, git-sync first asks the replica what a
+   push would change (a request that sends no data); if more refs than the batch size would be
+   written, they go in batches, and the removals are made by one final push only once every batch
+   has succeeded (see [Limits the platform can send](git-sync.md#limits-the-platform-can-send)).
 
 Repository data travels directly between your git server, git-sync, and the replica over HTTPS.
 The gateway tunnel carries only control messages: configuration from the platform, and status

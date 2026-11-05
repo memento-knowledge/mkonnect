@@ -41,7 +41,8 @@ appears to use LFS still syncs and stays `ok`, but its status carries the warnin
 `lfs_not_replicated`. The check is a cheap local heuristic: it looks for a `filter=lfs` rule in the
 `.gitattributes` at the root of the default branch's latest commit, so it can miss a repository
 whose rules live elsewhere and can flag one that has a rule but no LFS files. It contacts nothing
-and never fails a sync. The warning is dropped by the first sync that finds no such rule.
+and never fails a sync. The warning is dropped by the first sync that finds no such rule. It is not kept across a
+restart, so it is absent until the first sync after one, and a repository in `error` does not show it.
 
 git-sync does not decide which repositories to sync: the platform sends the full list, and
 git-sync syncs nothing until it has received one. When a repository disappears from that list, git-sync
@@ -116,7 +117,7 @@ error, the release most likely has no git-sync image.
 - **Scratch space** (`/tmp`): holds each sync's empty home directory and git's own temporary
   files, not the mirrors, so it is much smaller than the data volume. It must be backed by disk,
   not memory. It is `/tmp` unless `GIT_SYNC_TMP_DIR` (or, failing that, `TMPDIR`) names another
-  absolute path. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
+  directory, which must be an absolute path: git-sync does not start with a relative one. The Helm chart default is a `5Gi` disk-backed `emptyDir`; raise
   `gitSync.tmp.sizeLimit` if you see `local_disk_exhausted` for `/tmp`.
 - **Concurrency and memory:** by default up to four repositories sync at once; the others wait their turn
   (see [Concurrency](#concurrency)). A very large repository, or a large first sync, can exceed the
@@ -633,8 +634,8 @@ git-sync should register and connect within a few seconds.
   [Run state](#run-state)).
 - **Command line:** `connector status` prints the replica host pin as the process sees it in its
   environment, the configured providers (credentials masked), and, for each repository, when it was
-  last attempted and last succeeded, how long that took, how many refs it pushed, the newest commit
-  at your git server and its default branch. It reads the [run state](#run-state) file, so it works
+  last attempted and last succeeded, how long that took, how many refs it pushed, the time of the
+  newest commit across the branches and tags at your git server, and its default branch. It reads the [run state](#run-state) file, so it works
   while git-sync is stopped, but it cannot show a sync in progress or why an attempt failed:
   `LAST ATTEMPT` later than `LAST SUCCESS` means the latest attempt did not succeed. `--absolute`
   prints timestamps instead of "5m ago", and `--json` prints only the sync state as a JSON object
@@ -666,10 +667,10 @@ Each repository is in one of four states in the portal:
 
 | State | Meaning |
 |---|---|
-| `pending` | Configured, but no sync has started or finished yet since git-sync started, or syncing is suspended. An earlier last-success time, if there is one, is still shown. |
+| `pending` | Configured, but not synced yet: since git-sync started, or since the repository's origin, replica or credential changed. It stays `pending` while syncing is suspended. An earlier last-success time, if there is one, is still shown. |
 | `syncing` | A sync is queued or running. A repository waiting for a free slot is `syncing` too. |
 | `ok` | The last sync succeeded. It may carry a warning such as `lfs_not_replicated`. |
-| `error` | The last sync failed, with one of the types in [Troubleshooting](#troubleshooting). |
+| `error` | The last sync failed, or the repository cannot be synced at all (no provider for its host, or an unusable replica configuration), with one of the types in [Troubleshooting](#troubleshooting). |
 
 If a repository shows an error, see [Troubleshooting](#troubleshooting).
 
@@ -1057,7 +1058,7 @@ clears the error.
 | `local config load failed` mentions a `token_file` | The message names the problem and, except for the owner of the configuration file itself (`uses token_file but is owned by another user`: `chown` it to uid 65532 or `root`), the provider: `set only one of token and token_file`; `an authentication mode requires a token or a token_file`; `token_file must not be empty`; `token_file must be an absolute path`; `could not be opened` (the volume or Secret is not mounted, the path is wrong, or the file is not readable by the user running git-sync: for a Kubernetes Secret, check `fsGroup`); `is not a regular file`; `is writable by group or others` (use `0600`, `0640` or `0440`); `is owned by another user` (the owner must be uid 65532, the user running git-sync, or `root`; for a bind mount, `chown` the host file); `is empty`; `ends with a carriage return` (re-save with LF line endings); `has more than one line`; `contains control or invisible characters`; `has leading or trailing whitespace`; `is larger than the 4096-byte limit`. `connector config list`, `set`, `remove` and `status` fail the same way, so fix the file first, even to remove a provider. Run them as the user that runs git-sync: as `root` in a container (`docker exec -u 0`), files owned by uid 65532 count as owned by another user. |
 | Log warns `credential file is readable by group or other users` | Expected for a Docker secret (`0444`) or a Kubernetes Secret. Where you control the mode, tighten it to `0600`; the connector starts either way. |
 | Log warns `credential file is owned by another user` for the provider configuration | The connector starts for now, but a later release will refuse to. Make the user running git-sync (uid 65532 in the image) or `root` own the file. |
-| Start fails with `temp directory … is not writable` | The scratch directory (`GIT_SYNC_TMP_DIR`, else `TMPDIR`, else `/tmp`) is not writable by uid 65532, or is not an absolute path. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
+| Start fails with `temp directory … is not writable` or `… is not usable`, or with `GIT_SYNC_TMP_DIR must be an absolute path` | The scratch directory (`GIT_SYNC_TMP_DIR`, else `TMPDIR`, else `/tmp`) is not writable by uid 65532, cannot be created, or is a relative path. In Docker, make sure `gitsync-tmp` is a writable volume; in Kubernetes, check that the `tmp` volume is mounted. |
 | `cannot register: key directory … is not writable` | The `/data` volume is not writable by uid 65532. For a reused non-empty Docker volume, fix ownership once: `docker run --rm --user 0 --entrypoint chown -v gitsync-data:/data "$gitsync_image" -R 65532:65532 /data`. In Kubernetes, check the storage class supports `fsGroup`. |
 | After a restart, the log shows `key file has unsafe permissions 0660; require owner-only access` and the connector will not connect | Something loosened the signing key's mode, typically a Kubernetes volume whose permissions are re-applied with the pod's `fsGroup` at every mount. The chart sets `fsGroupChangePolicy: OnRootMismatch` to avoid this; if it recurs after the fix below, your storage driver ignores that setting. Restore `0600` as described in [Restoring the key file mode](#restoring-the-key-file-mode). The key itself is unchanged, so no re-registration is needed. |
 | A credential change did not take effect | git-sync reloads the provider configuration while it runs. Look in its log for `local provider configuration reloaded`, or for `the git-sync config cannot be used` with its reason (it then keeps the previous configuration). On Kubernetes the kubelet delivers an updated Secret to the pod after a delay, often a minute or more. See [Reloading the provider configuration](#reloading-the-provider-configuration). |
