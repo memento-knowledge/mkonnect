@@ -1,6 +1,7 @@
 // Package cli implements the git-sync connector's operator command line: `config set`, `list`,
-// `remove`, `check`, and `status`. It mirrors the API connector's CLI (internal/cli) — the credential comes
-// on stdin, never on the command line — but writes git-sync's own provider-keyed local config.
+// `remove`, `check`, `status`, and `preflight`. It mirrors the API connector's CLI (internal/cli) —
+// the credential comes on stdin, never on the command line — but writes git-sync's own
+// provider-keyed local config.
 package cli
 
 import (
@@ -26,15 +27,17 @@ const maxTokenBytes = 64 << 10
 // Run dispatches the git-sync operator commands. args is everything after "connector".
 func Run(args []string, stdin io.Reader, w io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: mkonnect-gitsync connector <config|status> [args...]")
+		return errors.New("usage: mkonnect-gitsync connector <config|status|preflight> [args...]")
 	}
 	switch args[0] {
 	case "config":
 		return runConfig(args[1:], stdin, w)
 	case "status":
 		return runStatus(args[1:], w)
+	case "preflight":
+		return runPreflight(args[1:], w)
 	default:
-		return fmt.Errorf("unknown command %q; use config or status", args[0])
+		return fmt.Errorf("unknown command %q; use config, status or preflight", args[0])
 	}
 }
 

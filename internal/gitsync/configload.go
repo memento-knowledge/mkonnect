@@ -422,15 +422,26 @@ type ConfigReport struct {
 // credential value. Like New it tightens the file to 0600 where it can; Warnings records the mode the
 // file had before.
 func CheckConfig(path string) ConfigReport {
-	rep := ConfigReport{Path: path}
+	warnings := modeWarnings(path)
+	return buildReport(path, loadConfig(path), warnings)
+}
+
+// modeWarnings says when the config file's mode is wider than the connector expects. It must be
+// read before a load that may tighten the file.
+func modeWarnings(path string) []string {
 	// Group read alone is tolerated (a mounted Kubernetes Secret has it); any other access beyond the
 	// owner is what readSecureFile either tightens or refuses.
 	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0o027 != 0 {
-		rep.Warnings = append(rep.Warnings, fmt.Sprintf(
+		return []string{fmt.Sprintf(
 			"the file's mode is %04o, wider than the owner-only access the connector expects (group read alone is tolerated, for mounted Secrets). The connector tightens it to 0600 where it is allowed to, and otherwise refuses a file that lets others access it.",
-			info.Mode().Perm()))
+			info.Mode().Perm())}
 	}
-	res := loadConfig(path)
+	return nil
+}
+
+// buildReport turns one load into the report CheckConfig and ReadConfig share.
+func buildReport(path string, res loadedConfig, warnings []string) ConfigReport {
+	rep := ConfigReport{Path: path, Warnings: warnings}
 	rep.Missing = res.missing
 	rep.Issues = res.issues
 	for _, name := range slices.Sorted(maps.Keys(res.entries)) {

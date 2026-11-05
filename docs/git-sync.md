@@ -341,6 +341,86 @@ and your git servers, and must pass the gateway's WebSocket upgrade. Add your cl
 addresses to `NO_PROXY` if git servers are reached directly. This is based on reading the code and
 the behaviour of git and Go; it has not been tested through every kind of proxy.
 
+## Check the host before the first start (preflight)
+
+`connector preflight` tests the things that most often keep a new installation from working, before
+you depend on the portal to tell you. It reports `PASS`, `WARN` or `FAIL` for each check with how to
+fix a problem, and exits non-zero if any check `FAIL`s. It never prints a credential.
+
+| Check | What it tests |
+|---|---|
+| `git` | `git` is on `PATH` and is version 2.31 or newer. Distribution suffixes such as `(Apple Git-154)` or `-1ubuntu1` are ignored. |
+| `tmpdir` | The temporary directory (`GIT_SYNC_TMP_DIR`, else `TMPDIR`) exists and the connector's user can create a directory and a file in it; the probe is removed. The check never creates the directory. If it does not exist yet but the connector could create it at startup, the check warns (and the origins are not checked until you create it and run preflight again); if the connector could not create it, for example under a read-only root file system, it fails: mount a writable volume there. |
+| `replica-host` | `GIT_SYNC_REPLICA_HOST` is set and well formed, judged by the same rules as at startup. Without a valid value the connector connects but rejects every configuration and never syncs. A value that is not valid is not echoed back. |
+| `gateway-url`, `gateway-dns`, `gateway-tls` | `GATEWAY_URL` is valid, its name resolves, and a TLS connection to the gateway succeeds with a trusted certificate. |
+| `provider-config` | The provider configuration is one the connector accepts (the same rules as `connector config check`, except that preflight never changes the file; `config check` tightens a loose file mode to 0600, as the connector does at startup). A file whose mode is wider than the connector accepts (anything beyond owner access plus group read) is a failure: the connector tightens such a file to 0600 at startup where it can and refuses it where it cannot, and preflight cannot tell which without changing the file, which it never does. Run `chmod 600` on it (or let `connector config check` tighten it), then run preflight again.
+| `origin:<name>` | Each configured git server answers a `git ls-remote` against its base URL, with that provider's credential, using the same code and the same locked-down git environment as the connector's own reachability check. |
+
+**The gateway check** makes one `HEAD` request to the gateway's address, with no body, no
+credential and no WebSocket upgrade, and any user information, query or fragment in `GATEWAY_URL`
+is left out. Any HTTP answer shows the path works; the gateway is expected to refuse a request that
+is not a WebSocket upgrade. It goes through `HTTPS_PROXY` and `NO_PROXY` and trusts the system
+certificate store (plus `SSL_CERT_FILE` and `SSL_CERT_DIR` on Linux), as the connector's own
+connection does. `GIT_SSL_CAINFO` does not apply to it, just as it does not for the connector. When
+a proxy applies, the proxy resolves the gateway's name, so `gateway-dns` has nothing to test.
+
+**An origin result is about reachability.** `PASS` means the git server answered. Many servers
+answer a request to their base URL without asking for a credential, so a `PASS` does not prove that
+the credential is accepted or that it can read any repository; that shows at the first sync. A
+`FAIL` for `origin:<name>` means the server was unreachable (DNS, firewall, proxy, or a certificate
+git does not trust: see [Trusting an internal CA for git](#trusting-an-internal-ca-for-git)), or it
+asked for a credential and rejected the one configured. Each credential is sent only to its own
+provider's server, and git is told not to follow redirects, so it cannot be passed on to another
+host.
+
+A check that cannot run because an earlier one failed is shown as `SKIP`, with the reason; a
+skipped check is not a pass. The origin checks are skipped while `git`, `tmpdir` or
+`provider-config` fails, because the probe needs all three.
+
+**What it does not do.** It does not enrol, register, authenticate to the gateway, send connector
+data, or contact the Memento replica, and it is not a dry-run sync. Its only request to the platform
+is the body-less `HEAD` described above. Whether the connector can push to the
+replica is reported by `connector status` and in the portal once it is enrolled. It also does not
+check `CONNECTOR_ID` (the connector will not start without it), the registration token, or that the
+key file's directory is writable.
+
+**Where to run it.** Run it where the connector runs, as the same user and with the same
+environment, because the answer depends on the network, DNS, proxy settings and user it sees. A
+throwaway container can differ from the deployed one (for example, it is not subject to the
+Kubernetes network policy), so on Kubernetes prefer the running pod.
+
+Docker, before the first start (run it from the shell that defined `gitsync_dir` and `gitsync_image`
+in [Option A](#option-a-docker); the data volume is mounted read-only. Add the same extra `-v`
+mounts as your run command, for example a volume holding a `token_file` credential, or the
+`provider-config` check cannot read them):
+
+```bash
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  -v gitsync-data:/data:ro -v gitsync-tmp:/tmp \
+  --env-file "$gitsync_dir/gitsync.env" \
+  "$gitsync_image" connector preflight
+```
+
+Docker, against the running container:
+
+```bash
+docker exec mkonnect-gitsync /mkonnect-gitsync connector preflight
+```
+
+Kubernetes (the chart's pod runs from the moment it is installed, before it is enrolled):
+
+```bash
+kubectl exec deploy/mkonnect-gitsync -- /mkonnect-gitsync connector preflight
+```
+
+Add `--json` for a machine-readable result. It is one object with `version` (currently `1`), `ok`
+(`false` if any check failed), a `summary` of counts, and a `checks` array of `id`, `status`
+(`pass`, `warn`, `fail` or `skip`), `detail` and `remedy` (null when there is nothing to fix). Fields
+are only ever added within a version.
+
+Configure your git server credentials (next section) and run it again: with no provider configured,
+the origin checks have nothing to test and report a warning.
+
 ## Configure your git server credential
 
 git-sync only uses a credential against a repository whose origin URL has the same scheme, host,

@@ -43,21 +43,15 @@ type Config struct {
 	CABundle string
 }
 
-// Load reads configuration from environment variables and applies defaults.
-// It returns an error if required variables are missing.
-func Load() (*Config, error) {
-	cfg := &Config{
-		GatewayURL:      os.Getenv("GATEWAY_URL"),
-		ConnectorID:     os.Getenv("CONNECTOR_ID"),
-		KeyFile:         os.Getenv("KEY_FILE"),
-		ProtocolVersion: os.Getenv("PROTOCOL_VERSION"),
-		CABundle:        os.Getenv("CA_BUNDLE"),
-	}
-
-	if cfg.GatewayURL == "" {
+// ParseGatewayURL validates a GATEWAY_URL value by the rules the connector applies at startup: an
+// absolute wss:// URL, or, for local development only, a ws:// loopback URL with
+// ALLOW_INSECURE_GATEWAY=true. It prints nothing and its errors never repeat the value. The operator
+// preflight command shares it so it judges the URL exactly as the daemon does.
+func ParseGatewayURL(raw string) (*url.URL, error) {
+	if raw == "" {
 		return nil, fmt.Errorf("GATEWAY_URL is required")
 	}
-	gatewayURL, err := url.Parse(cfg.GatewayURL)
+	gatewayURL, err := url.Parse(raw)
 	if err != nil || gatewayURL.Host == "" || (gatewayURL.Scheme != "ws" && gatewayURL.Scheme != "wss") {
 		return nil, fmt.Errorf("GATEWAY_URL must be an absolute ws:// or wss:// URL")
 	}
@@ -70,6 +64,26 @@ func Load() (*Config, error) {
 		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
 			return nil, fmt.Errorf("ALLOW_INSECURE_GATEWAY only permits ws:// loopback URLs")
 		}
+	}
+	return gatewayURL, nil
+}
+
+// Load reads configuration from environment variables and applies defaults.
+// It returns an error if required variables are missing.
+func Load() (*Config, error) {
+	cfg := &Config{
+		GatewayURL:      os.Getenv("GATEWAY_URL"),
+		ConnectorID:     os.Getenv("CONNECTOR_ID"),
+		KeyFile:         os.Getenv("KEY_FILE"),
+		ProtocolVersion: os.Getenv("PROTOCOL_VERSION"),
+		CABundle:        os.Getenv("CA_BUNDLE"),
+	}
+
+	gatewayURL, err := ParseGatewayURL(cfg.GatewayURL)
+	if err != nil {
+		return nil, err
+	}
+	if gatewayURL.Scheme == "ws" {
 		fmt.Fprintln(os.Stderr, "WARNING: plaintext loopback gateway explicitly enabled for local development")
 	}
 	if cfg.ConnectorID == "" {
