@@ -63,24 +63,31 @@ Whether the git-sync image counts as published is decided by the digest the git-
 
 ## Image signatures and provenance
 
-Each release's connector and git-sync images are signed keylessly with [Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overview/), and a SLSA build provenance attestation for each is stored in GitHub's attestation store. Nothing about the images, their tags or their digests changes: the signature is attached to the digest the release already records in `release-metadata.json`.
+Each release's connector and git-sync images are signed keylessly with [Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overview/), and a SLSA build provenance attestation for each is stored in GitHub's attestation store. The images, release tags and digests do not change: the signature is attached to the digest the release already records in `release-metadata.json`, and the registry gains a signature artifact alongside the image (as an OCI referrer or under a `sha256-<digest>` tag).
 
 Signing is best effort, like the git-sync image: the `sign-images` job runs after the GitHub Release is published, is marked `continue-on-error`, and signs the connector and git-sync images in separate steps. A signing failure shows as a warning annotation, never blocks or undoes a release, and a git-sync image that was not published is simply not signed. An image from a release whose signing step failed has no signature; check before relying on one.
 
 The signing identity is this repository's release workflow at a release tag: the certificate's subject is `https://github.com/memento-knowledge/mkonnect/.github/workflows/release.yml@refs/tags/<release-id>` and its issuer is `https://token.actions.githubusercontent.com`. Keyless signatures are recorded in the public Sigstore transparency log (Rekor), which makes the repository, workflow and tag visible there.
 
-Verify an image by digest (take the digest from `release-metadata.json`, never from a tag):
+Verify an image by digest (take the digest and release ID from `release-metadata.json`, never from a tag):
 
 ```bash
+digest=$(jq -r .git_sync_image_digest release-metadata.json)
+release_id=$(jq -r .release_id release-metadata.json)
 cosign verify "public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
   --certificate-identity-regexp '^https://github\.com/memento-knowledge/mkonnect/\.github/workflows/release\.yml@refs/tags/[0-9]{8}\.[0-9]+$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository memento-knowledge/mkonnect \
+  --certificate-github-workflow-trigger push
 ```
 
 Use `memento-connector` for the API connector image. Verify its provenance with the GitHub CLI (an alternative that does not depend on the registry):
 
 ```bash
-gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" --repo memento-knowledge/mkonnect
+gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
+  --repo memento-knowledge/mkonnect \
+  --signer-workflow memento-knowledge/mkonnect/.github/workflows/release.yml \
+  --source-ref "refs/tags/$release_id"
 ```
 
 A release published without signatures stays that way, as with the git-sync image: the next release is signed. Re-running a published release's workflow is not supported (see above). `scripts/sign-image.sh` is idempotent, though: it first checks whether a signature by the expected identity already verifies and signs only if not, so a future signing-only workflow can call it safely.

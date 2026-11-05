@@ -107,15 +107,21 @@ newer:
 
 ```bash
 digest=$(jq -r .git_sync_image_digest release-metadata.json)
+release_id=$(jq -r .release_id release-metadata.json)
 cosign verify "public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
   --certificate-identity-regexp '^https://github\.com/memento-knowledge/mkonnect/\.github/workflows/release\.yml@refs/tags/[0-9]{8}\.[0-9]+$' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository memento-knowledge/mkonnect \
+  --certificate-github-workflow-trigger push
 ```
 
 or, for the provenance, with the GitHub CLI (it does not need the registry to hold a signature):
 
 ```bash
-gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" --repo memento-knowledge/mkonnect
+gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
+  --repo memento-knowledge/mkonnect \
+  --signer-workflow memento-knowledge/mkonnect/.github/workflows/release.yml \
+  --source-ref "refs/tags/$release_id"
 ```
 
 Always verify the digest you will run, which is why the install commands recommend pinning it. See

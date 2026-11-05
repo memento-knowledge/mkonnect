@@ -49,6 +49,9 @@ grep -q -- "--certificate-oidc-issuer https://token.actions.githubusercontent.co
 grep -q -F -- '--certificate-identity-regexp ^https://github\.com/example-org/example\.repo/\.github/workflows/release\.yml@refs/tags/[0-9]{8}\.[0-9]+$' "$tmpdir/log" ||
   fail "must pin the release workflow identity at a release tag, with dots escaped"
 
+grep -q -- "--certificate-github-workflow-repository $repository --certificate-github-workflow-trigger push" "$tmpdir/log" ||
+  fail "must pin the repository and the push trigger of the signing workflow"
+
 # Already signed: nothing new is signed.
 FAKE_SIGNED=1 run bash "$script" --image "$image" --digest "$digest" --repository "$repository" >/dev/null ||
   fail "an already signed image should succeed"

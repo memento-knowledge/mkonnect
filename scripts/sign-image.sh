@@ -54,7 +54,9 @@ identity_regexp="^https://github\\.com/${repo_regex}/\\.github/workflows/release
 verify() {
   "$cosign" verify "$ref" \
     --certificate-identity-regexp "$identity_regexp" \
-    --certificate-oidc-issuer "$issuer" >/dev/null
+    --certificate-oidc-issuer "$issuer" \
+    --certificate-github-workflow-repository "$repository" \
+    --certificate-github-workflow-trigger push >/dev/null
 }
 
 if verify 2>/dev/null; then
