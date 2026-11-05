@@ -65,7 +65,11 @@ For each configured repository, one sync does the following:
    the sync stops with an error and **does not touch the replica**. This prevents an empty or
    misbehaving origin from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
-   no longer exists on your git server is removed from the replica.
+   no longer exists on your git server is removed from the replica. When the platform sets a push
+   batch size and the mirror holds more refs than that, the push is made in batches (after a
+   request that sends no data to learn what would change), and the removals are made by one final
+   push only once every batch has succeeded (see
+   [Limits the platform can send](git-sync.md#limits-the-platform-can-send)).
 
 Repository data travels directly between your git server, git-sync, and the replica over HTTPS.
 The gateway tunnel carries only control messages: configuration from the platform, and status
@@ -76,7 +80,8 @@ The gateway tunnel carries only control messages: configuration from the platfor
 Only `refs/heads/*` and `refs/tags/*`, together with the objects reachable from them. That is the
 complete history behind every branch and tag, including files that were later deleted. It does
 **not** receive other namespaces your server may keep (for example pull or merge request refs),
-Git LFS object contents (git-sync uses plain `git fetch` and `git push`), repository hooks or
+Git LFS object contents (git-sync uses plain `git fetch` and `git push`; a repository that appears
+to use LFS is reported with the warning `lfs_not_replicated`), repository hooks or
 settings, or anything outside the repository. Review what the repositories you select contain
 before replicating them.
 
@@ -99,8 +104,8 @@ repository) takes effect at the next sync.
 ### What is reported to the platform
 
 The connector sends status: for each repository its ID, state (`pending`, `syncing`, `ok`,
-`error`), an error type, and, for failures it cannot classify, a single short detail line from
-which URLs, host names, and absolute paths have been removed. It also sends, for each repository,
+`error`), an error type, any warning codes (currently only `lfs_not_replicated`), and, for failures
+it cannot classify, a single short detail line from which URLs, host names, and absolute paths have been removed. It also sends, for each repository,
 the times of its last attempt and last success, how long the attempt took, how many refs it
 pushed, the newest commit time across the branches and tags, and the default branch name at your
 git server. It also sends the configuration version it accepted, the reason when it rejected a
@@ -208,7 +213,10 @@ The `git` processes git-sync starts are also constrained:
   git-sync never disables certificate verification.
 - TLS certificates are verified. A custom CA bundle can be added (see
   [Trusting an internal CA for git](git-sync.md#trusting-an-internal-ca-for-git)).
-- Each fetch and each push has a 30-minute limit, and at most four repositories sync at once.
+- Each fetch has a fixed 30-minute limit. A push has a 30-minute limit unless the platform sets
+  another (60 seconds to 24 hours), and at most four repositories sync at once unless the platform
+  sets another number (1 to 32); see
+  [Limits the platform can send](git-sync.md#limits-the-platform-can-send).
 - Each git process runs in its own process group and is killed on timeout or shutdown, so none
   holding a credential outlives the daemon.
 - A platform-supplied repository ID is validated and never used as a file path or git argument;

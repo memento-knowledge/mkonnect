@@ -143,6 +143,9 @@ gitSync:
   # cannot write to it; manage it by updating the Secret; the connector reloads it without a restart.
   # When secretName is empty the connector uses a writable /data/git-sync.json
   # that you manage with `connector config set`.
+  # An entry may name a `token_file` (an absolute path) instead of an inline
+  # `token`. The chart mounts no extra Secret for it, so add that volume to the
+  # Deployment yourself; see docs/git-sync.md.
   # Mirrors are always stored under /data/mirrors (GIT_SYNC_MIRRORS_DIR is set
   # explicitly), never beside the read-only Secret mount.
   providerConfig:
