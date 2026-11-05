@@ -91,8 +91,33 @@ func (g *gatewayFixture) trusting() func() *http.Transport {
 	}
 }
 
-// preflightEnv isolates a preflight run: a writable temp dir, a pinned synthetic replica host, a
-// provider config at a fresh path, no proxy variables, and the given gateway.
+// reachableReplica answers every probe of the replica host as reachable, and records the entries it
+// was given.
+type reachableReplica struct {
+	mu   sync.Mutex
+	seen []gitsync.LocalEntry
+}
+
+func (p *reachableReplica) Probe(_ context.Context, e gitsync.LocalEntry) (gitsync.OriginResult, error) {
+	p.mu.Lock()
+	p.seen = append(p.seen, e)
+	p.mu.Unlock()
+	return gitsync.OriginReachable, nil
+}
+
+// syntheticLookup resolves any name to a documentation address, so no test depends on real DNS.
+func syntheticLookup(context.Context, string) ([]string, error) { return []string{"192.0.2.1"}, nil }
+
+// Synthetic registration values; never real ones.
+const (
+	testConnectorID = "synthetic-git-sync-connector"
+	testRegToken    = "synthetic-registration-token-0123456789"
+)
+
+// preflightEnv isolates a preflight run: a writable temp dir, a pinned synthetic replica host that
+// answers as reachable, a provider config at a fresh path, a connector ID, a registration token file
+// and a key directory of its own (and a home directory, so the default key path is never the
+// developer's), no proxy variables, and the given gateway.
 func preflightEnv(t *testing.T, gatewayURL string) (configPath, tmpDir string) {
 	t.Helper()
 	configPath = withConfig(t)
@@ -104,6 +129,17 @@ func preflightEnv(t *testing.T, gatewayURL string) (configPath, tmpDir string) {
 	for _, k := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "GIT_SSL_CAINFO"} {
 		t.Setenv(k, "")
 	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CONNECTOR_ID", testConnectorID)
+	t.Setenv("KEY_FILE", filepath.Join(t.TempDir(), "gitsync-key"))
+	tokenFile := filepath.Join(t.TempDir(), "registration-token")
+	if err := os.WriteFile(tokenFile, []byte(testRegToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REGISTRATION_TOKEN_FILE", tokenFile)
+	t.Setenv("REGISTRATION_TOKEN", "")
+	t.Cleanup(cli.SetReplicaProberForTest(&reachableReplica{}))
+	t.Cleanup(cli.SetPreflightEnvForTest(nil, nil, syntheticLookup))
 	return configPath, tmpDir
 }
 
@@ -910,7 +946,7 @@ func TestPreflightAllPassTextAndExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preflight: %v\n%s", err, out)
 	}
-	for _, want := range []string{"PASS  git", "PASS  tmpdir", "PASS  replica-host", "PASS  gateway-url", "PASS  gateway-tls", "PASS  provider-config", "PASS  origin:internal", "0 failed, 0 skipped"} {
+	for _, want := range []string{"PASS  git", "PASS  tmpdir", "PASS  replica-host", "PASS  connector-id", "PASS  key-file", "PASS  registration-token", "PASS  gateway-url", "PASS  gateway-tls", "PASS  replica-dns", "PASS  replica-https", "PASS  provider-config", "PASS  origin:internal", "0 failed, 0 skipped"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
 		}

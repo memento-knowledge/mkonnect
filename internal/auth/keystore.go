@@ -12,6 +12,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// ErrUnsafeKeyPermissions is returned (wrapped) by Load when the key file is accessible by anyone but
+// its owner. The daemon refuses such a file rather than tightening it, so the operator preflight
+// can tell the case apart without matching message text.
+var ErrUnsafeKeyPermissions = errors.New("key file has unsafe permissions")
+
 // KeyStore manages the on-disk ML-DSA-65 private key.
 type KeyStore struct {
 	path string
@@ -45,7 +50,7 @@ func (ks *KeyStore) Load() (*mldsa65.PrivateKey, bool, error) {
 		return nil, false, fmt.Errorf("key file must be a regular file")
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, false, fmt.Errorf("key file has unsafe permissions %04o; require owner-only access", perm)
+		return nil, false, fmt.Errorf("%w %04o; require owner-only access", ErrUnsafeKeyPermissions, perm)
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
@@ -69,6 +74,15 @@ func (k *KeyStore) EnsureWritable() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create key dir %s: %w", dir, err)
 	}
+	return k.ProbeWritable()
+}
+
+// ProbeWritable is EnsureWritable without creating the key directory, which must already exist:
+// it writes and removes the same key-sized temporary file, so it also detects a device with no
+// room for the key. The operator preflight uses it, because that command may run as another user
+// than the connector and must not leave a directory the connector cannot use.
+func (k *KeyStore) ProbeWritable() error {
+	dir := filepath.Dir(k.path)
 	f, err := os.CreateTemp(dir, ".keycheck-*.tmp")
 	if err != nil {
 		return fmt.Errorf("key directory %s is not writable (fix the volume/mount permissions): %w", dir, err)

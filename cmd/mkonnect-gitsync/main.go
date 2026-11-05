@@ -16,7 +16,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -55,14 +54,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Use a distinct default key path so running alongside the API connector with default
-	// settings does not make the two share one key file (where the second registration would
-	// clobber the first). An explicit KEY_FILE still wins. Operators must also give this
-	// connector its own CONNECTOR_ID — that is required configuration and cannot be defaulted.
-	if os.Getenv("KEY_FILE") == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			cfg.KeyFile = filepath.Join(home, ".mkonnect", "gitsync-key")
-		}
+	// The key path is KEY_FILE, else a default distinct from the API connector's, so running alongside
+	// it with default settings does not make the two share one key file (where the second
+	// registration would clobber the first). Operators must also give this connector its own
+	// CONNECTOR_ID: that is required configuration and cannot be defaulted.
+	if keyFile, err := gitsync.KeyFilePath(); err == nil {
+		cfg.KeyFile = keyFile
 	}
 
 	local, err := gitsync.New(gitsync.DefaultConfigPath())

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -229,5 +230,32 @@ func TestEnsureWritableFailsWhenDirUnavailable(t *testing.T) {
 	path := filepath.Join(blocker, "key")
 	if err := NewKeyStore(path).EnsureWritable(); err == nil {
 		t.Fatal("expected EnsureWritable to fail when the key dir cannot be created")
+	}
+}
+
+func TestProbeWritableDoesNotCreateTheDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "absent")
+	if err := NewKeyStore(filepath.Join(dir, "key")).ProbeWritable(); err == nil {
+		t.Fatal("expected an error: the directory does not exist")
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ProbeWritable created the directory: %v", err)
+	}
+}
+
+func TestLoadUnsafePermissionsIsATypedError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := NewKeyStore(path).Load()
+	if !errors.Is(err, ErrUnsafeKeyPermissions) {
+		t.Fatalf("got %v", err)
+	}
+	if got, want := err.Error(), "key file has unsafe permissions 0644; require owner-only access"; got != want {
+		t.Errorf("message changed: %q", got)
 	}
 }

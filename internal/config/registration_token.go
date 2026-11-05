@@ -16,20 +16,49 @@ import (
 // path and is rejected rather than truncated.
 const maxRegistrationTokenFileSize = 4096
 
+// RegistrationTokenSource says where the registration token comes from.
+type RegistrationTokenSource string
+
+const (
+	// RegistrationTokenNone: neither REGISTRATION_TOKEN_FILE nor REGISTRATION_TOKEN is set.
+	RegistrationTokenNone RegistrationTokenSource = "none"
+	// RegistrationTokenEnv: REGISTRATION_TOKEN, an environment variable.
+	RegistrationTokenEnv RegistrationTokenSource = "env"
+	// RegistrationTokenFile: the file named by REGISTRATION_TOKEN_FILE.
+	RegistrationTokenFile RegistrationTokenSource = "file"
+)
+
 // registrationToken resolves the registration token. When REGISTRATION_TOKEN_FILE is
 // set the token is read from that file and REGISTRATION_TOKEN is ignored; any failure
 // to read the file is an error rather than a silent fallback to the environment
 // variable. When it is unset, REGISTRATION_TOKEN is returned verbatim.
 func registrationToken() (string, error) {
+	token, _, err := resolveRegistrationToken()
+	return token, err
+}
+
+func resolveRegistrationToken() (string, RegistrationTokenSource, error) {
 	path := os.Getenv("REGISTRATION_TOKEN_FILE")
 	if path == "" {
-		return os.Getenv("REGISTRATION_TOKEN"), nil
+		if token := os.Getenv("REGISTRATION_TOKEN"); token != "" {
+			return token, RegistrationTokenEnv, nil
+		}
+		return "", RegistrationTokenNone, nil
 	}
 	token, err := readRegistrationTokenFile(path)
 	if err != nil {
-		return "", fmt.Errorf("REGISTRATION_TOKEN_FILE: %w", err)
+		return "", RegistrationTokenFile, fmt.Errorf("REGISTRATION_TOKEN_FILE: %w", err)
 	}
-	return token, nil
+	return token, RegistrationTokenFile, nil
+}
+
+// CheckRegistrationToken applies the rules the connector applies to its registration token at
+// startup and reports where it comes from, without returning the value, so a caller that only needs
+// to know whether the token is usable (the operator preflight) cannot print or log it. The error,
+// like Load's, names the problem and the file path but never the contents.
+func CheckRegistrationToken() (RegistrationTokenSource, error) {
+	_, src, err := resolveRegistrationToken()
+	return src, err
 }
 
 // readRegistrationTokenFile reads and validates a registration token file. Errors
