@@ -78,6 +78,15 @@ func (g *providerGates) size() int {
 	return len(g.gates)
 }
 
+// held reports whether b has a gate, closed or half open: the origin refused the credential and no
+// sync has shown since that it works again.
+func (g *providerGates) held(b binding) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.gates[b]
+	return ok
+}
+
 func (g *providerGates) state(b binding, now time.Time) gateState {
 	g.mu.Lock()
 	defer g.mu.Unlock()

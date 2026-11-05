@@ -772,8 +772,9 @@ the one that failed:
 
 The hold is kept in memory, like the rest of the backoff. After a restart each repository may try
 once, but a sync still waiting for a free slot when the first rejection comes back is stopped. The
-reachability check of the portal (see [Verify](#verify)) uses the same credential every few minutes
-and is not held back.
+reachability check shown in the portal (see [Verify](#verify)) uses the same credential every few
+minutes, so it is held back too: while a credential is held it reports `access_denied` for that
+provider without contacting the server.
 
 A successful sync clears the backoff. A repository whose origin or replica changes in a new
 configuration starts again with a fresh schedule; a configuration that leaves them unchanged (for

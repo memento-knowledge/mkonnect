@@ -96,16 +96,24 @@ func (s *providerSet) equal(o *providerSet) bool {
 	return true
 }
 
-// entries returns the providers' entries, ordered by name.
-func (s *providerSet) entries() []LocalEntry {
+// probeTarget is a provider to run the origin reachability check against, with the binding that names
+// its credential.
+type probeTarget struct {
+	entry LocalEntry
+	bind  binding
+}
+
+// probeTargets returns the providers, ordered by name.
+func (s *providerSet) probeTargets() []probeTarget {
 	names := make([]string, 0, len(s.byName))
 	for n := range s.byName {
 		names = append(names, n)
 	}
 	slices.Sort(names)
-	out := make([]LocalEntry, len(names))
+	out := make([]probeTarget, len(names))
 	for i, n := range names {
-		out[i] = s.byName[n].entry
+		pe := s.byName[n]
+		out[i] = probeTarget{entry: pe.entry, bind: binding{provider: n, gen: pe.gen}}
 	}
 	return out
 }
