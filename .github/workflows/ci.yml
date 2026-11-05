@@ -41,6 +41,9 @@ jobs:
       - name: Run release-metadata.json reconcile tests
         run: bash scripts/reconcile-release-metadata_test.sh
 
+      - name: Run image signing script tests
+        run: bash scripts/sign-image_test.sh
+
   lint:
     runs-on: ubuntu-latest
     steps:

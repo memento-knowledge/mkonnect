@@ -61,7 +61,36 @@ Whether the git-sync image counts as published is decided by the digest the git-
 - Re-running is only for a release that is still a draft. Use "Re-run failed jobs" by default. "Re-run all jobs" is also accepted, but it re-runs the git-sync job too: if that job hits a transient error on the re-run, the regenerated metadata has `null` git-sync fields, and on a draft that replaces metadata which had recorded a published git-sync image (the image tags stay in the registry). See [Release metadata](#release-metadata).
 - Do not publish the draft GitHub Release by hand while a workflow run is in progress: the workflow checks that the release is still a draft before it changes anything, and a manual publish between that check and its next step is not detected.
 
-Image signing and provenance attestation are documented separately once available.
+## Image signatures and provenance
+
+The release workflow signs each release's connector and git-sync images keylessly with [Sigstore cosign](https://docs.sigstore.dev/cosign/signing/overview/) and stores a SLSA build provenance attestation for each in GitHub's attestation store. The images, release tags and digests are untouched: the signature is attached to the digest the release already records in `release-metadata.json`. cosign adds a signature artifact to the same repository, as an OCI referrer or, where the registry lacks the OCI referrers API, under a `sha256-<digest>` tag. Whether Amazon ECR Public accepts that artifact had not been confirmed when signing was added, so the first signed release is the first real test: check it with the command below before relying on signatures.
+
+Signing is best effort, like the git-sync image: the `sign-images` job runs after the GitHub Release is published, is marked `continue-on-error`, and signs the connector and git-sync images in separate steps. Provenance is attested separately from the signatures, so a registry that refuses the signature artifacts still leaves provenance in GitHub's store. A signing failure shows as a warning annotation, never blocks or undoes a release, and a git-sync image that was not published is simply not signed. An image from a release whose signing step failed has no signature; check before relying on one.
+
+The signing identity is this repository's release workflow at a release tag: the certificate's subject is `https://github.com/memento-knowledge/mkonnect/.github/workflows/release.yml@refs/tags/<release-id>` and its issuer is `https://token.actions.githubusercontent.com`. Keyless signatures are recorded in the public Sigstore transparency log (Rekor), which makes the repository, workflow and tag visible there.
+
+With cosign 3.1 or newer, verify an image by digest (take the digest and release ID from `release-metadata.json`, never from a tag):
+
+```bash
+digest=$(jq -r .git_sync_image_digest release-metadata.json)
+release_id=$(jq -r .release_id release-metadata.json)
+cosign verify "public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
+  --certificate-identity-regexp '^https://github\.com/memento-knowledge/mkonnect/\.github/workflows/release\.yml@refs/tags/[0-9]{8}\.[0-9]+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository memento-knowledge/mkonnect \
+  --certificate-github-workflow-trigger push
+```
+
+Use `memento-connector` for the API connector image. Verify its provenance with the GitHub CLI 2.49 or newer (the attestation is read from GitHub, so the registry does not need to hold a signature; the image reference is still resolved against it):
+
+```bash
+gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
+  --repo memento-knowledge/mkonnect \
+  --signer-workflow memento-knowledge/mkonnect/.github/workflows/release.yml \
+  --source-ref "refs/tags/$release_id"
+```
+
+A release published without signatures stays that way, as with the git-sync image: the next release is signed. Re-running a published release's workflow is not supported (see above). `scripts/sign-image.sh` is idempotent, though: it first checks whether a signature by the expected identity already verifies and signs only if not, so a future signing-only workflow can call it safely.
 
 ## Release metadata
 
