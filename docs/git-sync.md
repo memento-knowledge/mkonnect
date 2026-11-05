@@ -97,6 +97,31 @@ release. Otherwise, **pin the image by digest** (`git_sync_image_digest`) rather
 commands below show both forms. If a pod or container fails to start with an "image not found"
 error, the release most likely has no git-sync image.
 
+### Verify the image signature
+
+Releases after the one that introduced signing carry a [Sigstore](https://docs.sigstore.dev/cosign/signing/overview/)
+signature on the image digest, made by this repository's release workflow, and a build provenance
+attestation. Signing is best effort, so a release can have an image without them: verification
+tells you which. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or
+newer:
+
+```bash
+digest=$(jq -r .git_sync_image_digest release-metadata.json)
+cosign verify "public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
+  --certificate-identity-regexp '^https://github\.com/memento-knowledge/mkonnect/\.github/workflows/release\.yml@refs/tags/[0-9]{8}\.[0-9]+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+or, for the provenance, with the GitHub CLI (it does not need the registry to hold a signature):
+
+```bash
+gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" --repo memento-knowledge/mkonnect
+```
+
+Always verify the digest you will run, which is why the install commands recommend pinning it. See
+[Image signatures and provenance](../RELEASING.md#image-signatures-and-provenance) for what is
+signed and how.
+
 ### Sizing
 
 - **Data volume** (`/data`): the sum of the mirrored repositories' sizes, multiplied by about 1.2,
