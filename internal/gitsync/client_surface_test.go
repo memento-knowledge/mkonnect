@@ -533,6 +533,16 @@ func TestProbeOfASupersededConnectionNeitherStoresNorClears(t *testing.T) {
 			close(block)
 			waitProbeDone(t, c)
 
+			// The superseded attempt gave its cadence slot back (asserted below), so the first
+			// heartbeat on the new connection starts a fresh probe of its own. Hold that probe, or it
+			// can land between maybeProbe and the status OnHeartbeat builds and replace the very cache
+			// this heartbeat is meant to observe, and send a status of its own.
+			hold := make(chan struct{})
+			var release sync.Once
+			releaseProbe := func() { release.Do(func() { close(hold) }) }
+			t.Cleanup(releaseProbe)
+			prober.set(gitsync.OriginUnreachable, nil, hold)
+
 			if hb := heartbeat(t, c, s2); hb.OriginCheck == nil || *hb.OriginCheck != *cached {
 				t.Errorf("origin_check on the current connection = %+v, want the cached %+v", hb.OriginCheck, cached)
 			}
@@ -543,11 +553,14 @@ func TestProbeOfASupersededConnectionNeitherStoresNorClears(t *testing.T) {
 				t.Errorf("the current connection was sent %d statuses, want only the heartbeat's", n)
 			}
 
-			// The abandoned attempt did not use up the cadence slot.
-			prober.set(gitsync.OriginUnreachable, nil, nil)
-			heartbeat(t, c, s2)
+			// The abandoned attempt did not use up the cadence slot: that heartbeat started a probe at
+			// once, and when it finishes it is committed to the current connection.
 			waitFor(t, func() bool { return prober.calls.Load() == 3 })
+			releaseProbe()
 			waitProbeDone(t, c)
+			if got := latestOriginCheck(s2.messages()); got == nil || got.Result != "unreachable" {
+				t.Errorf("origin_check on the current connection after its own probe = %+v, want unreachable", got)
+			}
 		})
 	}
 }
