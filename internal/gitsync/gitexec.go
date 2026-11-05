@@ -143,16 +143,28 @@ func TempRoot() (string, error) {
 	return root, nil
 }
 
-// resolveTempRoot picks the temp root from the environment, checks it is absolute, and creates it.
-func resolveTempRoot() (string, error) {
+// TempRootPath returns the temp root the connector would use, and the environment variable it came
+// from, without creating it or touching the file system. It is GIT_SYNC_TMP_DIR when set, otherwise
+// os.TempDir() (TMPDIR). The path must be absolute: a relative one is an error, never a silent
+// fallback. The operator CLI uses it to inspect the directory without creating one the connector's
+// own user could not use.
+func TempRootPath() (path, source string, err error) {
 	root, source := os.TempDir(), "TMPDIR"
 	if v := os.Getenv("GIT_SYNC_TMP_DIR"); v != "" {
 		root, source = v, "GIT_SYNC_TMP_DIR"
 	}
 	if !filepath.IsAbs(root) {
-		return "", fmt.Errorf("%s must be an absolute path, got %q", source, root)
+		return "", source, fmt.Errorf("%s must be an absolute path, got %q", source, root)
 	}
-	root = filepath.Clean(root)
+	return filepath.Clean(root), source, nil
+}
+
+// resolveTempRoot picks the temp root from the environment (see TempRootPath) and creates it.
+func resolveTempRoot() (string, error) {
+	root, source, err := TempRootPath()
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", fmt.Errorf("temp directory %q (from %s) is not usable: %w", root, source, err)
 	}

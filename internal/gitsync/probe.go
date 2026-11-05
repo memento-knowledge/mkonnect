@@ -48,10 +48,44 @@ type gitProber struct {
 // NewGitProber returns a prober backed by the git binary.
 func NewGitProber() *gitProber { return &gitProber{run: runGit} }
 
+// MinGitMajor and MinGitMinor are the oldest git the connector supports: GIT_CONFIG_COUNT
+// credential injection needs git >= 2.31.
+const (
+	MinGitMajor = 2
+	MinGitMinor = 31
+)
+
+// gitVersionRE reads the version out of `git --version`. It takes the leading numeric components and
+// ignores whatever follows, so a distribution or platform suffix ("2.39.5 (Apple Git-154)",
+// "2.43.0.windows.1", "2.34.1-1ubuntu1", a release candidate "2.31.0-rc1" or "2.40.rc0") does not
+// stop it from reading the version.
+var gitVersionRE = regexp.MustCompile(`^git version (([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})?)`)
+
+// ParseGitVersion reads the output of `git --version`. It returns the dotted version as printed
+// (for display) and its major and minor numbers; ok is false for anything it does not recognise.
+func ParseGitVersion(out string) (version string, major, minor int, ok bool) {
+	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
+	m := gitVersionRE.FindStringSubmatch(line)
+	if m == nil {
+		return "", 0, 0, false
+	}
+	major, err1 := strconv.Atoi(m[2])
+	minor, err2 := strconv.Atoi(m[3])
+	if err1 != nil || err2 != nil {
+		return "", 0, 0, false
+	}
+	return m[1], major, minor, true
+}
+
+// GitVersionSupported reports whether major.minor is at least MinGitMajor.MinGitMinor.
+func GitVersionSupported(major, minor int) bool {
+	return major > MinGitMajor || (major == MinGitMajor && minor >= MinGitMinor)
+}
+
 // GitVersionOK reports whether a git that supports GIT_CONFIG_* credential injection (>= 2.31) is
 // available on PATH. When it returns false, neither the reachability probe nor the mirror sync can
 // inject its credential and the git-sync image is misconfigured — a packaging concern, surfaced as
-// a startup warning.
+// a startup warning. On success detail is the version; otherwise it says what is wrong.
 func GitVersionOK() (ok bool, detail string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -59,24 +93,14 @@ func GitVersionOK() (ok bool, detail string) {
 	if err != nil {
 		return false, "git was not found on PATH or did not respond"
 	}
-	fields := strings.Fields(string(out)) // e.g. "git version 2.39.3"
-	if len(fields) < 3 {
+	ver, major, minor, parsed := ParseGitVersion(string(out))
+	if !parsed {
 		return false, "unrecognised `git --version` output"
 	}
-	ver := fields[2]
-	parts := strings.SplitN(ver, ".", 3)
-	if len(parts) < 2 {
-		return false, "unrecognised git version " + ver
+	if !GitVersionSupported(major, minor) {
+		return false, "git " + ver + " is older than the required 2.31"
 	}
-	major, err1 := strconv.Atoi(parts[0])
-	minor, err2 := strconv.Atoi(parts[1])
-	if err1 != nil || err2 != nil {
-		return false, "unrecognised git version " + ver
-	}
-	if major > 2 || (major == 2 && minor >= 31) {
-		return true, ver
-	}
-	return false, "git " + ver + " is older than the required 2.31"
+	return true, ver
 }
 
 // Probe runs `git ls-remote` against the entry's base URL. The credential is injected through the

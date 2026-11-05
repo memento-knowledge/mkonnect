@@ -28,7 +28,7 @@ import (
 )
 
 func main() {
-	// Operator CLI: `mkonnect-gitsync connector <config|status> ...`. Handled before loading daemon
+	// Operator CLI: `mkonnect-gitsync connector <config|status|preflight> ...`. Handled before loading daemon
 	// configuration so an admin can configure credentials without a running connector.
 	if len(os.Args) > 1 && os.Args[1] == "connector" {
 		if err := cli.Run(os.Args[2:], os.Stdin, os.Stdout); err != nil {

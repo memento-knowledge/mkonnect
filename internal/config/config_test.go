@@ -133,3 +133,38 @@ func TestLoadAllowsExplicitPlaintextLoopbackGateway(t *testing.T) {
 		t.Fatalf("explicitly enabled loopback ws:// should be allowed, got error: %v", err)
 	}
 }
+
+func TestParseGatewayURL(t *testing.T) {
+	tests := []struct {
+		name, raw, insecure string
+		wantErr             string
+	}{
+		{name: "wss", raw: "wss://gateway.example.test/ws"},
+		{name: "wss with port", raw: "wss://gateway.example.test:8443"},
+		{name: "empty", raw: "", wantErr: "GATEWAY_URL is required"},
+		{name: "https", raw: "https://gateway.example.test", wantErr: "ws:// or wss://"},
+		{name: "no host", raw: "wss:///x", wantErr: "ws:// or wss://"},
+		{name: "ws without opt-in", raw: "ws://127.0.0.1:8080", wantErr: "must use wss://"},
+		{name: "ws loopback", raw: "ws://127.0.0.1:8080", insecure: "true"},
+		{name: "ws localhost", raw: "ws://localhost:8080", insecure: "true"},
+		{name: "ws not loopback", raw: "ws://gateway.example.test", insecure: "true", wantErr: "loopback"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ALLOW_INSECURE_GATEWAY", tt.insecure)
+			u, err := config.ParseGatewayURL(tt.raw)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tt.wantErr)
+				}
+				if tt.raw != "" && strings.Contains(err.Error(), tt.raw) {
+					t.Errorf("the error repeats the value: %v", err)
+				}
+				return
+			}
+			if err != nil || u == nil {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}

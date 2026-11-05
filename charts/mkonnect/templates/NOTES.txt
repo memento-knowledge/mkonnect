@@ -16,6 +16,8 @@ with its own connector ID, volume ({{ $name }}-data) and registration token.
 No registration token is mounted. If this connector has not registered yet, supply one with
 gitSync.config.registrationTokenSecret.name (an existing Secret) or --set-file gitSync.config.registrationToken=<file>.
 {{- end }}
+To test this pod's network path, git, temporary directory and settings before or after it enrols:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ $name }} -- /mkonnect-gitsync connector preflight
 Check in the Memento portal that it connected, then configure the credential for your git server(s):
 {{- if $gs.providerConfig.secretName }}
   The provider config is mounted read-only from the Secret {{ $gs.providerConfig.secretName }}; update that Secret
