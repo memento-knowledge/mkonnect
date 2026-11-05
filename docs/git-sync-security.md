@@ -20,15 +20,17 @@ against [`internal/gitsync`](../internal/gitsync) and [`cmd/mkonnect-gitsync`](.
   never written to disk by git-sync.
 - The process runs as an unprivileged user with a read-only root filesystem and no Linux
   capabilities.
+- Release images are built by this repository's release workflow and are meant to be signed, with
+  build provenance. Signing is new and has not yet run in a release; see [Supply chain](#supply-chain).
 
 ## Network destinations
 
 | Destination | Port | Direction | Purpose |
 |---|---|---|---|
-| Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`) | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration. |
+| Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`), unless that URL names another port | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration. |
 | Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. |
 | Your git server(s): the base URL(s) you configure as providers | as in each base URL (443 for `https://`) | outbound | Read-only `git ls-remote` and `git fetch`. |
-| Container registry (`public.ecr.aws`) | 443 | outbound, from the container runtime or the cluster nodes | Pulling the image at install and upgrade. git-sync itself does not contact it. |
+| Container registry (`public.ecr.aws`) | 443 | outbound, from the container runtime or the cluster nodes, and from where you run `helm` | Pulling the image at install and upgrade, and, on Kubernetes, pulling the Helm chart (`oci://public.ecr.aws/...`). The running git-sync process does not contact it. |
 | DNS | 53 | outbound | Name resolution. |
 
 There are no inbound connections. Exact gateway and replica host names are given in the
@@ -40,7 +42,9 @@ credential against git servers that you configured (see
 
 If your environment requires an HTTP proxy, set `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`, and
 their lower-case forms, in the container environment (the chart's `gitSync.proxy.*` values set
-both cases). git-sync passes exactly these six variables on to git for its fetches and pushes; git's
+both cases). Of its own environment, git-sync passes on to git only `PATH`, these six variables, and
+the three CA settings (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`; see
+[Process isolation and hardening](#process-isolation-and-hardening)), for its fetches and pushes; git's
 HTTP library reads only the lower-case `http_proxy` for `http://` URLs. The connection to the
 gateway uses Go's default HTTP transport, which reads `HTTPS_PROXY` / `https_proxy` and `NO_PROXY` /
 `no_proxy` for its `wss://` connection. A proxy that tunnels with `CONNECT` sees the destination
@@ -89,12 +93,12 @@ before replicating them.
 
 | Data | Where | Notes |
 |---|---|---|
-| Private signing key (ML-DSA-65) | `/data/gitsync-key` on the data volume | Mode `0600`, owner-only. Issued by the gateway at registration. Losing it means re-registering. |
+| Signing key (ML-DSA-65 private key) | `/data/gitsync-key` on the data volume | Mode `0600`, owner-only. Issued by the gateway at registration. Losing it means re-registering. |
 | Provider configuration, including your git server credential | A Secret mounted read-only at `/etc/mkonnect-gitsync-providers/`, or `/data/git-sync.json` on the data volume | In **cleartext** (not encrypted at rest by git-sync). git-sync tightens the file to owner-only (`0600`) where it can, and refuses to start with a read-only file that is group-writable or accessible by others. |
-| Mirrors of the replicated repositories | `/data/mirrors` on the data volume | A full copy of the history behind every branch and tag. Treat the volume as containing your source code. The mirror of a repository the platform stops listing is deleted once it has been unlisted for seven days (see [Mirror cleanup](git-sync.md#mirror-cleanup)); `GIT_SYNC_MIRROR_GC=off` turns that off. |
+| Mirrors of the replicated repositories | `/data/mirrors` on the data volume | A full copy of the history behind every branch and tag. Treat the volume as containing your source code. The mirror of a repository the platform stops listing gets a small timestamp marker file and is deleted once it has been unlisted for seven days (see [Mirror cleanup](git-sync.md#mirror-cleanup)); `GIT_SYNC_MIRROR_GC=off` turns that off. |
 | Run state | `/data/mirrors/run-state.json` on the data volume | Per repository: when the last attempt started and how long it took, when the last sync succeeded, how many refs it pushed, the newest commit time and default branch at your git server, and an unsalted SHA-256 hash of the origin and replica URLs (it does not reveal them, but could confirm a guessed pair). No credential, URL, host name, path, or error text. Mode `0600`. |
 | Replica push tokens | **Memory only** | Received from the platform per repository, with an expiry, and kept only for repositories that can be synced. Not written to disk and not logged. |
-| One-time registration token | A read-only file mounted from a Secret (Kubernetes) or from a dedicated Docker volume | Used once. Remove it after the connector has registered. It is never an environment variable. |
+| One-time registration token | A read-only file mounted from a Secret (Kubernetes) or from a dedicated Docker volume | Used once. Remove it after the connector has registered. The chart and the Docker instructions deliver it as a file (`REGISTRATION_TOKEN_FILE`), not as an environment variable. The connector also accepts `REGISTRATION_TOKEN` in its environment, which you should not use: an environment value shows in `docker inspect` and in the pod specification. |
 | Per-sync scratch data | `/tmp` (disk-backed) | Each sync creates a throwaway, empty home directory for git, also used for git's temporary files, and removes it afterwards. The fetched objects themselves go into the mirror, not here. |
 | Logs | Standard error (`docker logs`, `kubectl logs`) | See [What is logged](#what-is-logged). |
 
@@ -142,8 +146,8 @@ names or repository paths.
 
 | Credential | Held by | How it is protected | Lifetime |
 |---|---|---|---|
-| Registration token | Issued for your tenant at registration; delivered to git-sync as a file | Mounted read-only, mode `0440` in Kubernetes (group-readable through the pod's `fsGroup`); in Docker, a `0600` file owned by uid 65532 in a dedicated volume mounted read-only. git-sync refuses a token file that is accessible by others or writable by its group. Not an environment variable, so it is not shown by `docker inspect` or in the pod specification. | One time; remove after registration. |
-| Signing key | Generated by the gateway at registration; stored by git-sync | Owner-only file on the data volume; the private key is never sent again. Each reconnect proves possession by signing a challenge. | Until you delete the volume. |
+| Registration token | Issued for your tenant at registration; delivered to git-sync as a file | Mounted read-only, mode `0440` in Kubernetes (group-readable through the pod's `fsGroup`); in Docker, a `0600` file owned by uid 65532 in a dedicated volume mounted read-only. git-sync refuses a token file that is accessible by others or writable by its group. Delivered as a file in both, so it is not shown by `docker inspect` or in the pod specification (see the note on `REGISTRATION_TOKEN` above). | One time; remove after registration. |
+| Signing key | Generated by the gateway at registration; stored by git-sync | Owner-only file on the data volume (git-sync refuses a key file that others can access); the signing key is never sent again. Each reconnect proves possession by signing a challenge. | Until you delete the volume. |
 | Git server credential | You | Stored in the provider configuration, or in a file the configuration names (`token_file`; refused when group or others can write it or another user owns it). Used only for requests to the matching git server. On Kubernetes, prefer a Secret you manage. | Until you rotate or revoke it at your git server. |
 | Replica push token | Issued by the platform per repository | Memory only; sent only to the pinned replica host; carries an expiry that git-sync checks before pushing. | Has an expiry; refreshed by the platform while connected. |
 
@@ -175,6 +179,39 @@ unprivileged user the process itself runs as.
   `replica_host_not_pinned`) and never pushes, while still connecting and reporting status. The pin
   is checked again just before a sync starts, which is the point where the push token would leave
   the process.
+
+### How the credentials reach git
+
+For each fetch, probe or push, git-sync builds a new environment for the `git` child process and adds
+the credential as git configuration through `GIT_CONFIG_COUNT` and `GIT_CONFIG_KEY_n` /
+`GIT_CONFIG_VALUE_n` (this is why git 2.31 or newer is required). The credential is an
+`Authorization` header set under `http.<url>/.extraHeader`, so git sends it only to requests whose
+URL falls under that one URL (same scheme, host and port). It is not placed on the command line, in
+the URL, in a credential helper, in git's system or global configuration (both are disabled), or in
+a file; the process's own environment is not inherited by git. The environment of a child is readable
+by the same user, as noted above.
+
+### Rotation, revocation and live reload
+
+- **Your git server credential** is revoked or rotated by changing the provider configuration (or a
+  `token_file` it names), or by revoking it at your git server. git-sync reads the provider
+  configuration every 5 seconds (and at once on `SIGHUP`), applies a change after seeing it twice
+  one second apart, stops any sync that was using a removed or changed credential (its git processes
+  are killed and the sync pushes nothing), and syncs the repository again with the new one. Deleting
+  the provider file revokes every provider credential. A file that cannot be used is not applied: git-sync keeps
+  the last configuration that worked and logs the kind of problem. On Kubernetes, a Secret reaches
+  the pod after a kubelet delay. See
+  [Reloading the provider configuration](git-sync.md#reloading-the-provider-configuration).
+- **A credential your git server refuses** is not retried in a loop: the repositories that use it
+  wait, which avoids piling up failed logins. See
+  [A rejected credential holds back every repository that uses it](git-sync.md#a-rejected-credential-holds-back-every-repository-that-uses-it).
+- **The replica push token** is issued and refreshed by the platform, not by you. git-sync does not
+  push with a token it knows has expired. You cannot rotate it; stopping git-sync stops its use.
+- **What needs a restart:** the replica host pin, the registration token file, the signing key file
+  and every other setting are read once at startup.
+- **Stopping git-sync** ends all use of every credential it holds. On a normal shutdown it stops
+  its running git processes and waits up to 10 seconds for them, so none holding a credential
+  outlives it.
 
 ## Process isolation and hardening
 
@@ -260,6 +297,40 @@ Limits to be aware of:
 - The policy does not cover image pulls, which are made by the node's container runtime. Allow the
   registry from the nodes.
 
+## Supply chain
+
+- **What you run.** The git-sync image is built from [`Dockerfile.gitsync`](../Dockerfile.gitsync) by
+  this repository's release workflow, from a release tag. It holds the `mkonnect-gitsync` binary
+  (built with `CGO_ENABLED=0`), `git` and CA certificates on an Alpine base, and runs as uid 65532;
+  the package manager is removed in the build. The Alpine base is pinned by digest; `git` and
+  `ca-certificates` are resolved from Alpine's package index at build time, so the image as a whole
+  is not bit-for-bit reproducible, and the build fails if `git` is older than 2.31.
+- **Pin by digest.** Each release records the image digests in `release-metadata.json`. Use the
+  digest, not a tag, when you install (`gitSync.image.digest` in the chart; `repository@sha256:...` with
+  Docker). A release can exist without a git-sync image; check as described in
+  [Check that the release has a git-sync image](git-sync.md#check-that-the-release-has-a-git-sync-image).
+- **Signatures and provenance.** The release workflow is set up to sign each released image
+  keylessly with [Sigstore](https://docs.sigstore.dev/cosign/signing/overview/) cosign, using the
+  workflow's own identity, and to attest build provenance, which GitHub stores. You verify
+  both yourself, from any machine, with the commands in
+  [Verify the image signature](git-sync.md#verify-the-image-signature) and
+  [RELEASING.md](../RELEASING.md#image-signatures-and-provenance). git-sync never checks them. Keyless
+  signatures are recorded in Sigstore's public transparency log.
+- **Signing has not run in a release yet.** The signing step was added after the most recent release
+  at the time this page was written (20261022.0), whose workflow does not contain it. Verifying that
+  release or any earlier one will fail because there is nothing to verify, not because it was
+  tampered with. Signing is also best effort: it is a separate job that cannot block or undo a
+  release, and whether the public registry accepts the signature artifacts has not yet been
+  confirmed. So a signed image is not guaranteed even from a later release. Verify the digest you
+  will run and treat a failure for an unsigned release as "unsigned", not as a clean bill of health
+  or as proof of tampering. Check [RELEASING.md](../RELEASING.md#image-signatures-and-provenance) for the
+  current position.
+- **What is not signed.** The signing covers the container images. The Helm chart is not signed by
+  this workflow; each release publishes it with a SHA-256 checksum file, and you can read its templates
+  in [`charts/mkonnect`](../charts/mkonnect).
+- **Code checks.** This repository's CI runs the Go tests with the race detector, `staticcheck` and
+  `govulncheck` on changes.
+
 ## Use a least-privilege git account
 
 git-sync replicates **every branch and tag** of each repository you select, so decide what to
@@ -282,17 +353,8 @@ select, then give it only that:
 
 ## Uninstalling
 
-Removing git-sync stops all access immediately: it makes no connection once stopped. To remove it
-completely:
-
-1. Stop and remove the container, or disable `gitSync.enabled`, as described in
-   [Uninstalling](git-sync.md#uninstalling).
-2. Delete its volumes. This destroys the signing key, the provider configuration, and every
-   mirror.
-3. Delete the Secrets you created for it.
-4. Revoke the access token you issued on your git server.
-5. Remove the git-sync connector, and its repositories, in the Memento portal. What is retained
-   on the Memento side for repositories already replicated is controlled there.
-
-Because the credential for your git server is held only on your side, revoking it at the source
-completes the removal; there is nothing to revoke on Memento's side for it.
+Stopping git-sync ends all access at once: it makes no connection once stopped. To remove it completely,
+and to revoke the credentials it held, follow
+[Uninstalling](git-sync.md#uninstalling) in the git-sync guide: it covers Docker and Helm, what to
+delete (volumes, Secrets, host files), revoking your git server credential, and what remains on the
+Memento side.

@@ -11,7 +11,8 @@ Guides for administrators deploying and operating the mkonnect on-prem connector
   server credential, verify, understand the sync schedule, retries and what it keeps on disk,
   upgrade, uninstall, and troubleshoot.
 - **[git-sync security and data handling](git-sync-security.md)** — for security reviewers: network
-  destinations, data flow, credential custody, hardening, and network policy.
+  destinations, data flow, credential custody and revocation, hardening, network policy, and the
+  supply chain (image signatures and provenance).
 
 For a conceptual overview, the architecture, and the full configuration reference, see the
 [project README](../README.md). Maintainers cutting a release should see
