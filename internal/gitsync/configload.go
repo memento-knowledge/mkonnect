@@ -56,7 +56,7 @@ type ConfigIssue struct {
 	// Provider names the provider the issue is about; empty when it concerns the file as a whole or a
 	// provider name that is itself invalid (which is never echoed).
 	Provider string
-	// Field names the setting at fault (base_url, auth, username, token), or is empty.
+	// Field names the setting at fault (base_url, auth, username, token, token_file), or is empty.
 	Field string
 	// Message says what is wrong, without any value from the file.
 	Message string
@@ -89,39 +89,90 @@ type loadedConfig struct {
 	// missing says the file does not exist, which is not an error: the connector then has no providers.
 	missing bool
 	issues  []ConfigIssue
+	// sources are the files involved: the config (listed even when missing) and every token file it
+	// names, with a fingerprint of the bytes actually read. It is filled in even when the load fails.
+	sources sourceSet
 }
 
 // knownConfigFields are the settings a provider may carry, the only field names an issue may repeat.
-var knownConfigFields = []string{"base_url", "auth", "username", "token"}
+var knownConfigFields = []string{"base_url", "auth", "username", "token", "token_file"}
 
 // loadConfig reads and validates the provider config at path, collecting every problem it can find.
-// A problem with the file itself (unreadable, not JSON, wrong shape) ends the load, since nothing
-// after it can be interpreted; problems with individual providers are all collected, in provider-name
-// order so the first is the same on every run.
+// A problem with the file itself (unreadable, not JSON, wrong shape, owned by another user while
+// naming a token file) ends the load, since nothing after it can be trusted or interpreted; problems
+// with individual providers are all collected, in provider-name order so the first is the same on
+// every run.
+//
+// The load has two passes over the providers. The first checks everything that does not need a
+// credential (name, credential source, settings, inline token, host). The second reads the token
+// files, and runs only if the first found nothing wrong, so a configuration that will be refused
+// anyway opens no token file at all.
 func loadConfig(path string) loadedConfig {
-	res := loadedConfig{entries: map[string]LocalEntry{}, hostKeys: map[string]string{}}
+	res := loadedConfig{entries: map[string]LocalEntry{}, hostKeys: map[string]string{}, sources: sourceSet{}}
 	fail := func(class IssueClass, msg string, err error) loadedConfig {
 		res.issues = append(res.issues, ConfigIssue{Class: class, Message: msg, err: err})
 		return res
 	}
 
-	data, err := readSecureFile(path, "git-sync config", maxConfigFileSize)
+	cfg, err := readProviderConfig(path, maxConfigFileSize, rejectForeignConfigOwner)
 	if err != nil {
+		res.sources.add(Source{Path: path})
 		if os.IsNotExist(err) {
 			res.missing = true
 			return res
 		}
 		return fail(IssueFile, err.Error(), err)
 	}
+	res.sources.add(newSource(path, cfg.data))
 
-	dc, issue := decodeConfig(path, data)
+	dc, issue := decodeConfig(path, cfg.data)
 	if issue != nil {
 		res.issues = append(res.issues, *issue)
 		return res
 	}
+	names := slices.Sorted(maps.Keys(dc))
+
+	// Record every well-formed token file now, so a failed load still reports the files a retry should
+	// watch (including one that does not exist yet).
+	usesTokenFile := false
+	for _, name := range names {
+		// Any token_file key counts, even an empty one: that is an error for its provider below, and
+		// until then the config is held to the stricter owner rule.
+		if tf := dc[name].TokenFile; tf != nil {
+			usesTokenFile = true
+			if validateTokenFilePath(*tf) == nil {
+				res.sources.add(Source{Path: *tf})
+			}
+		}
+	}
+	// A config that names token files decides which local file is sent to which host, so it must not
+	// be editable by anyone else. This is checked on the descriptor the config was read from, before
+	// any token file is opened. A config with only inline tokens is judged by rejectForeignConfigOwner.
+	warnWhile(cfg.foreignOwner && !usesTokenFile, "owner", path,
+		"credential file is owned by another user; restrict it to the user running the connector (a future release will refuse to start)", "file", "git-sync config", "path", path)
+	if cfg.foreignOwner && usesTokenFile {
+		const msg = "uses token_file but is owned by another user; it must be owned by the user running the connector or by root"
+		return fail(IssueFile, msg, fmt.Errorf("git-sync config %s %s", path, msg))
+	}
+
+	entryIssue := func(name string, err error) {
+		class, field := IssueCredentials, ""
+		var fe *fieldError
+		if errors.As(err, &fe) {
+			field = fe.field
+			if field == "base_url" {
+				class = IssueBaseURL
+			}
+		}
+		res.issues = append(res.issues, ConfigIssue{
+			Class: class, Provider: name, Field: field, Message: err.Error(),
+			err: fmt.Errorf("provider %q is invalid: %w", name, err),
+		})
+	}
 
 	owners := make(map[string]string, len(dc))
-	for _, name := range slices.Sorted(maps.Keys(dc)) {
+	pending := map[string]LocalEntry{} // providers whose credential is still to be read from a file
+	for _, name := range names {
 		if err := validateProviderName(name); err != nil {
 			res.issues = append(res.issues, ConfigIssue{
 				Class: IssueProviderName, Message: describeBadProviderName(name),
@@ -130,21 +181,20 @@ func loadConfig(path string) loadedConfig {
 			continue
 		}
 		de := dc[name]
-		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token)}
-		if err := e.Validate(); err != nil {
-			class, field := IssueCredentials, ""
-			var fe *fieldError
-			if errors.As(err, &fe) {
-				field = fe.field
-				if field == "base_url" {
-					class = IssueBaseURL
-				}
-			}
-			res.issues = append(res.issues, ConfigIssue{
-				Class: class, Provider: name, Field: field, Message: err.Error(),
-				err: fmt.Errorf("provider %q is invalid: %w", name, err),
-			})
+		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(strVal(de.Token)), TokenFile: strVal(de.TokenFile)}
+		if err := e.validateSettings(); err != nil {
+			entryIssue(name, err)
 			continue
+		}
+		if err := validateCredentialSource(de); err != nil {
+			entryIssue(name, err)
+			continue
+		}
+		if e.TokenFile == "" {
+			if err := e.validateToken(); err != nil {
+				entryIssue(name, err)
+				continue
+			}
 		}
 		hk, err := canonicalHostKey(e.BaseURL)
 		if err != nil {
@@ -164,9 +214,75 @@ func loadConfig(path string) loadedConfig {
 		}
 		owners[hk] = name
 		res.hostKeys[name] = hk
+		if e.TokenFile != "" {
+			pending[name] = e
+		} else {
+			res.entries[name] = e
+		}
+	}
+	if len(res.issues) > 0 {
+		return res
+	}
+
+	// Second pass: read the token files. A file shared by several providers is read once, so they all
+	// see the same bytes.
+	contents := map[string][]byte{}
+	for _, name := range names {
+		e, ok := pending[name]
+		if !ok {
+			continue
+		}
+		tokenFileIssue := func(msg string) {
+			res.issues = append(res.issues, ConfigIssue{
+				Class: IssueCredentials, Provider: name, Field: "token_file", Message: msg,
+				err: fmt.Errorf("provider %q %s", name, msg),
+			})
+		}
+		raw, ok := contents[e.TokenFile]
+		if !ok {
+			raw, err = tokenFileReader(e.TokenFile, "token_file")
+			if err != nil {
+				tokenFileIssue(err.Error())
+				continue
+			}
+			contents[e.TokenFile] = raw
+			res.sources.add(newSource(e.TokenFile, raw))
+		}
+		token, problem := tokenFileValue(raw)
+		if problem != "" {
+			tokenFileIssue(fmt.Sprintf("token_file %s %s", e.TokenFile, problem))
+			continue
+		}
+		e.Token = Secret(token)
+		if err := e.validateToken(); err != nil {
+			tokenFileIssue(fmt.Sprintf("token_file %s: %s", e.TokenFile, err))
+			continue
+		}
 		res.entries[name] = e
 	}
 	return res
+}
+
+// validateCredentialSource checks, on a provider as written in the config file, that its credential
+// comes from exactly one place: with an authentication mode, one of token and token_file (never
+// both). It goes by which keys are present, not by whether they hold a value, so that an explicitly
+// empty token_file is an error and cannot pass as an absent one. It also checks the token_file path,
+// which is printed in messages.
+func validateCredentialSource(de diskEntry) error {
+	hasToken, hasFile := de.Token != nil, de.TokenFile != nil
+	switch {
+	case hasToken && hasFile:
+		return fieldErr("token_file", "set only one of token and token_file")
+	case hasFile && *de.TokenFile == "":
+		return fieldErr("token_file", "token_file must not be empty")
+	case hasFile:
+		if err := validateTokenFilePath(*de.TokenFile); err != nil {
+			return fieldErr("token_file", err.Error())
+		}
+	case de.Auth != "" && !hasToken:
+		return fieldErr("token", "an authentication mode requires a token or a token_file")
+	}
+	return nil
 }
 
 // decodeConfig parses the file content strictly: unknown fields are rejected and nothing may follow
@@ -260,6 +376,9 @@ type ProviderReport struct {
 	Auth string
 	// HasToken says a credential is configured inline in the file; its value is not carried.
 	HasToken bool
+	// TokenFile says the credential is read from a file the config names (token_file); neither its
+	// path nor its content is carried.
+	TokenFile bool
 }
 
 // ConfigReport is what loading the provider config found.
@@ -293,7 +412,7 @@ func CheckConfig(path string) ConfigReport {
 	rep.Issues = res.issues
 	for _, name := range slices.Sorted(maps.Keys(res.entries)) {
 		e := res.entries[name]
-		rep.Providers = append(rep.Providers, ProviderReport{Name: name, HostKey: res.hostKeys[name], Auth: e.Auth, HasToken: e.Token.Reveal() != ""})
+		rep.Providers = append(rep.Providers, ProviderReport{Name: name, HostKey: res.hostKeys[name], Auth: e.Auth, HasToken: e.Token.Reveal() != "" && e.TokenFile == "", TokenFile: e.TokenFile != ""})
 	}
 	return rep
 }

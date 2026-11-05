@@ -130,10 +130,14 @@ func authMode(p gitsync.ProviderReport) string {
 	return p.Auth
 }
 
-// credentialSource says where a provider's credential comes from, never what it is. Today that is
-// the config file itself; a provider that does not authenticate has none.
+// credentialSource says where a provider's credential comes from, never what it is: the config file
+// itself, or a file the config names (its path is not printed). A provider that does not authenticate
+// has none.
 func credentialSource(p gitsync.ProviderReport) string {
-	if p.HasToken {
+	switch {
+	case p.TokenFile:
+		return "token_file"
+	case p.HasToken:
 		return "inline token"
 	}
 	return "-"

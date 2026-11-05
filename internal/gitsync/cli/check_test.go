@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -166,5 +167,113 @@ func TestConfigCheckAgreesWithTheLoader(t *testing.T) {
 		if (checkErr != nil) != wantFail || (listErr != nil) != wantFail {
 			t.Errorf("check err = %v, list err = %v, want failure=%v for both", checkErr, listErr, wantFail)
 		}
+	}
+}
+
+// tokenFileCase is one `config check` run against a config that names token files. files are written
+// next to the config (name -> content and mode); the config text uses {dir} for that directory.
+type tokenFileCase struct {
+	name    string
+	config  string
+	files   map[string]checkFile
+	wantErr string
+}
+
+type checkFile struct {
+	content string
+	mode    os.FileMode
+}
+
+func TestConfigCheckTokenFiles(t *testing.T) {
+	const ok = checkToken + "\n"
+	tests := []tokenFileCase{
+		{
+			// The credential source is reported, neither the path nor the content.
+			name: "check_token_file_valid",
+			config: `{
+  "filed": {"base_url": "https://git.example.test/", "auth": "bearer", "token_file": "{dir}/good"},
+  "inline": {"base_url": "https://git-b.example.test/", "auth": "bearer", "token": "` + checkToken + `"}
+}`,
+			files: map[string]checkFile{"good": {ok, 0o600}},
+		},
+		{
+			// One problem per class of token-file failure, each located by provider and field.
+			name: "check_token_file_errors",
+			config: `{
+  "a-missing": {"base_url": "https://a.example.test/", "auth": "bearer", "token_file": "{dir}/absent"},
+  "b-writable": {"base_url": "https://b.example.test/", "auth": "bearer", "token_file": "{dir}/writable"},
+  "c-crlf": {"base_url": "https://c.example.test/", "auth": "bearer", "token_file": "{dir}/crlf"},
+  "d-empty": {"base_url": "https://d.example.test/", "auth": "bearer", "token_file": "{dir}/empty"},
+  "e-short": {"base_url": "https://e.example.test/", "auth": "bearer", "token_file": "{dir}/short"},
+  "f-fine": {"base_url": "https://f.example.test/", "auth": "bearer", "token_file": "{dir}/good"}
+}`,
+			files: map[string]checkFile{
+				"writable": {ok, 0o666},
+				"crlf":     {checkToken + "\r\n", 0o600},
+				"empty":    {"", 0o600},
+				"short":    {"short\n", 0o600},
+				"good":     {ok, 0o600},
+			},
+			wantErr: "found 5 problems",
+		},
+		{
+			name:    "check_token_file_empty_value",
+			config:  `{"p": {"base_url": "https://git.example.test/", "auth": "bearer", "token_file": ""}}`,
+			wantErr: "found 1 problem",
+		},
+		{
+			name:    "check_token_file_and_token",
+			config:  `{"p": {"base_url": "https://git.example.test/", "auth": "bearer", "token": "` + checkToken + `", "token_file": "{dir}/good"}}`,
+			files:   map[string]checkFile{"good": {ok, 0o600}},
+			wantErr: "found 1 problem",
+		},
+		{
+			// A configuration with any other problem opens no token file, so the missing file is not
+			// reported until the duplicate host is fixed.
+			name: "check_token_file_skipped_when_another_problem",
+			config: `{
+  "one": {"base_url": "https://git.example.test/", "auth": "bearer", "token_file": "{dir}/absent"},
+  "two": {"base_url": "https://git.example.test/other"}
+}`,
+			wantErr: "found 1 problem",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := withConfig(t)
+			dir := filepath.Dir(path)
+			for name, f := range tt.files {
+				p := filepath.Join(dir, name)
+				if err := os.WriteFile(p, []byte(f.content), f.mode); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, f.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := strings.ReplaceAll(tt.config, "{dir}", dir)
+			if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out, err := runCLI(t, "", "config", "check")
+			out = strings.ReplaceAll(out, path, "<config>")
+			out = strings.ReplaceAll(out, dir, "<dir>")
+			out = uidRE.ReplaceAllString(out, "uid N")
+
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Fatalf("config check failed: %v\n%s", err, out)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)):
+				t.Fatalf("config check error = %v, want one containing %q\n%s", err, tt.wantErr, out)
+			}
+			// Never the credential (in the file, with or without its line ending) and, for a config that
+			// is accepted, never a path either.
+			for _, leak := range []string{checkToken, strings.TrimSuffix(checkToken, checkToken[len(checkToken)-4:])} {
+				if strings.Contains(out, leak) || (err != nil && strings.Contains(err.Error(), leak)) {
+					t.Errorf("config check output or error repeats the credential:\n%s\n%v", out, err)
+				}
+			}
+			goldenCompare(t, tt.name+".golden", out)
+		})
 	}
 }
