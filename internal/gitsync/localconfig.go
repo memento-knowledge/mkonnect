@@ -3,8 +3,10 @@
 // The connection lifecycle (dial, enrollment, handshake, heartbeat, reconnect) lives in
 // internal/gateway, which this package drives — exactly as the API connector in internal/ws does.
 //
-// The local credential surface here is intentionally minimal — full credential hardening (at-rest
-// protection) is future work. The provider configuration is reloaded while the daemon runs; see reload.go.
+// The local credential surface here is intentionally minimal: a credential is an inline token or
+// the path of a file holding it, vetted as described on readProviderConfig and readTokenFile.
+// At-rest encryption is future work. The provider configuration, token files included, is reloaded
+// while the daemon runs; see reload.go.
 package gitsync
 
 import (

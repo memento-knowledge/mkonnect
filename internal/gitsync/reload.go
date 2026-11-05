@@ -2,17 +2,15 @@ package gitsync
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
-	"io"
 	"log/slog"
-	"os"
-	"syscall"
 	"time"
 )
 
-// The live reload of the local provider configuration (the provider file). A change is noticed by polling a digest, applied only once it has been seen twice, and
+// The live reload of the local provider configuration (the provider file, and the token files it
+// names). A change is noticed by polling a digest, applied only once it has been seen twice, and
 // can be forced with SIGHUP. These are constants on purpose: there is no knob and no way to turn the
 // reload off, because the only alternative to noticing a revoked credential is restarting.
 const (
@@ -25,31 +23,38 @@ const (
 	reloadSettle = time.Second
 )
 
-// digest identifies what one read of the configuration saw. It is derived from the bytes of the
-// provider file, so it is a function of secrets: it is never logged and never
-// leaves a package-private field.
+// digest identifies what one read of the configuration saw: the provider file and every token file it
+// names (by their bytes, or by their absence), and whether the provider file's mode was wider than
+// accepted. It is derived from credentials, so it is keyed with the per-process random key of Source
+// (a plain hash of a short token could be tested against guesses), it is never logged, and it
+// never leaves a package-private field.
 type digest [sha256.Size]byte
 
-// contentDigest is the digest of a configuration whose provider file holds data.
-func contentDigest(data []byte) digest { return digestOf("content", data) }
-
-// missingDigest is the digest of a configuration whose provider file does not exist.
-func missingDigest() digest { return digestOf("missing", nil) }
-
-// failureDigest is the digest of a configuration that could not be read or loaded, identified by its
-// category: every read that fails the same way is the same observation.
-func failureDigest(category string) digest { return digestOf("failure", []byte(category)) }
-
-func digestOf(kind string, data []byte) digest {
-	h := sha256.New()
+// sourcesDigest is the digest of a read that involved sources.
+func sourcesDigest(sources []Source, loose bool) digest {
+	mac := hmac.New(sha256.New, digestKey)
 	var n [8]byte
-	for _, part := range [][]byte{[]byte(kind), data} {
-		binary.BigEndian.PutUint64(n[:], uint64(len(part)))
-		h.Write(n[:])
-		h.Write(part)
+	put := func(b []byte) {
+		binary.BigEndian.PutUint64(n[:], uint64(len(b)))
+		mac.Write(n[:])
+		mac.Write(b)
+	}
+	for _, s := range sources {
+		put([]byte(s.Path))
+		if s.Read {
+			put([]byte{1})
+			put(s.digest[:])
+		} else {
+			put([]byte{0})
+		}
+	}
+	if loose {
+		put([]byte{1})
+	} else {
+		put([]byte{0})
 	}
 	var d digest
-	h.Sum(d[:0])
+	mac.Sum(d[:0])
 	return d
 }
 
@@ -57,7 +62,7 @@ func digestOf(kind string, data []byte) digest {
 type bundleKind int
 
 const (
-	// bundleOK: the configuration was read and is valid; store holds it.
+	// bundleOK: the configuration was read and is usable; store holds it.
 	bundleOK bundleKind = iota
 	// bundleMissing: the provider file does not exist.
 	bundleMissing
@@ -69,91 +74,52 @@ const (
 // bytes, so what is compared is exactly what would be applied: there is no window between noticing a
 // change and loading it in which the files could differ.
 type configBundle struct {
-	kind     bundleKind
-	digest   digest
-	store    *Store
-	category string // fixed, content-free; set for bundleInvalid
+	kind   bundleKind
+	digest digest
+	store  *Store
+	// category is the class of the first problem (an IssueClass), set for bundleInvalid: a fixed
+	// word, safe to log, taken from nothing in the files.
+	category string
+	// loose: a look found the provider file's mode wider than accepted, and so did not judge it.
+	loose bool
+	// dropped counts providers left out of store because their token file does not exist.
+	dropped int
+}
+
+// bundleOf turns a load into a bundle.
+func bundleOf(path string, res loadedConfig) configBundle {
+	d := sourcesDigest(res.sources.sorted(), res.loose)
+	b := configBundle{digest: d, loose: res.loose}
+	switch {
+	case res.missing:
+		b.kind = bundleMissing
+	case len(res.issues) == 0 || len(res.missingToken) > 0:
+		// A token file that does not exist is a credential that was taken away: the provider is
+		// dropped and the others carry on, rather than keeping the credential in force.
+		b.kind = bundleOK
+		b.store = &Store{path: path, data: res.entries, sources: res.sources, digest: d}
+		b.dropped = len(res.missingToken)
+	default:
+		b.kind = bundleInvalid
+		b.category = string(res.issues[0].Class)
+	}
+	return b
 }
 
 // configSource reads the configuration. A confirming read (confirm) is the one whose result may be
-// applied: it enforces the file rules exactly as the startup load does, tightening the file's mode
-// where it can. The reads that merely look for a change (not confirm) have no side effect: they
-// neither change a file's mode nor log about it, so polling is silent and cannot undo an operator's
-// deliberate permissions.
+// applied: it enforces the file rules exactly as the startup load does, tightening the provider
+// file's mode where it can. The reads that merely look for a change (not confirm) have no side
+// effect: they neither change a file's mode nor log about it, so polling is silent and cannot undo
+// an operator's deliberate permissions.
 type configSource interface {
 	read(confirm bool) configBundle
 }
 
-// fileSource reads the provider file at path.
+// fileSource reads the provider file at path, and the token files it names.
 type fileSource struct{ path string }
 
 func (f fileSource) read(confirm bool) configBundle {
-	var data []byte
-	var err error
-	var loose os.FileMode
-	if confirm {
-		data, err = readSecureFile(f.path, "git-sync config", maxConfigFileSize)
-	} else {
-		data, loose, err = peekFile(f.path, "git-sync config", maxConfigFileSize)
-	}
-	if err != nil {
-		if os.IsNotExist(err) {
-			return configBundle{kind: bundleMissing, digest: missingDigest()}
-		}
-		return configBundle{kind: bundleInvalid, digest: failureDigest(loadUnreadable), category: loadUnreadable}
-	}
-	// A look at a file whose mode the confirming read would have to tighten is a different
-	// observation from the same bytes at an acceptable mode: the mode is part of what it saw, so a
-	// change to the mode alone is noticed.
-	digest := contentDigest(data)
-	if loose != 0 {
-		digest = looseModeDigest(loose, data)
-	}
-	st, err := parseProviders(f.path, data)
-	if err != nil {
-		c := loadCategory(err)
-		return configBundle{kind: bundleInvalid, digest: digest, category: c}
-	}
-	return configBundle{kind: bundleOK, digest: digest, store: st}
-}
-
-// looseModeDigest is the digest a look reports for data at a mode that is not acceptable as-is.
-func looseModeDigest(mode os.FileMode, data []byte) digest {
-	return digestOf(fmt.Sprintf("loose:%04o", mode.Perm()), data)
-}
-
-// peekFile is readSecureFile without its side effects: it applies the same checks through one
-// descriptor but never changes the file's mode and never logs. A mode readSecureFile would tighten is
-// not an error here: whether it can be tightened is for the confirming read to find out, and a look
-// that called it unusable would hide, behind a digest shared by every unreadable file, the fix of
-// whatever made it so.
-func peekFile(path, what string, maxSize int64) (data []byte, loose os.FileMode, err error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, 0, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, 0, fmt.Errorf("%s is not a regular file", what)
-	}
-	if info.Size() > maxSize {
-		return nil, 0, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
-	}
-	if !readOnlyModeAcceptable(info.Mode()) {
-		loose = info.Mode()
-	}
-	b, err := io.ReadAll(io.LimitReader(f, maxSize+1))
-	if err != nil {
-		return nil, 0, err
-	}
-	if int64(len(b)) > maxSize {
-		return nil, 0, fmt.Errorf("%s is larger than the %d-byte limit", what, maxSize)
-	}
-	return b, loose, nil
+	return bundleOf(f.path, loadConfigMode(f.path, confirm))
 }
 
 // reloader notices changes to the provider configuration and applies them. One goroutine owns all of
@@ -175,8 +141,9 @@ type reloader struct {
 
 	applied digest // what is in force
 
-	pending     bool
-	pendingSeen digest // the digest seen first, awaiting its second sighting
+	pending      bool
+	pendingSeen  digest // the digest seen first, awaiting its second sighting
+	pendingLoose bool   // that sighting found the provider file's mode too open to judge
 
 	lastBad     digest // the unusable content already reported
 	haveLastBad bool
@@ -273,7 +240,7 @@ func (r *reloader) sight(b configBundle) bool {
 	if r.haveBadFrom && b.digest == r.badFrom {
 		return false
 	}
-	r.pending, r.pendingSeen = true, b.digest
+	r.pending, r.pendingSeen, r.pendingLoose = true, b.digest, b.loose
 	return true
 }
 
@@ -284,10 +251,12 @@ func (r *reloader) confirm() (rearm bool) {
 	switch {
 	case b.digest == r.applied:
 		return false // it went back
-	case b.kind == bundleInvalid && b.category == loadUnreadable && b.digest != r.pendingSeen:
-		// The look found content that the confirming read then refused (it could not tighten the
-		// file's mode, or the file went bad): unusable, and the content that was looked at is not
-		// looked at again until it changes.
+	case b.kind == bundleInvalid && b.category == string(IssueFile) && r.pendingLoose && b.digest != r.pendingSeen:
+		// The look found a provider file whose mode it could not judge, and the confirming read
+		// refused it (it could not tighten the mode). The two disagree about the same bytes, so what
+		// was looked at is unusable, and is not looked at again until its content or mode changes.
+		// (Any other disagreement means the files moved between the two reads, and is a new first
+		// sighting.)
 		r.badFrom, r.haveBadFrom = r.pendingSeen, true
 		r.decide(b, false)
 		return false
@@ -306,7 +275,7 @@ func (r *reloader) forced() (rearm bool) {
 	b := r.src.read(true)
 	if b.kind == bundleMissing && b.digest != r.applied {
 		slog.Warn("reload requested but the git-sync config file is missing; it will be treated as empty if it is still missing shortly")
-		r.pending, r.pendingSeen = true, b.digest
+		r.pending, r.pendingSeen, r.pendingLoose = true, b.digest, b.loose
 		return true
 	}
 	if b.digest == r.applied {
@@ -323,6 +292,9 @@ func (r *reloader) decide(b configBundle, explicit bool) {
 	switch b.kind {
 	case bundleOK:
 		r.applied, r.haveLastBad, r.haveBadFrom = b.digest, false, false
+		if b.dropped > 0 {
+			slog.Error("a token file no longer exists: the providers that used it are dropped, which revokes their credentials; the others carry on", "providers", b.dropped)
+		}
 		r.apply(b.store)
 	case bundleMissing:
 		slog.Error("the git-sync config file no longer exists: treating the provider configuration as empty, which revokes every provider credential and stops all syncing until the file is restored")

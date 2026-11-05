@@ -133,6 +133,7 @@ func syncRepo(ctx context.Context, d syncDeps, t syncTask) syncResult {
 
 // syncAttempt is syncRepo's body; it records what it measures in stats as it goes.
 func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats) syncResult {
+	d = d.redactingStderr(t)
 	if ctx.Err() != nil {
 		return syncResult{State: StatePending}
 	}

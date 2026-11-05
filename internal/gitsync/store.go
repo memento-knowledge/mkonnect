@@ -1,11 +1,9 @@
 package gitsync
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,101 +15,41 @@ import (
 // CLI) and read accessors (used by the connector). It mirrors internal/creds/store.go, with the
 // redaction-safe persistence above.
 type Store struct {
-	mu   sync.RWMutex
-	path string
-	data map[string]LocalEntry
-	// digest identifies the bytes data was built from (see contentDigest); zero for a store that was
-	// not loaded from a file.
+	mu      sync.RWMutex
+	path    string
+	data    map[string]LocalEntry
+	sources sourceSet
+	// digest identifies what the load read (see sourcesDigest); the live reload compares later reads
+	// against it. Zero for a store that was not loaded from files.
 	digest digest
 }
 
 // New loads the provider config from path. A missing file yields an empty store and no error. A
-// present file is tightened to owner-only, decoded strictly (unknown fields rejected), and every
-// entry validated; a duplicate host (two providers that resolve to the same scheme+host+port) is
-// rejected so credential selection can never be ambiguous. No error includes a credential value.
+// present file is vetted (see readProviderConfig), tightened to owner-only, decoded strictly
+// (unknown fields rejected), and every entry validated; a duplicate host (two providers that
+// resolve to the same scheme+host+port) is rejected so credential selection can never be ambiguous.
 //
-// The store remembers where it was loaded from and a digest of exactly the bytes it was built from,
-// which is what the live reload compares against (see reloader).
+// A provider's credential is either an inline token or a token_file, the path of a file holding it
+// (see readTokenFile for the checks on that file). Every provider is validated before any token file
+// is opened, so a token file is read only for a configuration that is otherwise acceptable. No error
+// includes a credential value or token-file content; errors name the provider and the problem.
+//
+// Any failure after the file was located is a *LoadError (use errors.As) carrying the files involved.
+// The files of a successful load are available from Sources.
 func New(path string) (*Store, error) {
-	data, err := readSecureFile(path, "git-sync config", maxConfigFileSize)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &Store{path: path, data: map[string]LocalEntry{}, digest: missingDigest()}, nil
-		}
-		return nil, err
+	res := loadConfig(path)
+	if len(res.issues) > 0 {
+		return nil, &LoadError{Sources: res.sources.sorted(), err: res.issues[0]}
 	}
-	return parseProviders(path, data)
+	return &Store{path: path, data: res.entries, sources: res.sources, digest: sourcesDigest(res.sources.sorted(), res.loose)}, nil
 }
 
-// Error categories for a configuration that could not be loaded. They are fixed strings, safe to log
-// on every reload: unlike the loader's own errors (which name keys of the file), they carry nothing
-// taken from it.
-const (
-	loadInvalidJSON   = "invalid_json"
-	loadInvalidConfig = "invalid_configuration"
-	loadUnreadable    = "unreadable"
-)
-
-// loadError is a load failure together with its fixed category.
-type loadError struct {
-	category string
-	err      error
-}
-
-func (e *loadError) Error() string { return e.err.Error() }
-func (e *loadError) Unwrap() error { return e.err }
-
-func invalidConfig(format string, args ...any) error {
-	return &loadError{category: loadInvalidConfig, err: fmt.Errorf(format, args...)}
-}
-
-// loadCategory returns the fixed category of a load failure.
-func loadCategory(err error) string {
-	var le *loadError
-	if errors.As(err, &le) {
-		return le.category
-	}
-	return loadUnreadable
-}
-
-// parseProviders builds a Store from the bytes of a provider config read from path.
-func parseProviders(path string, data []byte) (*Store, error) {
-	s := &Store{path: path, data: map[string]LocalEntry{}, digest: contentDigest(data)}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var dc map[string]diskEntry
-	if err := dec.Decode(&dc); err != nil {
-		var syntaxErr *json.SyntaxError
-		if errors.As(err, &syntaxErr) {
-			return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s is not valid JSON (at byte offset %d)", path, syntaxErr.Offset)}
-		}
-		return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s is not valid: %w", path, err)}
-	}
-	// Reject anything after the first JSON value (a second value or trailing garbage), so a
-	// malformed file cannot be silently half-accepted. Trailing whitespace yields io.EOF.
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, &loadError{category: loadInvalidJSON, err: fmt.Errorf("git-sync config %s has unexpected trailing data after the configuration object", path)}
-	}
-	hostKeys := make(map[string]string, len(dc))
-	for name, de := range dc {
-		if err := validateProviderName(name); err != nil {
-			return nil, invalidConfig("git-sync config %s: %w", path, err)
-		}
-		e := LocalEntry{BaseURL: de.BaseURL, Auth: de.Auth, Username: de.Username, Token: Secret(de.Token)}
-		if err := e.Validate(); err != nil {
-			return nil, invalidConfig("provider %q is invalid: %w", name, err)
-		}
-		hk, err := canonicalHostKey(e.BaseURL)
-		if err != nil {
-			return nil, invalidConfig("provider %q is invalid: base_url %w", name, err)
-		}
-		if other, ok := hostKeys[hk]; ok {
-			return nil, invalidConfig("git-sync config %s: providers %q and %q use the same host; each host may be configured once", path, other, name)
-		}
-		hostKeys[hk] = name
-		s.data[name] = e
-	}
-	return s, nil
+// Sources returns the files the last load read, sorted by path: the config file (listed even when it
+// does not exist, so a reload notices it appearing) and each token file. See Source.
+func (s *Store) Sources() []Source {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sources.sorted()
 }
 
 // Get returns the entry for name, or false if none.
@@ -143,6 +81,9 @@ func (s *Store) Names() []string {
 func (s *Store) Set(name string, e LocalEntry) error {
 	if err := validateProviderName(name); err != nil {
 		return err
+	}
+	if e.TokenFile != "" {
+		return errors.New("a token_file provider is configured by editing the configuration file, not through Set")
 	}
 	if err := e.Validate(); err != nil {
 		return err
@@ -221,11 +162,19 @@ func (s *Store) matchByHostKey(hostKey string) (name string, e LocalEntry, ok bo
 
 // save writes data atomically: a temp file in the same directory, tightened to 0600, synced,
 // then renamed over the target, with the directory synced so the rename is durable. The on-disk
-// form reveals the token (the file must hold the real value), never the Secret's redaction.
+// form reveals an inline token (the file must hold the real value), never the Secret's redaction.
+// A token-file provider is written back as its path alone: the credential belongs to that file and
+// must not be copied into the config.
 func (s *Store) save(data map[string]LocalEntry) error {
 	dc := make(map[string]diskEntry, len(data))
 	for name, e := range data {
-		dc[name] = diskEntry{BaseURL: e.BaseURL, Auth: e.Auth, Username: e.Username, Token: e.Token.Reveal()}
+		de := diskEntry{BaseURL: e.BaseURL, Auth: e.Auth, Username: e.Username}
+		if e.TokenFile != "" {
+			de.TokenFile = strPtr(e.TokenFile)
+		} else {
+			de.Token = strPtr(e.Token.Reveal())
+		}
+		dc[name] = de
 	}
 	b, err := json.MarshalIndent(dc, "", "  ")
 	if err != nil {
@@ -260,5 +209,17 @@ func (s *Store) save(data map[string]LocalEntry) error {
 		_ = d.Sync()
 		_ = d.Close()
 	}
+	// The config now on disk is what this store holds, so Sources must describe it: the new config,
+	// plus the token files that the entries now saved still name (a replaced or removed token-file
+	// provider no longer contributes one). Their fingerprints are those of the load that read them.
+	next := sourceSet{s.path: newSource(s.path, b)}
+	for _, e := range data {
+		if e.TokenFile != "" {
+			if src, ok := s.sources[e.TokenFile]; ok {
+				next[e.TokenFile] = src
+			}
+		}
+	}
+	s.sources = next
 	return nil
 }

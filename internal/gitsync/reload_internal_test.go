@@ -53,6 +53,13 @@ func (s *scriptedSource) readCount() int {
 	return s.reads
 }
 
+// contentDigest and missingDigest stand in for the digests of reads whose files the tests do not
+// have: any two with different inputs differ.
+func contentDigest(data []byte) digest {
+	return sourcesDigest([]Source{newSource("/test/content", data)}, false)
+}
+func missingDigest() digest { return sourcesDigest([]Source{{Path: "/test/missing"}}, false) }
+
 func okBundle(label string) configBundle {
 	return configBundle{kind: bundleOK, digest: contentDigest([]byte(label)), store: &Store{data: map[string]LocalEntry{label: {}}}}
 }
@@ -252,7 +259,7 @@ func TestSIGHUPDuringASettleAppliesOnce(t *testing.T) {
 func TestInvalidFileKeepsLastGoodAndLogsOnce(t *testing.T) {
 	logs := captureLogs(t)
 	src := &scriptedSource{}
-	bad := badBundle("canary-token-0123456789 {not json", loadInvalidJSON)
+	bad := badBundle("canary-token-0123456789 {not json", string(IssueSyntax))
 	src.set(bad)
 	a := contentDigest([]byte("a"))
 	_, got := startReloader(t, src, a, 3*time.Millisecond, 3*time.Millisecond)
@@ -264,7 +271,7 @@ func TestInvalidFileKeepsLastGoodAndLogsOnce(t *testing.T) {
 	if n := strings.Count(out, "cannot be used"); n != 1 {
 		t.Errorf("reported %d times, want once:\n%s", n, out)
 	}
-	if !strings.Contains(out, loadInvalidJSON) {
+	if !strings.Contains(out, string(IssueSyntax)) {
 		t.Errorf("log lacks the category:\n%s", out)
 	}
 	for _, leak := range []string{"canary-token", hex.EncodeToString(bad.digest[:]), hex.EncodeToString(bad.digest[:4])} {
@@ -281,10 +288,10 @@ func TestInvalidFileKeepsLastGoodAndLogsOnce(t *testing.T) {
 func TestEachDistinctUnusableContentIsReported(t *testing.T) {
 	logs := captureLogs(t)
 	src := &scriptedSource{}
-	src.set(badBundle("x", loadInvalidJSON))
+	src.set(badBundle("x", string(IssueSyntax)))
 	_, _ = startReloader(t, src, contentDigest([]byte("a")), 3*time.Millisecond, 3*time.Millisecond)
 	eventuallyTrue(t, "the first report", func() bool { return strings.Count(logs.String(), "cannot be used") == 1 })
-	src.set(badBundle("y", loadInvalidConfig))
+	src.set(badBundle("y", string(IssueSchema)))
 	eventuallyTrue(t, "the second report", func() bool { return strings.Count(logs.String(), "cannot be used") == 2 })
 	quietly(40 * time.Millisecond)
 	if n := strings.Count(logs.String(), "cannot be used"); n != 2 {
@@ -326,7 +333,7 @@ func TestFileMissingAtStartupIsNotAnAlarm(t *testing.T) {
 // new first sighting, not a confirmation of the old one.
 func TestConfirmingReadThatSeesSomethingElseStartsTheWaitOver(t *testing.T) {
 	src := &scriptedSource{}
-	src.set(badBundle("mode", loadUnreadable), okBundle("fixed"), okBundle("fixed"))
+	src.set(badBundle("mode", string(IssueFile)), okBundle("fixed"), okBundle("fixed"))
 	_, got := startReloader(t, src, contentDigest([]byte("a")), 5*time.Millisecond, 5*time.Millisecond)
 	eventuallyTrue(t, "an apply", func() bool { return got.count() == 1 })
 	if names := got.names(0); len(names) != 1 || names[0] != "fixed" {
@@ -353,7 +360,8 @@ func TestSIGHUPWithNoChangeAppliesNothing(t *testing.T) {
 func TestFileThatCannotBeTightenedIsNotConfirmedOverAndOver(t *testing.T) {
 	logs := captureLogs(t)
 	look := okBundle("loose")
-	confirmBad := badBundle("loose-refused", loadUnreadable)
+	look.loose = true // the look could not judge the file's mode
+	confirmBad := badBundle("loose-refused", string(IssueFile))
 	src := &modalSource{look: look, confirm: confirmBad}
 	_, got := startReloader(t, src, contentDigest([]byte("a")), 3*time.Millisecond, 3*time.Millisecond)
 	eventuallyTrue(t, "the report", func() bool { return strings.Count(logs.String(), "cannot be used") == 1 })
@@ -426,7 +434,7 @@ func TestModeOnlyFixOfALooseFileIsPickedUp(t *testing.T) {
 func TestValidContentSeenThenTransientlyBadIsStillApplied(t *testing.T) {
 	src := &scriptedSource{}
 	y := okBundle("y")
-	src.set(y, badBundle("z", loadInvalidJSON), y, y, y, y, y, y)
+	src.set(y, badBundle("z", string(IssueSyntax)), y, y, y, y, y, y)
 	_, got := startReloader(t, src, contentDigest([]byte("a")), 3*time.Millisecond, 3*time.Millisecond)
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) && got.count() == 0 {

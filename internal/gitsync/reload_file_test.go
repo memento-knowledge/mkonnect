@@ -2,6 +2,7 @@ package gitsync_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -208,4 +209,131 @@ func TestFileRepairedAfterBeingUnreadableIsPickedUp(t *testing.T) {
 	waitFor(t, func() bool {
 		return c.ProviderTokenForTest("origin") == tokenTwo
 	})
+}
+
+// tokenFileProvidersJSON is a provider file whose providers read their credential from files.
+func tokenFileProvidersJSON(entries ...[3]string) string {
+	var parts []string
+	for _, e := range entries { // name, host, token file path
+		parts = append(parts, fmt.Sprintf(`%q:{"base_url":"https://%s/","auth":"bearer","token_file":%q}`, e[0], e[1], e[2]))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+func writeTokenFile(t *testing.T, path, token string) {
+	t.Helper()
+	replaceFile(t, path, token+"\n", 0o600)
+}
+
+// Rotating the credential by overwriting its token file, which the provider file does not change, is
+// noticed: the sync using the old credential is stopped and the repository is synced with the new one.
+func TestRotatingATokenFileRotatesTheCredentialLive(t *testing.T) {
+	logs := captureLogs(t)
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "git-token")
+	writeTokenFile(t, tokenPath, tokenOne)
+	g := &scriptedGit{gate: make(chan struct{})}
+	c, _ := newFileClient(t, tokenFileProvidersJSON([3]string{"origin", "git.example.com", tokenPath}),
+		&fakeProber{result: gitsync.OriginReachable}, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
+	configureRepo(c, &stubSender{}, "repo-a", "https://git.example.com/team/a.git")
+	waitFor(t, func() bool { return g.count("fetch") == 1 })
+	fileReload(t, c, 10*time.Millisecond, 10*time.Millisecond)
+
+	writeTokenFile(t, tokenPath, tokenTwo)
+
+	waitFor(t, func() bool { return g.count("fetch") == 2 })
+	var fetchEnvs [][]string
+	g.mu.Lock()
+	for i, a := range g.argvs {
+		if subOf(a) == "fetch" {
+			fetchEnvs = append(fetchEnvs, g.envs[i])
+		}
+	}
+	g.mu.Unlock()
+	if !envHas(fetchEnvs[0], tokenOne) || !envHas(fetchEnvs[1], tokenTwo) || envHas(fetchEnvs[1], tokenOne) {
+		t.Error("the rerun did not use only the new credential")
+	}
+	assertNoSecrets(t, "logs", logs.String(), tokenOne, tokenTwo, testPushToken)
+}
+
+// A Kubernetes Secret volume updates by swapping a symlink; the swap is a change of the token.
+func TestSwappingATokenFileSymlinkIsNoticed(t *testing.T) {
+	dir := t.TempDir()
+	for _, v := range []struct{ name, token string }{{"v1", tokenOne}, {"v2", tokenTwo}} {
+		if err := os.MkdirAll(filepath.Join(dir, v.name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeTokenFile(t, filepath.Join(dir, v.name, "token"), v.token)
+	}
+	link := filepath.Join(dir, "..data")
+	if err := os.Symlink("v1", link); err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(dir, "git-token")
+	if err := os.Symlink(filepath.Join("..data", "token"), tokenPath); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := newFileClient(t, tokenFileProvidersJSON([3]string{"origin", "git.example.com", tokenPath}), &fakeProber{result: gitsync.OriginReachable})
+	fileReload(t, c, 10*time.Millisecond, 10*time.Millisecond)
+
+	if err := os.Symlink("v2", link+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(link+".tmp", link); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return c.ProviderTokenForTest("origin") == tokenTwo })
+}
+
+// A token file that is deleted drops its provider only: that provider's syncs are stopped and its
+// repositories are denied, while the other providers carry on. The file coming back restores it.
+func TestDeletingATokenFileDropsOnlyItsProvider(t *testing.T) {
+	logs := captureLogs(t)
+	dir := t.TempDir()
+	goneToken, keptToken := filepath.Join(dir, "gone-token"), filepath.Join(dir, "kept-token")
+	writeTokenFile(t, goneToken, tokenOne)
+	writeTokenFile(t, keptToken, tokenTwo)
+	g := &scriptedGit{gate: make(chan struct{})}
+	c, _ := newFileClient(t, tokenFileProvidersJSON([3]string{"gone", "git.example.com", goneToken}, [3]string{"kept", "other.example.com", keptToken}),
+		&fakeProber{result: gitsync.OriginReachable}, gitsync.WithGitRunner(g.run))
+	t.Cleanup(g.release)
+	s := &stubSender{}
+	c.HandleMessage(context.Background(), s, "git_sync_config", configJSONRaw("1",
+		repoJSON("repo-gone", "https://git.example.com/a.git", "", "https://replica.example.com/r/a.git", testPushToken),
+		repoJSON("repo-kept", "https://other.example.com/b.git", "", "https://replica.example.com/r/b.git", testPushToken)))
+	waitFor(t, func() bool { return c.AttemptsForTest() == 2 || g.count("fetch") == 2 })
+	fileReload(t, c, 10*time.Millisecond, 10*time.Millisecond)
+
+	if err := os.Remove(goneToken); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { _, bound, _ := c.BindingForTest("repo-gone"); return !bound })
+	if _, bound, _ := c.BindingForTest("repo-kept"); !bound {
+		t.Error("the provider whose token file is intact was dropped too")
+	}
+	waitFor(t, func() bool { return strings.Contains(logs.String(), "no longer exists") })
+	assertNoSecrets(t, "logs", logs.String(), tokenOne, tokenTwo)
+
+	writeTokenFile(t, goneToken, tokenOne)
+	waitFor(t, func() bool { _, bound, _ := c.BindingForTest("repo-gone"); return bound })
+}
+
+// A token file that exists but cannot be used (here empty, as while it is being rewritten) is not a
+// revocation: the last good configuration stays in force.
+func TestUnusableTokenFileKeepsTheLastGood(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "git-token")
+	writeTokenFile(t, tokenPath, tokenOne)
+	c, _ := newFileClient(t, tokenFileProvidersJSON([3]string{"origin", "git.example.com", tokenPath}), &fakeProber{result: gitsync.OriginReachable})
+	configureRepo(c, &stubSender{}, "repo-a", "https://git.example.com/team/a.git")
+	fileReload(t, c, 10*time.Millisecond, 10*time.Millisecond)
+
+	replaceFile(t, tokenPath, "", 0o600)
+	time.Sleep(300 * time.Millisecond)
+	if _, bound, _ := c.BindingForTest("repo-a"); !bound || c.ProviderTokenForTest("origin") != tokenOne {
+		t.Error("an empty token file revoked or replaced the credential in force")
+	}
+	writeTokenFile(t, tokenPath, tokenTwo)
+	waitFor(t, func() bool { return c.ProviderTokenForTest("origin") == tokenTwo })
 }

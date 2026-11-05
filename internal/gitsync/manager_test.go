@@ -236,6 +236,12 @@ func TestManagerLogsEachSyncOutcome(t *testing.T) {
 	m2.enqueue(context.Background(), []string{"repo-b"})
 	eventually(t, func() bool { return len(h2.results("repo-b")) == 1 })
 
+	// The outcome is logged after the finish hook that records the result, so wait for the lines
+	// themselves rather than read the log the instant the result is visible.
+	eventually(t, func() bool {
+		out := logs.String()
+		return strings.Contains(out, "repo_id=repo-a") && strings.Contains(out, "repo_id=repo-b") && strings.Contains(out, "sync complete")
+	})
 	out := logs.String()
 	for _, want := range []string{"repo_id=repo-a", "origin_access_denied", "level=WARN", "repo_id=repo-b", "sync complete", "duration="} {
 		if !strings.Contains(out, want) {

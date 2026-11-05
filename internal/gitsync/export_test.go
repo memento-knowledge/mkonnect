@@ -178,3 +178,29 @@ func (c *Client) ProviderTokenForTest(name string) string {
 	defer c.mu.Unlock()
 	return c.providers.byName[name].entry.Token.Reveal()
 }
+
+// SetOwnerForTest makes every vetted file appear to be owned by owner(base name), and the running
+// user to be euid, so a test can present a file as foreign-owned or root-owned without chown. owner
+// returns ok=false to simulate an owner that cannot be determined. It returns a function that
+// restores the real lookups.
+func SetOwnerForTest(owner func(name string) (uid int, ok bool), euid int) func() {
+	prevOwner, prevEUID := fileOwnerUID, effectiveUID
+	fileOwnerUID = func(info os.FileInfo) (int, bool) { return owner(info.Name()) }
+	effectiveUID = func() int { return euid }
+	return func() { fileOwnerUID, effectiveUID = prevOwner, prevEUID }
+}
+
+// RealGitRunnersForTest returns the runners the daemon uses to execute git, so a test can wrap them to
+// record exactly what the connector hands to git while still running the real binary.
+func RealGitRunnersForTest() (
+	run func(ctx context.Context, argv, env []string, dir string) ([]byte, error),
+	runOut func(ctx context.Context, argv, env []string, dir string, stdout io.Writer) ([]byte, error),
+) {
+	return runGit, runGitOut
+}
+
+// NewGitProberForTest returns the real origin prober with its git runner replaced, so a test can record
+// what the probe hands to git while still running the real binary.
+func NewGitProberForTest(run func(ctx context.Context, argv, env []string, dir string) ([]byte, error)) OriginProber {
+	return &gitProber{run: run}
+}
