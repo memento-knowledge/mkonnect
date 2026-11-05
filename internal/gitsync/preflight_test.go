@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -220,29 +221,26 @@ func TestCanCreateDir(t *testing.T) {
 	}
 }
 
-func TestReadConfigRefusesALooseFileItCannotTighten(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root can tighten any file")
-	}
-	// A file the connector cannot chmod because it belongs to someone else (root owns /etc/hosts).
-	if !cannotTighten("/etc/hosts") {
-		t.Skip("/etc/hosts is not root-owned here")
-	}
-	if cannotTighten(writeTemp(t, "{}")) {
+func TestCannotTighten(t *testing.T) {
+	own := writeTemp(t, "{}")
+	if cannotTighten(own) {
 		t.Error("a file the user owns on a writable file system can be tightened")
 	}
-}
-
-func writeTemp(t *testing.T, body string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "f.json")
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
+	info, err := os.Stat(own)
+	if err != nil || info.Mode().Perm() != 0o644 {
+		t.Errorf("the probe changed the file's mode: %v %v", info.Mode().Perm(), err)
 	}
-	return path
+	// A file that cannot be examined is not shown to be tightenable.
+	if !cannotTighten(filepath.Join(t.TempDir(), "absent")) {
+		t.Error("a path that cannot be opened must count as not tightenable")
+	}
+	// A file that belongs to someone else: the real call, with the file's current mode, is refused.
+	if _, err := os.Stat("/etc/hosts"); err == nil && os.Geteuid() != 0 && !cannotTighten("/etc/hosts") {
+		t.Error("a root-owned file cannot be chmod-ed by an ordinary user")
+	}
 }
 
-func TestReadConfigLooseFileOnAReadOnlyFilesystem(t *testing.T) {
+func TestReadConfigLooseFileWhenChmodIsDenied(t *testing.T) {
 	body := `{"a": {"base_url": "https://a.example.test/", "auth": "bearer", "token": "tok-0123456789abcdef"}}`
 	path := writeTemp(t, body) // mode 0644: wider than the connector accepts, owned by this user
 	if err := os.Chmod(path, 0o644); err != nil {
@@ -251,18 +249,24 @@ func TestReadConfigLooseFileOnAReadOnlyFilesystem(t *testing.T) {
 
 	for _, tt := range []struct {
 		name     string
-		readOnly bool
+		chmodErr error // what the chmod the connector would make returns
 		wantFail bool
 	}{
-		{"writable file system: the connector tightens it, so a warning only", false, false},
-		{"read-only file system: the connector cannot tighten it and refuses it", true, true},
+		{"chmod works: the connector tightens it, so a warning only", nil, false},
+		{"read-only file system", syscall.EROFS, true},
+		{"not permitted (another owner, an immutable file, a policy)", syscall.EPERM, true},
+		{"denied by an ACL or security policy", syscall.EACCES, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			prev := onReadOnlyFS
-			onReadOnlyFS = func(string) bool { return tt.readOnly }
-			t.Cleanup(func() { onReadOnlyFS = prev })
+			prev := fchmod
+			var gotMode os.FileMode
+			fchmod = func(f *os.File, m os.FileMode) error { gotMode = m; return tt.chmodErr }
+			t.Cleanup(func() { fchmod = prev })
 
 			cfg := ReadConfig(path)
+			if gotMode.Perm() != 0o644 {
+				t.Errorf("the probe must use the file's current mode, used %o", gotMode.Perm())
+			}
 			if tt.wantFail {
 				if len(cfg.Report.Issues) != 1 || cfg.Report.Issues[0].Class != IssueFile {
 					t.Fatalf("issues = %+v, want one file issue", cfg.Report.Issues)
@@ -280,8 +284,11 @@ func TestReadConfigLooseFileOnAReadOnlyFilesystem(t *testing.T) {
 	}
 }
 
-func TestOnReadOnlyFSIsFalseForAWritableDirectory(t *testing.T) {
-	if onReadOnlyFS(writeTemp(t, "{}")) {
-		t.Error("a file in a writable temp directory is not on a read-only file system")
+func writeTemp(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "f.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
 	}
+	return path
 }
