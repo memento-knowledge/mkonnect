@@ -227,25 +227,44 @@ func TestPreflightTempDir(t *testing.T) {
 			t.Errorf("preflight left %d entries behind in the temp dir", len(entries))
 		}
 	})
-	t.Run("missing is not created", func(t *testing.T) {
+	t.Run("missing but creatable warns and is not created", func(t *testing.T) {
 		basicsEnv(t)
-		missing := filepath.Join(t.TempDir(), "absent")
+		missing := filepath.Join(t.TempDir(), "absent", "deeper")
 		t.Setenv("GIT_SYNC_TMP_DIR", missing)
-		doc, _, err := runPreflightJSON(t)
-		c := wantStatus(t, doc, "tmpdir", "fail")
-		if c.Remedy == nil || err == nil {
-			t.Error("a missing temp dir needs a remedy and a non-zero exit")
+		doc, _, _ := runPreflightJSON(t)
+		c := wantStatus(t, doc, "tmpdir", "warn")
+		if c.Remedy == nil {
+			t.Error("a warning needs a remedy")
 		}
 		if _, statErr := os.Stat(missing); !errors.Is(statErr, os.ErrNotExist) {
 			t.Error("preflight must not create the temp dir")
 		}
 		wantStatus(t, doc, "origins", "skip")
 	})
+	t.Run("missing and not creatable fails", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can create anywhere")
+		}
+		basicsEnv(t)
+		ro := filepath.Join(t.TempDir(), "ro")
+		if err := os.Mkdir(ro, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GIT_SYNC_TMP_DIR", filepath.Join(ro, "tmp"))
+		doc, _, err := runPreflightJSON(t)
+		wantStatus(t, doc, "tmpdir", "fail")
+		if err == nil {
+			t.Error("expected a non-zero exit")
+		}
+	})
 	t.Run("relative path", func(t *testing.T) {
 		basicsEnv(t)
 		t.Setenv("GIT_SYNC_TMP_DIR", "relative/tmp")
-		doc, _, _ := runPreflightJSON(t)
+		doc, out, _ := runPreflightJSON(t)
 		wantStatus(t, doc, "tmpdir", "fail")
+		if strings.Contains(out, "relative/tmp") {
+			t.Error("the value of the variable must not be echoed")
+		}
 	})
 	t.Run("a file, not a directory", func(t *testing.T) {
 		basicsEnv(t)
@@ -400,9 +419,9 @@ func TestPreflightGateway(t *testing.T) {
 	})
 
 	t.Run("name does not resolve", func(t *testing.T) {
-		basicsEnv(t)
-		t.Setenv("GATEWAY_URL", "wss://gateway.example.test")
-		t.Cleanup(cli.SetPreflightEnvForTest(nil, nil, func(context.Context, string) ([]string, error) {
+		g := newGateway(t)
+		preflightEnv(t, "wss://gateway.example.test")
+		t.Cleanup(cli.SetPreflightEnvForTest(nil, g.trusting(), func(context.Context, string) ([]string, error) {
 			return nil, &net.DNSError{Err: "no such host", Name: "gateway.example.test", IsNotFound: true}
 		}))
 		doc, _, err := runPreflightJSON(t)
@@ -415,9 +434,12 @@ func TestPreflightGateway(t *testing.T) {
 
 	t.Run("through a proxy", func(t *testing.T) {
 		g := newGateway(t)
+		var cmu sync.Mutex
 		var connects []string
 		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cmu.Lock()
 			connects = append(connects, r.Method+" "+r.Host)
+			cmu.Unlock()
 			if r.Method != http.MethodConnect {
 				http.Error(w, "no", http.StatusBadRequest)
 				return
@@ -455,6 +477,8 @@ func TestPreflightGateway(t *testing.T) {
 		if !strings.Contains(c.Detail, "through the proxy at "+pu.Host) {
 			t.Errorf("detail = %q", c.Detail)
 		}
+		cmu.Lock()
+		defer cmu.Unlock()
 		if len(connects) != 1 || !strings.HasPrefix(connects[0], "CONNECT ") {
 			t.Errorf("proxy saw %v", connects)
 		}
@@ -484,6 +508,43 @@ func TestPreflightGateway(t *testing.T) {
 		}
 		if strings.Contains(out, proxyUserPW) {
 			t.Error("proxy credentials appeared in the output")
+		}
+	})
+
+	t.Run("unparsable proxy settings", func(t *testing.T) {
+		g := newGateway(t)
+		preflightEnv(t, "wss://"+g.host())
+		t.Cleanup(cli.SetPreflightEnvForTest(nil, func() *http.Transport {
+			tr := g.trusting()()
+			tr.Proxy = func(*http.Request) (*url.URL, error) {
+				return nil, errors.New(`invalid proxy address "http://svc:` + proxyUserPW + `@"`)
+			}
+			return tr
+		}, nil))
+		doc, out, err := runPreflightJSON(t)
+		wantStatus(t, doc, "gateway-dns", "skip")
+		c := wantStatus(t, doc, "gateway-tls", "fail")
+		if !strings.Contains(c.Detail, "could not be parsed") || err == nil || strings.Contains(out, proxyUserPW) {
+			t.Errorf("detail = %q err=%v", c.Detail, err)
+		}
+	})
+
+	t.Run("proxy that cannot be reached", func(t *testing.T) {
+		g := newGateway(t)
+		dead := httptest.NewServer(http.NotFoundHandler())
+		deadURL, _ := url.Parse(dead.URL)
+		dead.Close()
+		deadURL.User = url.UserPassword("svc", proxyUserPW)
+		preflightEnv(t, "wss://"+g.host())
+		t.Cleanup(cli.SetPreflightEnvForTest(nil, func() *http.Transport {
+			tr := g.trusting()()
+			tr.Proxy = http.ProxyURL(deadURL)
+			return tr
+		}, nil))
+		doc, out, _ := runPreflightJSON(t)
+		c := wantStatus(t, doc, "gateway-tls", "fail")
+		if !strings.Contains(c.Detail, "could not be reached") || strings.Contains(out, proxyUserPW) {
+			t.Errorf("detail = %q", c.Detail)
 		}
 	})
 

@@ -61,8 +61,9 @@ const (
 // stop it from reading the version.
 var gitVersionRE = regexp.MustCompile(`^git version (([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})?)`)
 
-// ParseGitVersion reads the output of `git --version`. It returns the dotted version as printed
-// (for display) and its major and minor numbers; ok is false for anything it does not recognise.
+// ParseGitVersion reads the output of `git --version`. It returns the leading dotted numbers of the
+// version (up to three, for display; a suffix is dropped) and its major and minor numbers; ok is false
+// for anything it does not recognise.
 func ParseGitVersion(out string) (version string, major, minor int, ok bool) {
 	line, _, _ := strings.Cut(strings.TrimSpace(out), "\n")
 	m := gitVersionRE.FindStringSubmatch(line)

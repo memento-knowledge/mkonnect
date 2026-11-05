@@ -30,14 +30,15 @@ for each check with how to fix it, and exits non-zero if any check FAILs:
   provider-config  the provider configuration is one the connector accepts
   origin:<name>  each configured git server answers (git ls-remote against its base URL)
 
-It does not enrol, authenticate to the gateway, send any data, or contact the Memento replica, and it
-is not a dry-run sync. A provider's credential is sent only to that provider's own git server. It
+It does not enrol, authenticate to the gateway, send connector data, or contact the Memento replica
+(its only request to the platform is one body-less, unauthenticated HEAD to the gateway), and it is
+not a dry-run sync. A provider's credential is sent only to that provider's own git server. It
 never prints a credential.
   --json  print the result as a single JSON object instead of text
 
-Run it as the user the connector runs as, with the connector's environment, from the place the
-connector will run (for Kubernetes, inside the pod: kubectl exec deploy/<name> -- /mkonnect-gitsync
-connector preflight). A container started only for this check has its own network policy, DNS and
+Run it as the user the connector runs as, with the connector's environment and the same volumes,
+from the place the connector will run (for Kubernetes, inside the pod: kubectl exec deploy/<name> --
+/mkonnect-gitsync connector preflight). A container started only for this check has its own network policy, DNS and
 proxy settings, and may not see what the connector will see.`
 
 // preflightJSONVersion is the version of the --json document. Fields are only ever added within a

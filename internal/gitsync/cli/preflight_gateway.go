@@ -85,7 +85,14 @@ func checkGateway(ctx context.Context, env preflightEnv) []checkResult {
 
 	var proxyURL *url.URL
 	if tr.Proxy != nil {
-		proxyURL, _ = tr.Proxy(req)
+		var perr error
+		if proxyURL, perr = tr.Proxy(req); perr != nil {
+			// Go's error repeats the setting, which may carry credentials, so it is not shown.
+			return []checkResult{urlRes,
+				{ID: "gateway-dns", Status: statusSkip, Detail: "not checked: the proxy settings are not valid (see gateway-tls)"},
+				{ID: "gateway-tls", Status: statusFail, Detail: "HTTPS_PROXY / NO_PROXY could not be parsed",
+					Remedy: "set HTTPS_PROXY to a URL such as http://proxy.example.net:3128, without credentials, and check NO_PROXY"}}
+		}
 	}
 	dnsRes := checkGatewayDNS(ctx, env, u.Hostname(), proxyURL)
 	if dnsRes.Status == statusFail {
@@ -188,6 +195,7 @@ func describeGatewayError(err error, hostPort string, proxyURL *url.URL) (detail
 		via = " through the proxy at " + proxyURL.Host
 	}
 	var (
+		proxyOp     *net.OpError
 		unknownAuth x509.UnknownAuthorityError
 		hostErr     x509.HostnameError
 		invalid     x509.CertificateInvalidError
@@ -195,6 +203,9 @@ func describeGatewayError(err error, hostPort string, proxyURL *url.URL) (detail
 		dnsErr      *net.DNSError
 	)
 	switch {
+	case proxyURL != nil && errors.As(err, &proxyOp) && proxyOp.Op == "proxyconnect":
+		return fmt.Sprintf("the proxy at %s could not be reached", proxyURL.Host),
+			"check the proxy address in HTTPS_PROXY and that this environment may connect to it"
 	case errors.As(err, &unknownAuth):
 		return fmt.Sprintf("%s%s: the server's certificate is not signed by a trusted authority", hostPort, via),
 			"if the gateway is reached through a TLS-inspecting proxy or has an internal CA, add that CA to the trust store of the environment that runs the connector (mount a PEM file and set SSL_CERT_FILE, or SSL_CERT_DIR); GIT_SSL_CAINFO does not apply to the gateway connection"

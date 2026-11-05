@@ -193,3 +193,51 @@ func TestProbeOriginsOnlyProbesAnAcceptedConfig(t *testing.T) {
 		t.Errorf("a missing configuration was probed")
 	}
 }
+
+func TestCanCreateDir(t *testing.T) {
+	root := t.TempDir()
+	if !CanCreateDir(filepath.Join(root, "a", "b", "c")) {
+		t.Error("a missing path under a writable directory can be created")
+	}
+	if _, err := os.Stat(filepath.Join(root, "a")); err == nil {
+		t.Error("CanCreateDir created something")
+	}
+	f := filepath.Join(root, "file")
+	if err := os.WriteFile(f, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if CanCreateDir(filepath.Join(f, "sub")) {
+		t.Error("nothing can be created under a file")
+	}
+	if os.Geteuid() != 0 {
+		ro := filepath.Join(root, "ro")
+		if err := os.Mkdir(ro, 0o500); err != nil {
+			t.Fatal(err)
+		}
+		if CanCreateDir(filepath.Join(ro, "x")) {
+			t.Error("nothing can be created under a read-only directory")
+		}
+	}
+}
+
+func TestReadConfigRefusesALooseFileItCannotTighten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can tighten any file")
+	}
+	// A file the connector cannot chmod because it belongs to someone else (root owns /etc/hosts).
+	if !cannotTighten("/etc/hosts") {
+		t.Skip("/etc/hosts is not root-owned here")
+	}
+	if cannotTighten(writeTemp(t, "{}")) {
+		t.Error("a file the user owns on a writable file system can be tightened")
+	}
+}
+
+func writeTemp(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "f.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

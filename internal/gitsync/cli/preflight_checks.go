@@ -62,7 +62,7 @@ func checkTempDir() checkResult {
 	root, source, err := gitsync.TempRootPath()
 	if err != nil {
 		r.Status = statusFail
-		r.Detail = err.Error()
+		r.Detail = source + " must be an absolute path"
 		r.Remedy = "set GIT_SYNC_TMP_DIR (or TMPDIR) to the absolute path of a writable directory"
 		return r
 	}
@@ -70,10 +70,16 @@ func checkTempDir() checkResult {
 	case err == nil:
 		r.Status = statusPass
 		r.Detail = fmt.Sprintf("%s (from %s) is writable; the probe was removed", root, source)
+	case errors.Is(err, fs.ErrNotExist) && gitsync.CanCreateDir(root):
+		// The connector creates the root (mode 0700) at startup, so this host would work; preflight
+		// does not, because it may be running as another user than the connector.
+		r.Status = statusWarn
+		r.Detail = fmt.Sprintf("%s (from %s) does not exist yet; the connector creates it at startup. Its writability was not tested, so the origins were not checked", root, source)
+		r.Remedy = "create it as the user the connector runs as (mode 0700) and run preflight again to test it"
 	case errors.Is(err, fs.ErrNotExist):
 		r.Status = statusFail
-		r.Detail = fmt.Sprintf("%s (from %s) does not exist", root, source)
-		r.Remedy = "create it as the user the connector runs as (mode 0700), or mount a writable volume there, then run preflight again; with a read-only root file system the connector cannot create it itself"
+		r.Detail = fmt.Sprintf("%s (from %s) does not exist, and the connector's user cannot create it", root, source)
+		r.Remedy = "mount a writable volume there (a read-only root file system cannot create it), or point GIT_SYNC_TMP_DIR at an existing writable directory"
 	default:
 		r.Status = statusFail
 		r.Detail = fmt.Sprintf("%s (from %s) is not usable: %s", root, source, fsErrorReason(err))
@@ -164,6 +170,10 @@ func checkOrigins(ctx context.Context, prober gitsync.OriginProber, cfg gitsync.
 		r := checkResult{ID: "origin:" + o.Name}
 		who := o.HostKey
 		switch {
+		case ctx.Err() != nil && (o.Err != nil || o.Result == gitsync.OriginUnreachable):
+			// The probe was cut short by the command's own time limit: that says nothing about the origin.
+			r.Status = statusSkip
+			r.Detail = fmt.Sprintf("%s: not checked, because the time limit for this command ran out", who)
 		case o.Err != nil:
 			r.Status = statusFail
 			r.Detail = fmt.Sprintf("%s: the check could not run: %s", who, localFault(o.Err))

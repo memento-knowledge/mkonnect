@@ -2,12 +2,15 @@ package gitsync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 // This file holds the parts of the operator CLI's preflight command that need the package's
@@ -33,7 +36,43 @@ type LoadedConfig struct {
 func ReadConfig(path string) LoadedConfig {
 	warnings := modeWarnings(path)
 	res := loadConfigMode(path, false)
-	return LoadedConfig{Report: buildReport(path, res, warnings), entries: res.entries}
+	rep := buildReport(path, res, warnings)
+	// The connector tightens a loose file itself and refuses it only when it cannot. Without
+	// trying, work out whether it could: a loose file it cannot tighten is one it would refuse.
+	if res.loose && cannotTighten(path) {
+		msg := "the file's mode is wider than the connector accepts and cannot be tightened (the file is on a read-only file system, or owned by another user); the connector would refuse it. Restrict it to the owner, allowing at most group read (for example 0600 or 0640)"
+		rep.Issues = append(rep.Issues, ConfigIssue{Class: IssueFile, Message: msg, err: errors.New(msg)})
+	}
+	return LoadedConfig{Report: rep, entries: res.entries}
+}
+
+// cannotTighten reports whether the connector's attempt to chmod the config file to 0600 would
+// fail: it needs to own the file (or be root) and the file system must not be read-only.
+func cannotTighten(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if euid := effectiveUID(); euid != 0 {
+		if uid, ok := fileOwnerUID(info); !ok || uid != euid {
+			return true
+		}
+	}
+	return unix.Access(path, unix.W_OK) == unix.EROFS
+}
+
+// CanCreateDir reports whether the connector's user could create path as a directory: its nearest
+// existing ancestor is a directory it can write to and enter. It creates nothing.
+func CanCreateDir(path string) bool {
+	for dir := filepath.Dir(filepath.Clean(path)); ; dir = filepath.Dir(dir) {
+		info, err := os.Stat(dir)
+		if err == nil {
+			return info.IsDir() && unix.Access(dir, unix.W_OK|unix.X_OK) == nil
+		}
+		if !os.IsNotExist(err) || dir == filepath.Dir(dir) {
+			return false
+		}
+	}
 }
 
 // OriginOutcome is the result of probing one configured provider's origin.
