@@ -231,3 +231,34 @@ func TestLoadRegistrationTokenFileEmptyVariableIsUnset(t *testing.T) {
 		t.Errorf("RegistrationToken = %q, want the env value", cfg.RegistrationToken)
 	}
 }
+
+func TestCheckRegistrationTokenReportsSourceWithoutValue(t *testing.T) {
+	t.Run("none", func(t *testing.T) {
+		t.Setenv("REGISTRATION_TOKEN_FILE", "")
+		t.Setenv("REGISTRATION_TOKEN", "")
+		if src, err := config.CheckRegistrationToken(); err != nil || src != config.RegistrationTokenNone {
+			t.Errorf("got %q, %v", src, err)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("REGISTRATION_TOKEN_FILE", "")
+		t.Setenv("REGISTRATION_TOKEN", "synthetic-token-value")
+		if src, err := config.CheckRegistrationToken(); err != nil || src != config.RegistrationTokenEnv {
+			t.Errorf("got %q, %v", src, err)
+		}
+	})
+	t.Run("file wins over the environment", func(t *testing.T) {
+		t.Setenv("REGISTRATION_TOKEN", "synthetic-env-value")
+		t.Setenv("REGISTRATION_TOKEN_FILE", writeTokenFile(t, "synthetic-file-value", 0o600))
+		if src, err := config.CheckRegistrationToken(); err != nil || src != config.RegistrationTokenFile {
+			t.Errorf("got %q, %v", src, err)
+		}
+	})
+	t.Run("an unusable file is an error even with the variable set", func(t *testing.T) {
+		t.Setenv("REGISTRATION_TOKEN", "synthetic-env-value")
+		t.Setenv("REGISTRATION_TOKEN_FILE", writeTokenFile(t, "synthetic-file-value", 0o644))
+		if _, err := config.CheckRegistrationToken(); err == nil {
+			t.Error("expected an error")
+		}
+	})
+}

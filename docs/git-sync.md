@@ -383,7 +383,11 @@ fix a problem, and exits non-zero if any check `FAIL`s. It never prints a creden
 | `git` | `git` is on `PATH` and is version 2.31 or newer. Distribution suffixes such as `(Apple Git-154)` or `-1ubuntu1` are ignored. |
 | `tmpdir` | The temporary directory (`GIT_SYNC_TMP_DIR`, else `TMPDIR`) exists and the connector's user can create a directory and a file in it; the probe is removed. The check never creates the directory. If it does not exist yet but the connector could create it at startup, the check warns (and the origins are not checked until you create it and run preflight again); if the connector could not create it, for example under a read-only root file system, it fails: mount a writable volume there. |
 | `replica-host` | `GIT_SYNC_REPLICA_HOST` is set and well formed, judged by the same rules as at startup. Without a valid value the connector connects but rejects every configuration and never syncs. A value that is not valid is not echoed back. |
+| `connector-id` | `CONNECTOR_ID` is set; the connector does not start without it. Only its presence is checked, and its value is not printed: the gateway judges it at registration. |
+| `key-file` | The signing key is where the connector keeps it (`KEY_FILE`, else `~/.mkonnect/gitsync-key`, the same rule the connector uses). If a key file exists, the connector is already enrolled, and the file must be owner-only (the connector refuses any other mode, and so does preflight, which never changes it). If there is none yet, the key's directory must be writable with room for the key: preflight writes and removes a file of the key's size there, as the connector does before it registers, because registration spends the one-time token and cannot be repeated if the key cannot be saved. A directory that does not exist yet is a warning if the connector could create it, and a failure if it could not (a read-only root file system, for example); preflight never creates it. |
+| `registration-token` | A registration token is configured and usable, before the connector has enrolled: `REGISTRATION_TOKEN_FILE` names an absolute path to a regular, non-empty file of at most 4096 bytes whose mode allows no access to others and no write to its group (`0600`, `0640` or `0440`). A token in the `REGISTRATION_TOKEN` environment variable is accepted with a warning, because environment values show in `docker inspect` and in the pod specification. Preflight checks presence, readability and mode only: it never sends the token anywhere, never asks the platform whether it is valid, and never prints it or the path it came from. A connector that is already enrolled legitimately has no token, so that is a pass; a token still configured then is a warning, because it is no longer needed. A `REGISTRATION_TOKEN_FILE` that is set must be usable even when enrolled, since the connector refuses to start with an unusable one. |
 | `gateway-url`, `gateway-dns`, `gateway-tls` | `GATEWAY_URL` is valid, its name resolves, and a TLS connection to the gateway succeeds with a trusted certificate. |
+| `replica-dns`, `replica-https` | The pinned replica host (`GIT_SYNC_REPLICA_HOST`) can be reached: its name resolves, and an unauthenticated HTTPS request to it is answered over a TLS connection that git trusts. The request is made by git, as the push is, with the same proxy settings and the same CA bundle (`GIT_SSL_CAINFO` replaces git's trust store, for the replica too). Like the origin check, any HTTP answer, including `401`, `403` and `404`, counts as reachable; `FAIL` means a connection, proxy or TLS problem. No credential of any kind is sent, and the push itself, which needs a token the platform issues once the connector is enrolled, is not tested. With an HTTPS proxy configured, the name is not looked up from here, because whether git uses the proxy for the host depends on `NO_PROXY`. |
 | `provider-config` | The provider configuration is one the connector accepts (the same rules as `connector config check`, except that preflight never changes the file; `config check` tightens a loose file mode to 0600, as the connector does at startup). A file whose mode is wider than the connector accepts (anything beyond owner access plus group read) is a failure: the connector tightens such a file to 0600 at startup where it can and refuses it where it cannot, and preflight cannot tell which without changing the file, which it never does. Run `chmod 600` on it (or let `connector config check` tighten it), then run preflight again.
 | `origin:<name>` | Each configured git server answers a `git ls-remote` against its base URL, with that provider's credential, using the same code and the same locked-down git environment as the connector's own reachability check. |
 
@@ -406,14 +410,17 @@ host.
 
 A check that cannot run because an earlier one failed is shown as `SKIP`, with the reason; a
 skipped check is not a pass. The origin checks are skipped while `git`, `tmpdir` or
-`provider-config` fails, because the probe needs all three.
+`provider-config` fails, because the probe needs all three; `replica-https` needs `git` and `tmpdir`
+and a valid pin, and is skipped while the replica's name does not resolve. `registration-token` is
+skipped when the key file cannot be judged, because whether the connector is enrolled is then not
+known.
 
 **What it does not do.** It does not enrol, register, authenticate to the gateway, send connector
 data, or contact the Memento replica, and it is not a dry-run sync. Its only request to the platform
-is the body-less `HEAD` described above. Whether the connector can push to the
-replica is reported by `connector status` and in the portal once it is enrolled. It also does not
-check `CONNECTOR_ID` (the connector will not start without it), the registration token, or that the
-key file's directory is writable.
+is the body-less `HEAD` described above, and the unauthenticated request to the replica host
+described in the table. It does not check with the platform that the connector ID or the
+registration token is valid. Whether the connector can push to the replica is reported by
+`connector status` and in the portal once it is enrolled.
 
 **Where to run it.** Run it where the connector runs, as the same user and with the same
 environment, because the answer depends on the network, DNS, proxy settings and user it sees. A
@@ -421,16 +428,21 @@ throwaway container can differ from the deployed one (for example, it is not sub
 Kubernetes network policy), so on Kubernetes prefer the running pod.
 
 Docker, before the first start (run it from the shell that defined `gitsync_dir` and `gitsync_image`
-in [Option A](#option-a-docker); the data volume is mounted read-only. Add the same extra `-v`
-mounts as your run command, for example a volume holding a `token_file` credential, or the
-`provider-config` check cannot read them):
+in [Option A](#option-a-docker)). Use the same mounts and environment files as your run command: the
+data volume read-write, because the `key-file` check writes and removes a small probe file there,
+and the `gitsync-secrets` volume and `registration.env`, or the `registration-token` check fails.
+Add any other extra `-v` mounts your run command has, for example a volume holding a `token_file`
+credential, or the `provider-config` check cannot read them:
 
 ```bash
 docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
-  -v gitsync-data:/data:ro -v gitsync-tmp:/tmp \
-  --env-file "$gitsync_dir/gitsync.env" \
+  -v gitsync-data:/data -v gitsync-tmp:/tmp -v gitsync-secrets:/run/secrets:ro \
+  --env-file "$gitsync_dir/gitsync.env" --env-file "$gitsync_dir/registration.env" \
   "$gitsync_image" connector preflight
 ```
+
+After the connector has registered and you have removed the registration token, leave
+`registration.env` and the `gitsync-secrets` volume out of the command.
 
 Docker, against the running container:
 

@@ -104,15 +104,28 @@ func checkGateway(ctx context.Context, env preflightEnv) []checkResult {
 // checkGatewayDNS resolves the gateway's name the way the connector's dial would, unless a proxy is
 // in the way, in which case the proxy resolves it and there is nothing to test from here.
 func checkGatewayDNS(ctx context.Context, env preflightEnv, host string, proxyURL *url.URL) checkResult {
-	r := checkResult{ID: "gateway-dns"}
+	return checkNameResolves(ctx, env, nameCheck{id: "gateway-dns", subject: "the gateway", setting: "GATEWAY_URL", connID: "gateway-tls"}, host, proxyURL)
+}
+
+// nameCheck says what a name lookup is for, so that the gateway and the replica host share the
+// lookup and differ only in the words around it.
+type nameCheck struct {
+	id      string // the check's id
+	subject string // "the gateway"
+	setting string // the setting that names the host
+	connID  string // the check that shows whether a proxy can reach it
+}
+
+func checkNameResolves(ctx context.Context, env preflightEnv, n nameCheck, host string, proxyURL *url.URL) checkResult {
+	r := checkResult{ID: n.id}
 	switch {
 	case proxyURL != nil:
 		r.Status = statusPass
-		r.Detail = fmt.Sprintf("nothing to look up from here: the proxy at %s resolves the gateway's name (gateway-tls shows whether it can)", proxyURL.Host)
+		r.Detail = fmt.Sprintf("nothing to look up from here: the proxy at %s resolves %s's name (%s shows whether it can)", proxyURL.Host, n.subject, n.connID)
 		return r
 	case net.ParseIP(strings.Trim(host, "[]")) != nil:
 		r.Status = statusPass
-		r.Detail = "nothing to look up: GATEWAY_URL names an IP address"
+		r.Detail = fmt.Sprintf("nothing to look up: %s names an IP address", n.setting)
 		return r
 	}
 	ctx, cancel := context.WithTimeout(ctx, gatewayCheckTimeout)
@@ -121,7 +134,7 @@ func checkGatewayDNS(ctx context.Context, env preflightEnv, host string, proxyUR
 	if err != nil || len(addrs) == 0 {
 		r.Status = statusFail
 		r.Detail = fmt.Sprintf("%s did not resolve (%s)", host, dnsReason(err))
-		r.Remedy = "check the container's or pod's DNS settings and that the name is reachable from this network; if the gateway is reached through a proxy, set HTTPS_PROXY (and NO_PROXY) as for the connector"
+		r.Remedy = fmt.Sprintf("check the container's or pod's DNS settings and that the name is reachable from this network; if %s is reached through a proxy, set HTTPS_PROXY (and NO_PROXY) as for the connector", n.subject)
 		return r
 	}
 	r.Status = statusPass

@@ -23,17 +23,26 @@ for each check with how to fix it, and exits non-zero if any check FAILs:
   git            git is installed and is version 2.31 or newer
   tmpdir         the temporary directory (GIT_SYNC_TMP_DIR, else TMPDIR) exists and is writable
   replica-host   GIT_SYNC_REPLICA_HOST is set and well formed
+  connector-id   CONNECTOR_ID is set
+  key-file       the signing key is where the connector keeps it: present with an owner-only mode
+                 (already enrolled), or its directory can take a new key
+  registration-token  a registration token is configured and its file is usable, unless already enrolled
   gateway-url    GATEWAY_URL is a valid gateway URL
   gateway-dns    the gateway's name resolves
   gateway-tls    a TLS connection to the gateway can be made, through the same proxy and with the
                  same trust store the connector uses
+  replica-dns    the replica host's name resolves
+  replica-https  the replica host answers an unauthenticated HTTPS request, through git, with the
+                 same proxy and trust store the push uses
   provider-config  the provider configuration is one the connector accepts
   origin:<name>  each configured git server answers (git ls-remote against its base URL)
 
-It does not enrol, authenticate to the gateway, send connector data, or contact the Memento replica
-(its only request to the platform is one body-less, unauthenticated HEAD to the gateway), and it is
-not a dry-run sync. A provider's credential is sent only to that provider's own git server. It
-never prints a credential.
+It does not enrol, authenticate to the gateway, send connector data, or check the registration token
+with the platform (it judges only that the token is present and its file is usable), and it is not a
+dry-run sync. Its only requests to the platform are one body-less, unauthenticated HEAD to the
+gateway and one unauthenticated HTTPS request to the pinned replica host. A provider's credential is
+sent only to that provider's own git server, and none is sent to the replica. It never prints a
+credential or the registration token.
   --json  print the result as a single JSON object instead of text
 
 Run it as the user the connector runs as, with the connector's environment and the same volumes,
@@ -73,16 +82,20 @@ type checkResult struct {
 // preflightEnv holds what a test replaces: the origin prober, and the pieces of the gateway check
 // that read process-wide state Go caches (the proxy environment, the system trust store).
 type preflightEnv struct {
-	prober     gitsync.OriginProber
-	transport  func() *http.Transport
-	lookupHost func(ctx context.Context, host string) ([]string, error)
+	prober gitsync.OriginProber
+	// replicaProber makes the unauthenticated request to the replica host; it is separate from prober
+	// so that a test that answers for origins is not asked about the replica.
+	replicaProber gitsync.OriginProber
+	transport     func() *http.Transport
+	lookupHost    func(ctx context.Context, host string) ([]string, error)
 }
 
 func defaultPreflightEnv() preflightEnv {
 	return preflightEnv{
-		prober:     gitsync.NewGitProber(),
-		transport:  newGatewayTransport,
-		lookupHost: net.DefaultResolver.LookupHost,
+		prober:        gitsync.NewGitProber(),
+		replicaProber: gitsync.NewGitProber(),
+		transport:     newGatewayTransport,
+		lookupHost:    net.DefaultResolver.LookupHost,
 	}
 }
 
@@ -130,8 +143,12 @@ func runPreflightChecks(ctx context.Context, env preflightEnv) []checkResult {
 
 	gitRes := checkGit(ctx)
 	tmpRes := checkTempDir()
-	add(gitRes, tmpRes, checkReplicaHost())
+	replicaRes := checkReplicaHost()
+	add(gitRes, tmpRes, replicaRes, checkConnectorID())
+	keyRes, enrolment := checkKeyFile()
+	add(keyRes, checkRegistrationToken(enrolment))
 	add(checkGateway(ctx, env)...)
+	add(checkReplica(ctx, env, replicaPrereqs{replica: replicaRes, git: gitRes, tmp: tmpRes})...)
 
 	cfg := gitsync.ReadConfig(gitsync.DefaultConfigPath())
 	cfgRes := checkProviderConfig(cfg.Report)
@@ -163,18 +180,19 @@ func tally(results []checkResult) map[checkStatus]int {
 
 func printPreflight(w io.Writer, results []checkResult, counts map[checkStatus]int) {
 	fmt.Fprintln(w, "=== git-sync preflight ===")
-	fmt.Fprintf(w, "  Checked as uid %d, with this process's environment. Nothing is sent to the Memento platform,\n", os.Geteuid())
-	fmt.Fprintln(w, "  no credential is sent anywhere but to the git server it belongs to, and the replica is not contacted.")
+	fmt.Fprintf(w, "  Checked as uid %d, with this process's environment. No connector data or token is sent to the Memento\n", os.Geteuid())
+	fmt.Fprintln(w, "  platform, and no credential is sent anywhere but to the git server it belongs to. The platform sees only")
+	fmt.Fprintln(w, "  a body-less request to the gateway and an unauthenticated request to the replica host.")
 	fmt.Fprintln(w)
 	for _, r := range results {
 		label := strings.ToUpper(string(r.Status))
 		lines := strings.Split(r.Detail, "\n")
-		fmt.Fprintf(w, "  %-4s  %-16s %s\n", label, r.ID, lines[0])
+		fmt.Fprintf(w, "  %-4s  %-20s %s\n", label, r.ID, lines[0])
 		for _, l := range lines[1:] {
-			fmt.Fprintf(w, "        %-16s %s\n", "", l)
+			fmt.Fprintf(w, "        %-20s %s\n", "", l)
 		}
 		if r.Remedy != "" {
-			fmt.Fprintf(w, "        %-16s Fix: %s\n", "", r.Remedy)
+			fmt.Fprintf(w, "        %-20s Fix: %s\n", "", r.Remedy)
 		}
 	}
 	fmt.Fprintf(w, "\nSummary: %d passed, %d %s, %d failed, %d skipped.\n",
@@ -185,7 +203,7 @@ func printPreflight(w io.Writer, results []checkResult, counts map[checkStatus]i
 	case counts[statusSkip] > 0:
 		fmt.Fprintln(w, "Some checks were skipped, so this host is not yet shown to be ready.")
 	default:
-		fmt.Fprintln(w, "No failures. The replica push is not part of this check; once enrolled, it is reported by `connector status` and in the portal.")
+		fmt.Fprintln(w, "No failures. A push to the replica needs a token the platform issues once enrolled, so it is not tested here; it is reported by `connector status` and in the portal.")
 	}
 }
 
