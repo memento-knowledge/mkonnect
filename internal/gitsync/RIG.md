@@ -6,7 +6,8 @@ the container images, the Helm chart and the release assets (`.dockerignore`, `c
 and `scripts/check-artifact-contents.sh`, run by CI).
 
 It runs in the normal gate (`go test ./... -race`) and skips itself when `git` or `git-http-backend` is
-missing.
+missing. The scenarios too heavy for the gate (large pushes, thousands of refs, slow replicas) are the
+manual slow rig, built only with `-tags rig`: see [RIG-SLOW.md](RIG-SLOW.md).
 
 ## What it is
 

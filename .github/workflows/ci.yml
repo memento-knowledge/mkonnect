@@ -73,6 +73,13 @@ jobs:
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
+      # The manual slow replica rig is built only with -tags rig, so the steps above never see it.
+      # This compiles and lints it (same staticcheck pin) so it cannot rot; it does not run it.
+      - name: go vet and staticcheck (slow rig, compile only)
+        run: |
+          go vet -tags rig ./internal/gitsync
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 -tags rig ./internal/gitsync
+
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 

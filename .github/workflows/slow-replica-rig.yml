@@ -1,0 +1,75 @@
+name: Slow replica rig
+
+# A manual run of the git-sync slow replica rig (internal/gitsync/replicarig_slow_*_test.go): a large first
+# push, thousands of refs and deletions, a request-size limit, a slow replica and the repository
+# ceiling, all against stock `git http-backend` on localhost. It is never part of the pull-request
+# gate and has no schedule: a run costs roughly twenty minutes of one runner. It uses no secrets and
+# talks to nothing outside the runner. See internal/gitsync/RIG-SLOW.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      large_mib:
+        description: Size of the large-repository origin, in MiB (about four times this much disk is used)
+        default: '512'
+        required: true
+        type: string
+      refs:
+        description: Branches and tags in the many-refs scenario
+        default: '10000'
+        required: true
+        type: string
+      batch_refs:
+        description: push_batch_refs of the batched runs (100 to 100000)
+        default: '1000'
+        required: true
+        type: string
+      delete_percent:
+        description: Share of the refs the origin drops before the deletion scenarios (1 to 99)
+        default: '90'
+        required: true
+        type: string
+      slow_push_seconds:
+        description: How long the throttled replica takes over one push (70 or more)
+        default: '90'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slow-replica-rig
+  cancel-in-progress: false
+
+jobs:
+  rig:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27'
+
+      # GNU time lets the rig report the peak memory of the connector's git processes; without it
+      # the rig says the measurement was skipped.
+      - name: Install GNU time
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends time
+
+      # The sizes reach the test as environment variables, never as part of a shell command; the test
+      # checks each one against its accepted range and stops if it is outside it.
+      - name: Run the slow rig
+        env:
+          RIG_LARGE_MIB: ${{ inputs.large_mib }}
+          RIG_REFS: ${{ inputs.refs }}
+          RIG_BATCH_REFS: ${{ inputs.batch_refs }}
+          RIG_DELETE_PERCENT: ${{ inputs.delete_percent }}
+          RIG_SLOW_PUSH_SECONDS: ${{ inputs.slow_push_seconds }}
+        run: go test -tags rig -run '^TestRigSlow' -timeout 80m -v ./internal/gitsync

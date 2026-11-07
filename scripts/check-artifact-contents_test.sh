@@ -77,6 +77,8 @@ for bad in \
   "opt/repo/.git/HEAD" \
   "usr/local/replicarig_test.go" \
   "usr/share/RIG.md" \
+  "usr/local/replicarig_slow_test.go" \
+  "usr/share/RIG-SLOW.md" \
   "opt/scripts/release.sh" \
   "opt/go.mod" \
   "opt/Dockerfile" \
