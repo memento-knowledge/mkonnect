@@ -33,6 +33,16 @@ forbidden_re='(^|/)(\.git|\.github|\.claude|\.worktrees|testdata|scripts|docs|ch
 # Top-level directories an image may have: the operating system's own, plus what the build adds.
 system_top='.dockerenv bin boot data dev etc home lib lib64 media mnt opt proc root run sbin srv sys tmp usr var'
 
+# One scratch directory and, for an image check, one container, both removed on exit. (A RETURN trap
+# would outlive its function and see variables that are already out of scope, so there is none.)
+workdir=$(mktemp -d)
+container=
+cleanup() {
+  [[ -z $container ]] || docker rm "$container" >/dev/null 2>&1 || true
+  rm -rf "$workdir"
+}
+trap cleanup EXIT
+
 fail=0
 report() {
   printf '%s\n' "$*" >&2
@@ -49,9 +59,7 @@ check_forbidden() {
 }
 
 check_listing() {
-  local listing=$1 binary=${2#/} normalized top name entries
-  normalized=$(mktemp)
-  trap 'rm -f "$normalized"' RETURN
+  local listing=$1 binary=${2#/} normalized="$workdir/normalized" top entries
   sed -e 's#^\./##' -e 's#/$##' "$listing" | grep -v '^\.\{0,1\}$' >"$normalized" || true
   [[ -s $normalized ]] || {
     printf 'the filesystem listing is empty\n' >&2
@@ -76,13 +84,11 @@ check_listing() {
 }
 
 check_image() {
-  local image=$1 binary=$2 tmp cid
-  tmp=$(mktemp -d)
+  local image=$1 binary=$2
   # The argument is never run (nothing is started); it only lets an image without a command be created.
-  cid=$(docker create "$image" unused)
-  trap 'docker rm "$cid" >/dev/null 2>&1 || true; rm -rf "$tmp"' RETURN
-  docker export "$cid" | tar -t >"$tmp/listing"
-  check_listing "$tmp/listing" "$binary"
+  container=$(docker create "$image" unused)
+  docker export "$container" | tar -t >"$workdir/image.lst"
+  check_listing "$workdir/image.lst" "$binary"
 }
 
 # check_dockerfile verifies the COPY and ADD instructions of the last stage. Everything else the
@@ -131,13 +137,11 @@ check_dockerfile() {
 }
 
 check_chart() {
-  local pkg=$1 listing root
+  local pkg=$1 listing="$workdir/chart.lst" root
   [[ -f $pkg ]] || {
     printf 'no such chart package: %s\n' "$pkg" >&2
     return 1
   }
-  listing=$(mktemp)
-  trap 'rm -f "$listing"' RETURN
   tar -tzf "$pkg" >"$listing"
   root=$(cut -d/ -f1 "$listing" | sort -u)
   [[ $(printf '%s\n' "$root" | wc -l) -eq 1 && -n $root ]] || {
@@ -150,7 +154,6 @@ check_chart() {
     report "the chart package contains paths that must not be shipped:"
     sed 's/^/  /' "$listing.hits" >&2
   fi
-  rm -f "$listing.hits"
   local unexpected
   unexpected=$(grep -vE "^$root/(Chart\.yaml|values\.yaml|\.helmignore|templates/|templates/[A-Za-z0-9_.-]+\.(yaml|yml|tpl|txt))$" "$listing" || true)
   if [[ -n $unexpected ]]; then
