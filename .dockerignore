@@ -13,3 +13,11 @@ scripts
 dist
 **/*.md
 Dockerfile*
+
+# Test code and fixtures are not part of any build: nothing embeds them (there is no go:embed) and
+# `go build` ignores _test.go files. The final stages copy only the built binary, so this does not change
+# what ships (scripts/check-artifact-contents.sh asserts that); it keeps test code out of build layers
+# and the build cache key.
+**/*_test.go
+**/testdata
+internal/testca
