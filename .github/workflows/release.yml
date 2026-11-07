@@ -135,6 +135,10 @@ jobs:
           sha256sum "mkonnect-$CHART_VERSION.tgz" > "mkonnect-$CHART_VERSION.tgz.sha256"
           cd ..
           bash scripts/release-chart-source.sh --chart-dir charts/mkonnect --package "dist/mkonnect-$CHART_VERSION.tgz"
+          # Assert, without changing what is released, that the package holds only the chart's own files
+          # and that the asset directory holds only the package and its checksum.
+          bash scripts/check-artifact-contents.sh chart "dist/mkonnect-$CHART_VERSION.tgz"
+          bash scripts/check-artifact-contents.sh assets dist mkonnect "$CHART_VERSION"
 
       - id: asset
         name: Name release asset bundle

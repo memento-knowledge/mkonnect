@@ -104,6 +104,18 @@ jobs:
       - name: Lint Helm chart
         run: helm lint charts/mkonnect
 
+      # The package is what is released and pushed to a registry; it must hold the chart's own files
+      # and no test code, fixture, script or VCS state (see charts/mkonnect/.helmignore).
+      - name: Package the chart and verify its contents
+        run: |
+          mkdir "$RUNNER_TEMP/chart-package"
+          helm package charts/mkonnect --destination "$RUNNER_TEMP/chart-package"
+          tar -tzf "$RUNNER_TEMP/chart-package"/mkonnect-*.tgz
+          bash scripts/check-artifact-contents.sh chart "$RUNNER_TEMP"/chart-package/mkonnect-*.tgz
+
+      - name: Run artifact content check tests
+        run: bash scripts/check-artifact-contents_test.sh
+
   image:
     runs-on: ubuntu-latest
     steps:
@@ -118,6 +130,19 @@ jobs:
             --build-arg REVISION="$REVISION" \
             --tag mkonnect:ci \
             .
+
+      # Only the binary and an empty /data may come from the build; no test code, fixture, script,
+      # source or VCS state may be in the final filesystem. The self-test builds a deliberately bad
+      # image and requires the check to refuse it.
+      - name: Verify the image holds nothing but the binary and /data
+        run: |
+          bash scripts/check-artifact-contents.sh dockerfile Dockerfile /mkonnect /data-empty
+          bash scripts/check-artifact-contents.sh image mkonnect:ci /mkonnect
+
+      - name: Self-test the artifact content check against a deliberately bad image
+        env:
+          CHECK_ARTIFACT_DOCKER: '1'
+        run: bash scripts/check-artifact-contents_test.sh
 
       - name: Verify image metadata and health command
         env:
@@ -153,6 +178,13 @@ jobs:
             --build-arg REVISION="$REVISION" \
             --tag mkonnect-gitsync:ci \
             .
+
+      # The git-sync image adds git and CA certificates to its base; apart from them only the binary
+      # and an empty /data may come from the build, and nothing test-related may be in the filesystem.
+      - name: Verify the image holds nothing but the binary, /data and the operating system
+        run: |
+          bash scripts/check-artifact-contents.sh dockerfile Dockerfile.gitsync /mkonnect-gitsync
+          bash scripts/check-artifact-contents.sh image mkonnect-gitsync:ci /mkonnect-gitsync
 
       - name: Verify image metadata and health command
         env:

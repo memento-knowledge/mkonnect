@@ -3,7 +3,6 @@ package testca_test
 import (
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -14,15 +13,15 @@ const modulePath = "github.com/memento-knowledge/mkonnect"
 // excludes test files, so a production package that imported testca (or net/http/httptest) would
 // either fail to build there or, worse, pull a throwaway-CA generator into the connector.
 func TestProductionBinariesDoNotDependOnTestOnlyPackages(t *testing.T) {
-	goBin := filepath.Join(runtime.GOROOT(), "bin", "go")
-	if _, err := exec.LookPath(goBin); err != nil {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
 		t.Skipf("go tool not available: %v", err)
 	}
 	cmd := exec.Command(goBin, "list", "-deps", "-f", "{{.ImportPath}}", "./cmd/...")
 	cmd.Dir = filepath.Join("..", "..")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Skipf("go list failed (offline module cache?): %v\n%s", err, out)
+		t.Fatalf("go list: %v\n%s", err, out)
 	}
 	deps := strings.Fields(string(out))
 	if len(deps) == 0 {

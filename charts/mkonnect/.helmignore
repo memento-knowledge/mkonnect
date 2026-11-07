@@ -1,0 +1,17 @@
+# Files that never belong in the packaged chart. The chart directory holds Chart.yaml, values.yaml and
+# templates/ only; everything below is local state or test code that must not reach the chart package,
+# the release assets or an OCI registry. Do not add a pattern that matches a file the chart needs:
+# scripts/release-chart-source.sh compares the package with this directory and fails on a difference.
+# CI also lists the package (scripts/check-artifact-contents.sh chart) and fails on any other file.
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.bak
+*.tmp
+*~
+*_test.*
+testdata/
