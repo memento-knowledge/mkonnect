@@ -91,75 +91,114 @@ check_image() {
   check_listing "$workdir/image.lst" "$binary"
 }
 
-# check_dockerfile verifies the COPY, ADD and RUN --mount instructions of the last stage. Everything
-# else it does is a RUN of the base image's own tools, which cannot bring in files from the build
-# context.
+# check_dockerfile verifies the COPY, ADD and RUN instructions of the last stage, each read as one
+# logical instruction (a line continued with a trailing backslash is joined to the next, and comment
+# lines inside it are dropped). Everything else it does is a RUN of the base image's own tools, which
+# cannot bring in files from the build context.
 check_dockerfile() {
-  local file=$1 line instruction rest src found word from words=() operands=()
+  local file=$1 line trimmed logical="" start=0 n=0 last_from
   shift
-  local allowed=("$@") in_final=false
+  allowed=("$@")
   [[ -f $file ]] || {
     printf 'no such Dockerfile: %s\n' "$file" >&2
     return 1
   }
-  local last_from
   last_from=$(grep -n -i '^FROM[[:space:]]' "$file" | tail -1 | cut -d: -f1)
   [[ -n $last_from ]] || {
     printf '%s has no FROM\n' "$file" >&2
     return 1
   }
-  local n=0
+  in_final=false
   while IFS= read -r line || [[ -n $line ]]; do
     n=$((n + 1))
     ((n > last_from)) || continue
-    instruction=$(printf '%s' "$line" | awk '{ print toupper($1) }')
-    case $instruction in
-      ADD) report "$file:$n: the final stage must not use ADD: $line" ;;
-      COPY)
-        in_final=true
-        rest=${line#*[[:space:]]}
-        if [[ $rest == *\\ ]]; then
-          report "$file:$n: a COPY continued over several lines cannot be checked: $line"
-          continue
-        fi
-        read -r -a words <<<"$rest"
-        from=false
-        operands=()
-        for word in "${words[@]}"; do
-          case $word in
-            --from=builder) from=true ;;
-            --from=*) report "$file:$n: the final stage may only COPY --from=builder: $line" ;;
-            --*) ;;
-            *) operands+=("$word") ;;
-          esac
-        done
-        $from || {
-          report "$file:$n: the final stage may only COPY --from=builder: $line"
-          continue
-        }
-        # Every operand but the last (the destination) is a source, and each must be expected.
-        ((${#operands[@]} >= 2)) || {
-          report "$file:$n: cannot read the COPY operands: $line"
-          continue
-        }
-        for src in "${operands[@]:0:${#operands[@]}-1}"; do
-          found=false
-          for a in "${allowed[@]}"; do
-            [[ $src == "$a" ]] && found=true
-          done
-          $found || report "$file:$n: the final stage copies $src, which is not one of: ${allowed[*]}"
-        done
-        ;;
-      RUN)
-        # A bind mount would bring files of the build context into a RUN step.
-        if [[ $line == *--mount* && $line != *type=cache* && $line != *type=tmpfs* ]]; then
-          report "$file:$n: the final stage must not mount the build context into a RUN: $line"
-        fi
-        ;;
-    esac
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    if [[ $trimmed == \#* ]] || { [[ -z $logical && -z $trimmed ]]; }; then
+      continue
+    fi
+    [[ -n $logical ]] || start=$n
+    if [[ $line == *\\ ]]; then
+      logical+="${line%\\} "
+      continue
+    fi
+    logical+=$line
+    check_instruction "$file" "$start" "$logical"
+    logical=""
   done <"$file"
+  [[ -z $logical ]] || check_instruction "$file" "$start" "$logical"
   $in_final || report "$file: the final stage copies nothing from the builder"
   return "$fail"
+}
+
+# check_instruction judges one logical instruction of the final stage (see check_dockerfile).
+check_instruction() {
+  local file=$1 n=$2 text=$3 instruction rest word from src found
+  local -a words operands
+  text=${text#"${text%%[![:space:]]*}"}
+  instruction=$(printf '%s' "$text" | awk '{ print toupper($1) }')
+  rest=${text#*[[:space:]]}
+  read -r -a words <<<"$rest"
+  case $instruction in
+    ADD) report "$file:$n: the final stage must not use ADD: $text" ;;
+    COPY)
+      in_final=true
+      from=false
+      operands=()
+      for word in "${words[@]}"; do
+        case $word in
+          --from=builder) from=true ;;
+          --from=*) report "$file:$n: the final stage may only COPY --from=builder: $text" ;;
+          --*) ;;
+          *) operands+=("$word") ;;
+        esac
+      done
+      $from || {
+        report "$file:$n: the final stage may only COPY --from=builder: $text"
+        return 0
+      }
+      # Every operand but the last (the destination) is a source, and each must be expected.
+      ((${#operands[@]} >= 2)) || {
+        report "$file:$n: cannot read the COPY operands: $text"
+        return 0
+      }
+      for src in "${operands[@]:0:${#operands[@]}-1}"; do
+        found=false
+        for word in "${allowed[@]}"; do
+          [[ $src == "$word" ]] && found=true
+        done
+        $found || report "$file:$n: the final stage copies $src, which is not one of: ${allowed[*]}"
+      done
+      ;;
+    RUN)
+      # The flags come before the command. Only cache and tmpfs mounts that start empty are allowed: any
+      # other mount, or a source or stage to fill one from, would bring files of the build into the stage.
+      for word in "${words[@]}"; do
+        [[ $word == --* ]] || break
+        case $word in
+          --mount=*) check_mount "$file" "$n" "${word#--mount=}" ;;
+          --mount*) report "$file:$n: cannot read this RUN mount: $word" ;;
+        esac
+      done
+      ;;
+  esac
+}
+
+# check_mount judges the value of one RUN --mount flag.
+check_mount() {
+  local file=$1 n=$2 spec=$3 type=bind field key
+  local -a fields
+  IFS=, read -r -a fields <<<"$spec"
+  for field in "${fields[@]}"; do
+    key=${field%%=*}
+    case $key in
+      type) type=${field#*=} ;;
+      from | source | src) report "$file:$n: a RUN mount must not take its content from elsewhere: --mount=$spec" ;;
+    esac
+  done
+  case $type in
+    cache | tmpfs) ;;
+    *) report "$file:$n: the final stage must not use a RUN mount of type $type: --mount=$spec" ;;
+  esac
 }
 
 check_chart() {

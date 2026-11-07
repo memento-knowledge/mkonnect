@@ -98,22 +98,53 @@ expect_fail "a listing without the binary" "does not contain the binary" listing
 expect_ok "the connector Dockerfile" dockerfile "$root/Dockerfile" /mkonnect /data-empty
 expect_ok "the git-sync Dockerfile" dockerfile "$root/Dockerfile.gitsync" /mkonnect-gitsync
 
+# dockerfile_with FILE inserts the text of FILE before the ENTRYPOINT of the connector Dockerfile.
 dockerfile_with() {
-  sed -e '/^ENTRYPOINT/i\
-'"$1" "$root/Dockerfile" >"$tmpdir/Dockerfile.bad"
+  local at
+  at=$(grep -n '^ENTRYPOINT' "$root/Dockerfile" | cut -d: -f1)
+  {
+    head -n $((at - 1)) "$root/Dockerfile"
+    cat "$1"
+    tail -n +"$at" "$root/Dockerfile"
+  } >"$tmpdir/Dockerfile.bad"
 }
-dockerfile_with 'COPY foo_test.go /foo_test.go'
+bad_dockerfile() {
+  printf '%s\n' "$@" >"$tmpdir/insert"
+  dockerfile_with "$tmpdir/insert"
+}
+
+bad_dockerfile 'COPY foo_test.go /foo_test.go'
 expect_fail "a final stage copying from the build context" "may only COPY --from=builder" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
-dockerfile_with 'COPY --from=builder /src /src'
+bad_dockerfile 'COPY --from=builder /src /src'
 expect_fail "a final stage copying the whole source tree" "not one of" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
-dockerfile_with 'COPY --from=builder /mkonnect /src /'
+bad_dockerfile 'COPY --from=builder /mkonnect /src /'
 expect_fail "a final stage with an unexpected second source" "not one of" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
-dockerfile_with 'COPY --from=builder-evil /mkonnect /'
+bad_dockerfile 'COPY --from=builder-evil /mkonnect /'
 expect_fail "a final stage copying from another stage" "may only COPY --from=builder" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
-dockerfile_with 'RUN --mount=type=bind,source=.,target=/ctx cp -r /ctx /src'
-expect_fail "a final stage mounting the build context" "must not mount" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
-dockerfile_with 'ADD . /app'
+bad_dockerfile 'COPY --from=builder \' '    /mkonnect /src /'
+expect_fail "a COPY continued over two lines with an unexpected source" "not one of" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'ADD . /app'
 expect_fail "a final stage using ADD" "must not use ADD" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+
+bad_dockerfile 'RUN --mount=type=bind,source=.,target=/ctx cp -r /ctx /src'
+expect_fail "a final stage mounting the build context" "RUN mount of type bind" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount=target=/ctx cp -r /ctx /src'
+expect_fail "a RUN mount with no type (a bind mount)" "RUN mount of type bind" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount=type=cache,target=/cache --mount=type=bind,source=.,target=/ctx cp -r /ctx /out'
+expect_fail "a bind mount next to a cache mount" "RUN mount of type bind" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount=type=cache,target=/cache \' '    --mount=type=bind,source=.,target=/ctx \' '    cp -r /ctx /out'
+expect_fail "a bind mount on a continuation line" "RUN mount of type bind" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount=type=cache,target=/cache,from=builder,source=/src cp -r /cache /out'
+expect_fail "a cache mount filled from another stage" "take its content from elsewhere" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount cp -r /ctx /out'
+expect_fail "a RUN mount that cannot be read" "cannot read this RUN mount" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'RUN --mount=type=secret,id=x cat /run/secrets/x'
+expect_fail "a secret mount" "RUN mount of type secret" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+
+bad_dockerfile 'RUN --mount=type=cache,target=/cache \' '    --mount=type=tmpfs,target=/scratch \' '    true'
+expect_ok "cache and tmpfs mounts that start empty" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+bad_dockerfile 'COPY --from=builder \' '    /mkonnect \' '    /mkonnect'
+expect_ok "a COPY of an expected source continued over lines" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
 
 # --- release assets --------------------------------------------------------------------------------
 assets="$tmpdir/assets"
