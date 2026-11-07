@@ -37,6 +37,7 @@ import (
 //
 //	token / RotateToken      the Bearer token it accepts; any other Authorization answers 401
 //	SetMaxBody(n)            a request-body limit: a push whose body exceeds n bytes answers 413
+//	SetPushThrottle(bps)     the body of a push is read from the client at no more than bps bytes/s
 //	StallPushes()            requests of a push (the receive-pack advertisement and the POST) hang
 //	                         until the client gives up, as a replica that stopped answering does
 //	UnstallPushes()          the stall ends
@@ -72,6 +73,7 @@ type frontRequest struct {
 	Push    bool   // a POST to git-receive-pack
 	Chunked bool   // the request body was sent with chunked transfer encoding
 	Length  int64  // the declared body length, -1 when chunked
+	Bytes   int64  // the push body as the front saw it: the bytes read, or the declared length of a refused one
 }
 
 // replicaFront is the load balancer; see the comment at the top of the file.
@@ -88,6 +90,7 @@ type replicaFront struct {
 	token       string
 	tokens      []string // every token the front has accepted, oldest first
 	maxBody     int64
+	pushRate    int64 // bytes per second the front reads a push body at; 0 is unthrottled
 	revoked     bool
 	revokeAfter int
 	stall       bool
@@ -204,6 +207,13 @@ func (f *replicaFront) KnownTokens() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.tokens)
+}
+
+// SetPushThrottle makes the front read the body of a push from the client at no more than bytesPerSec
+// (0 ends it), before anything is forwarded to the backend: a slow replica, or a slow link to it. A
+// throttled push takes real time (size / rate) and is meant for tests that exercise a push timeout.
+func (f *replicaFront) SetPushThrottle(bytesPerSec int64) {
+	f.update(func() { f.pushRate = bytesPerSec })
 }
 
 // SetMaxBody sets the request-body limit; 0 removes it.
@@ -336,7 +346,7 @@ func (f *replicaFront) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	f.mu.Lock()
-	token, revoked, maxBody, stall, failStatus, revokePost := f.token, f.revoked, f.maxBody, f.stall, f.failStatus, f.revokePost
+	token, revoked, maxBody, rate, stall, failStatus, revokePost := f.token, f.revoked, f.maxBody, f.pushRate, f.stall, f.failStatus, f.revokePost
 	f.mu.Unlock()
 
 	switch {
@@ -355,11 +365,19 @@ func (f *replicaFront) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if limit <= 0 {
 			limit = maxBuffer
 		}
-		body, tooLarge := readLimited(r.Body, r.ContentLength, limit)
+		var src io.Reader = r.Body
+		if rate > 0 {
+			src = &throttledReader{r: r.Body, perSec: rate}
+		}
+		body, tooLarge := readLimited(src, r.ContentLength, limit)
+		rec.Bytes = int64(len(body))
+		if r.ContentLength > limit {
+			rec.Bytes = r.ContentLength
+		}
 		if tooLarge {
 			// Read the rest first so the answer is not racing a client still sending: what git
 			// reports is then the status, as with a proxy that buffers requests.
-			_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxDrain))
+			_, _ = io.Copy(io.Discard, io.LimitReader(src, maxDrain))
 			http.Error(sw, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
@@ -410,6 +428,25 @@ func (f *replicaFront) pushDone() {
 	if hook != nil {
 		hook(n)
 	}
+}
+
+// throttledReader reads from r at no more than perSec bytes per second, in slices of a tenth of a
+// second's worth. It sleeps; the point of it is that a push takes real time.
+type throttledReader struct {
+	r      io.Reader
+	perSec int64
+}
+
+func (t *throttledReader) Read(p []byte) (int, error) {
+	slice := max(t.perSec/10, 1)
+	if int64(len(p)) > slice {
+		p = p[:slice]
+	}
+	n, err := t.r.Read(p)
+	if n > 0 {
+		time.Sleep(time.Duration(int64(n) * int64(time.Second) / t.perSec))
+	}
+	return n, err
 }
 
 // readLimited reads a request body of the given declared length (-1 when unknown, as for a chunked

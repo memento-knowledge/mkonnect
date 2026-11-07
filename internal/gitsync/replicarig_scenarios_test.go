@@ -489,3 +489,29 @@ func TestReplicaRigCredentialRefusedAtThePostIsRejected(t *testing.T) {
 	r.syncOK()
 	r.wantReplicaEqualsOrigin()
 }
+
+// The front can throttle the body of a push, so a test can make a push take a known time without a
+// large repository, and it reports the size of each push body it saw.
+func TestReplicaRigThrottlesAPushAndReportsItsSize(t *testing.T) {
+	t.Parallel()
+	r := newReplicaRig(t, 0)
+	r.front.SetPushThrottle(100 << 10)
+	r.commitBlob(48 << 10)
+
+	start := time.Now()
+	r.syncOK()
+	var seen int64
+	for _, req := range r.front.Requests() {
+		if req.Push {
+			seen = max(seen, req.Bytes)
+		}
+	}
+	if seen < 48<<10 {
+		t.Errorf("the largest push body seen is %d bytes, want at least the 48 KiB blob", seen)
+	}
+	// 48 KiB at 100 KiB/s cannot take less than 0.45 s, whatever the machine.
+	if took := time.Since(start); took < 450*time.Millisecond {
+		t.Errorf("the sync took %v, want the throttle to hold the push for at least 450ms", took)
+	}
+	r.wantSameTips()
+}
