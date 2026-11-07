@@ -28,7 +28,7 @@ usage() {
 }
 
 # Paths no artifact may contain, wherever they appear.
-forbidden_re='(^|/)(\.git|\.github|\.claude|\.worktrees|testdata|scripts|docs|charts|cmd|internal)(/|$)|(^|/)\.git(ignore|attributes|modules)$|\.go$|(^|/)go\.(mod|sum)$|(^|/)Dockerfile[^/]*$|(^|/)replicarig[^/]*$|(^|/)RIG\.md$|_test\.[A-Za-z]+$'
+forbidden_re='(^|/)(\.git|\.github|\.claude|\.worktrees|testdata|scripts|docs|charts|cmd|internal)(/|$)|(^|/)\.git(ignore|attributes|modules)$|\.go$|(^|/)go\.(mod|sum)$|(^|/)Dockerfile[^/]*$|(^|/)replicarig[^/]*$|(^|/)RIG(-[A-Z]+)?\.md$|_test\.[A-Za-z]+$'
 
 # Top-level directories an image may have: the operating system's own, plus what the build adds.
 system_top='.dockerenv bin boot data dev etc home lib lib64 media mnt opt proc root run sbin srv sys tmp usr var'
