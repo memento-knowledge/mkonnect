@@ -54,7 +54,7 @@ check_forbidden() {
   hits=$(grep -E "$forbidden_re" "$listing" || true)
   if [[ -n $hits ]]; then
     report "$what contains paths that must not be shipped:"
-    printf '  %s\n' $hits >&2
+    sed 's/^/  /' <<<"$hits" >&2
   fi
 }
 
@@ -91,11 +91,11 @@ check_image() {
   check_listing "$workdir/image.lst" "$binary"
 }
 
-# check_dockerfile verifies the COPY and ADD instructions of the last stage. Everything else the
-# final stage does is a RUN of the base image's own tools and cannot bring in files from the build
+# check_dockerfile verifies the COPY, ADD and RUN --mount instructions of the last stage. Everything
+# else it does is a RUN of the base image's own tools, which cannot bring in files from the build
 # context.
 check_dockerfile() {
-  local file=$1 line instruction rest src found
+  local file=$1 line instruction rest src found word from words=() operands=()
   shift
   local allowed=("$@") in_final=false
   [[ -f $file ]] || {
@@ -118,17 +118,43 @@ check_dockerfile() {
       COPY)
         in_final=true
         rest=${line#*[[:space:]]}
-        if [[ $rest != *--from=builder* ]]; then
-          report "$file:$n: the final stage may only COPY --from=builder: $line"
+        if [[ $rest == *\\ ]]; then
+          report "$file:$n: a COPY continued over several lines cannot be checked: $line"
           continue
         fi
-        # The source is the argument after the flags and before the destination.
-        src=$(printf '%s' "$rest" | tr -s ' ' '\n' | grep -v '^--' | head -1)
-        found=false
-        for a in "${allowed[@]}"; do
-          [[ $src == "$a" ]] && found=true
+        read -r -a words <<<"$rest"
+        from=false
+        operands=()
+        for word in "${words[@]}"; do
+          case $word in
+            --from=builder) from=true ;;
+            --from=*) report "$file:$n: the final stage may only COPY --from=builder: $line" ;;
+            --*) ;;
+            *) operands+=("$word") ;;
+          esac
         done
-        $found || report "$file:$n: the final stage copies $src, which is not one of: ${allowed[*]}"
+        $from || {
+          report "$file:$n: the final stage may only COPY --from=builder: $line"
+          continue
+        }
+        # Every operand but the last (the destination) is a source, and each must be expected.
+        ((${#operands[@]} >= 2)) || {
+          report "$file:$n: cannot read the COPY operands: $line"
+          continue
+        }
+        for src in "${operands[@]:0:${#operands[@]}-1}"; do
+          found=false
+          for a in "${allowed[@]}"; do
+            [[ $src == "$a" ]] && found=true
+          done
+          $found || report "$file:$n: the final stage copies $src, which is not one of: ${allowed[*]}"
+        done
+        ;;
+      RUN)
+        # A bind mount would bring files of the build context into a RUN step.
+        if [[ $line == *--mount* && $line != *type=cache* && $line != *type=tmpfs* ]]; then
+          report "$file:$n: the final stage must not mount the build context into a RUN: $line"
+        fi
         ;;
     esac
   done <"$file"
@@ -157,14 +183,14 @@ check_chart() {
   local unexpected
   unexpected=$(grep -vE "^$root/(Chart\.yaml|values\.yaml|\.helmignore|templates/|templates/[A-Za-z0-9_.-]+\.(yaml|yml|tpl|txt))$" "$listing" || true)
   if [[ -n $unexpected ]]; then
-    report "the chart package contains files that are not part of the chart layout:"
-    printf '  %s\n' $unexpected >&2
+    report "the chart package contains files that are not part of the chart layout (a new kind of chart file, such as values.schema.json or crds/, must be added to the allow-list in this script):"
+    sed 's/^/  /' <<<"$unexpected" >&2
   fi
   return "$fail"
 }
 
 check_assets() {
-  local dir=$1 name=$2 version=$3 f base
+  local dir=${1%/} name=$2 version=$3 f base
   [[ -d $dir ]] || {
     printf 'no such directory: %s\n' "$dir" >&2
     return 1

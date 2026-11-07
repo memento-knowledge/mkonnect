@@ -30,7 +30,6 @@ import (
 // This file is the shared, test-only harness for scenarios in which the connector pushes to a replica
 // that sits behind a load balancer. It is a *_test.go file: it is compiled into the test binary only
 // and is excluded from every image and package (see RIG.md and scripts/check-artifact-contents.sh).
-// Other tests in this package, including slower ones, build on it.
 //
 // replicaFront is the load balancer: a TLS server (a throwaway CA from internal/testca) in front of a
 // stock `git http-backend` serving one bare repository. Everything the real git binary sends goes
@@ -44,7 +43,7 @@ import (
 //	FailPushes(status)       requests of a push are answered at once with that status (for example a
 //	                         504 from a gateway that gave up on the replica); 0 ends it
 //	RevokeAfterPushes(n)     after n completed pushes every request answers 401 (the credential is
-//	                         lost in the middle of a multi-batch push); Revoke / Restore do it by hand
+//	                         lost in the middle of a multi-batch push); Restore ends it
 //	RevokePushAuth()         only the POSTs of pushes answer 401, the advertisement still passes (a
 //	                         token that expires between the two requests of one push); Restore ends it
 //	OnPush(f)                f(n) runs after the n-th completed push, before its response is sent, so
@@ -71,6 +70,8 @@ type frontRequest struct {
 	Status  int    // 0 when the request was abandoned (a stall that the client gave up on)
 	Auth    string // the Authorization header exactly as received
 	Push    bool   // a POST to git-receive-pack
+	Chunked bool   // the request body was sent with chunked transfer encoding
+	Length  int64  // the declared body length, -1 when chunked
 }
 
 // replicaFront is the load balancer; see the comment at the top of the file.
@@ -225,10 +226,7 @@ func (f *replicaFront) RevokeAfterPushes(n int) {
 	f.update(func() { f.revokeAfter = f.pushes + n })
 }
 
-// Revoke makes every request answer 401 until Restore.
-func (f *replicaFront) Revoke() { f.update(func() { f.revoked = true }) }
-
-// Restore ends a revocation, whether by hand or by RevokeAfterPushes.
+// Restore ends a revocation, whether from RevokeAfterPushes or RevokePushAuth.
 func (f *replicaFront) Restore() {
 	f.update(func() { f.revoked, f.revokePost, f.revokeAfter = false, false, 0 })
 }
@@ -326,8 +324,10 @@ const maxBuffer = 64 << 20
 func (f *replicaFront) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rec := frontRequest{
 		Method: r.Method, Path: r.URL.Path, Service: r.URL.Query().Get("service"),
-		Auth: r.Header.Get("Authorization"),
-		Push: r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack"),
+		Auth:    r.Header.Get("Authorization"),
+		Push:    r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-receive-pack"),
+		Chunked: len(r.TransferEncoding) > 0 && r.TransferEncoding[0] == "chunked",
+		Length:  r.ContentLength,
 	}
 	sw := &statusWriter{ResponseWriter: w}
 	defer func() {
@@ -374,8 +374,6 @@ func (f *replicaFront) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if isPushRequest && stall {
 		f.update(func() { f.stalled++ })
-		// With the body read, the server notices the client going away and ends r.Context().
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, maxDrain))
 		select {
 		case <-r.Context().Done(): // the client gave up
 		case <-f.release:
@@ -482,7 +480,7 @@ func (r *replicaRig) syncOK() syncResult {
 }
 
 // wantError checks that a sync failed with the given error type and no detail (a classified failure
-// carries none), and returns it.
+// carries none).
 func (r *replicaRig) wantError(res syncResult, errorType string) {
 	r.t.Helper()
 	if res.State != StateError || res.ErrorType != errorType || res.ErrorDetail != "" {

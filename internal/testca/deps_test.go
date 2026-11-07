@@ -10,8 +10,9 @@ import (
 const modulePath = "github.com/memento-knowledge/mkonnect"
 
 // No binary the project ships may link test-only code. The images are built from a context that
-// excludes test files, so a production package that imported testca (or net/http/httptest) would
-// either fail to build there or, worse, pull a throwaway-CA generator into the connector.
+// excludes test files and internal/testca, so a production package that imported testca would fail to
+// build there; one that imported net/http/httptest or testing would build, and pull test machinery
+// into the connector.
 func TestProductionBinariesDoNotDependOnTestOnlyPackages(t *testing.T) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {

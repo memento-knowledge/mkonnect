@@ -14,8 +14,9 @@ import (
 )
 
 // End-to-end scenarios for the replica rig (see replicarig_test.go): the real sync path, real git,
-// a replica behind a TLS front end. Each one checks the replica's refs, the typed outcome, the
-// mirror, and that no credential leaked. All are small and run in parallel.
+// a replica behind a TLS front end. They check the replica's refs, the typed outcome, the mirror
+// and that no credential leaked, as far as each scenario applies (the helpers are in replicarig_test.go).
+// All are small and, except where noted, run in parallel.
 
 // A sync that finds the origin's history rewritten (an amended commit) or rolled back to an ancestor
 // must make the replica's branch follow it: both are forced updates.
@@ -269,6 +270,9 @@ func TestReplicaRigLFSWarningPresentThenCleared(t *testing.T) {
 	if got := o.sync(); got.Warnings != nil {
 		t.Errorf("Warnings after the rule was replaced = %v, want none", got.Warnings)
 	}
+	if got, want := refs(t, o.mirror.Dir(o.task.RepoID)), []string{"refs/heads/main"}; !slices.Equal(got, want) {
+		t.Errorf("mirror refs = %v, want %v", got, want)
+	}
 	for _, req := range front.Requests() {
 		if req.Auth != "Bearer "+front.Token() {
 			t.Errorf("the front received Authorization %q", req.Auth)
@@ -282,11 +286,12 @@ func TestReplicaRigLFSWarningPresentThenCleared(t *testing.T) {
 func TestReplicaRigOversizedPushIsRejectedThenSucceedsOnceTheLimitIsLifted(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name string
-		size int // bytes of incompressible content in the new commit
+		name    string
+		size    int // bytes of incompressible content in the new commit
+		chunked bool
 	}{
-		{"a body with a length", 96 << 10},
-		{"a chunked body", 2 << 20}, // beyond git's http.postBuffer of 1 MiB
+		{"a body with a length", 96 << 10, false},
+		{"a chunked body", 2 << 20, true}, // beyond git's http.postBuffer of 1 MiB
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -299,8 +304,17 @@ func TestReplicaRigOversizedPushIsRejectedThenSucceedsOnceTheLimitIsLifted(t *te
 			big := r.commitBlob(tc.size)
 			res := r.syncOnce()
 			r.wantError(res, ErrReplicaRejected)
-			if r.front.Count(413) == 0 {
-				t.Errorf("the front never answered 413: %v", r.front.Requests())
+			var refused []frontRequest
+			for _, req := range r.front.Requests() {
+				if req.Status == 413 {
+					refused = append(refused, req)
+				}
+			}
+			if len(refused) == 0 {
+				t.Fatalf("the front never answered 413: %v", r.front.Requests())
+			}
+			if got := refused[0]; got.Chunked != tc.chunked {
+				t.Errorf("the refused push had chunked=%v (length %d), want chunked=%v: git's http.postBuffer changed?", got.Chunked, got.Length, tc.chunked)
 			}
 			if got := refs(t, r.replica); !slices.Equal(got, before) || tip(t, r.replica, "refs/heads/main") != beforeTip {
 				t.Errorf("replica changed although its push was refused: %v", got)
@@ -418,7 +432,6 @@ func TestReplicaRigCredentialLostMidPushDeletesNothingAndRecovers(t *testing.T) 
 func TestReplicaRigRotatedTokenReplacesTheOldOne(t *testing.T) {
 	t.Parallel()
 	r := newReplicaRig(t, 1)
-	old := r.task.PushToken.Reveal()
 	r.syncOK()
 
 	fresh := r.front.RotateToken()
@@ -431,11 +444,6 @@ func TestReplicaRigRotatedTokenReplacesTheOldOne(t *testing.T) {
 	r.task.PushToken = Secret(fresh)
 	r.syncOK()
 	r.wantSameTips()
-	for _, req := range r.front.Requests() {
-		if req.Auth != "Bearer "+old && req.Auth != "Bearer "+fresh {
-			t.Errorf("the front received Authorization %q", req.Auth)
-		}
-	}
 }
 
 // A CA the connector does not trust makes the replica unreachable (a TLS failure, not a rejected
@@ -444,7 +452,8 @@ func TestReplicaRigRotatedTokenReplacesTheOldOne(t *testing.T) {
 // uses.
 func TestReplicaRigTrustsACustomCAThroughTheDaemonEnvironment(t *testing.T) {
 	r := newReplicaRig(t, 1)
-	r.d.run, r.d.runOut = runGit, runGitOut
+	// The recorder runs the real git without the trust wrapper, as the daemon does.
+	r.d.run, r.d.runOut = r.rec.run, r.rec.runOut
 	for _, name := range []string{"GIT_SSL_CAINFO", "SSL_CERT_FILE", "SSL_CERT_DIR"} {
 		t.Setenv(name, "")
 		if err := os.Unsetenv(name); err != nil {

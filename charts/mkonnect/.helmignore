@@ -2,7 +2,8 @@
 # templates/ only; everything below is local state or test code that must not reach the chart package,
 # the release assets or an OCI registry. Do not add a pattern that matches a file the chart needs:
 # scripts/release-chart-source.sh compares the package with this directory and fails on a difference.
-# CI also lists the package (scripts/check-artifact-contents.sh chart) and fails on any other file.
+# CI also lists the package (scripts/check-artifact-contents.sh chart) and fails on any file that is not in
+# its allow-list of chart files; add a new kind of chart file (values.schema.json, crds/) there too.
 .git/
 .gitignore
 .gitattributes

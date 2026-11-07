@@ -106,6 +106,12 @@ dockerfile_with 'COPY foo_test.go /foo_test.go'
 expect_fail "a final stage copying from the build context" "may only COPY --from=builder" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
 dockerfile_with 'COPY --from=builder /src /src'
 expect_fail "a final stage copying the whole source tree" "not one of" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+dockerfile_with 'COPY --from=builder /mkonnect /src /'
+expect_fail "a final stage with an unexpected second source" "not one of" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+dockerfile_with 'COPY --from=builder-evil /mkonnect /'
+expect_fail "a final stage copying from another stage" "may only COPY --from=builder" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
+dockerfile_with 'RUN --mount=type=bind,source=.,target=/ctx cp -r /ctx /src'
+expect_fail "a final stage mounting the build context" "must not mount" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
 dockerfile_with 'ADD . /app'
 expect_fail "a final stage using ADD" "must not use ADD" dockerfile "$tmpdir/Dockerfile.bad" /mkonnect /data-empty
 
@@ -116,6 +122,7 @@ touch "$assets/mkonnect-1.2.3.tgz" "$assets/mkonnect-1.2.3.tgz.sha256"
 expect_ok "release assets: chart and checksum" assets "$assets" mkonnect 1.2.3
 touch "$assets/release-metadata.json"
 expect_ok "release assets: chart, checksum and metadata" assets "$assets" mkonnect 1.2.3
+expect_ok "release assets: a directory named with a trailing slash" assets "$assets/" mkonnect 1.2.3
 touch "$assets/replicarig_test.go"
 expect_fail "release assets with a stray file" "unexpected release asset" assets "$assets" mkonnect 1.2.3
 rm "$assets/replicarig_test.go" "$assets/mkonnect-1.2.3.tgz.sha256"
@@ -168,9 +175,9 @@ COPY mkonnect /mkonnect
 COPY data-empty /data
 COPY foo_test.go /foo_test.go
 EOF
+  trap 'rm -rf "$tmpdir"; docker rmi -f artifact-check-good:test artifact-check-bad:test >/dev/null 2>&1 || true' EXIT
   docker build -q -f "$ctx/Dockerfile.good" -t artifact-check-good:test "$ctx" >/dev/null
   docker build -q -f "$ctx/Dockerfile.bad" -t artifact-check-bad:test "$ctx" >/dev/null
-  trap 'rm -rf "$tmpdir"; docker rmi -f artifact-check-good:test artifact-check-bad:test >/dev/null 2>&1 || true' EXIT
   expect_ok "a built image with only the binary and /data" image artifact-check-good:test /mkonnect
   expect_fail "a built image that also holds a test file" "foo_test.go" image artifact-check-bad:test /mkonnect
 else

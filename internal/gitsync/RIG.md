@@ -6,7 +6,7 @@ the container images, the Helm chart and the release assets (`.dockerignore`, `c
 and `scripts/check-artifact-contents.sh`, run by CI).
 
 It runs in the normal gate (`go test ./... -race`) and skips itself when `git` or `git-http-backend` is
-missing. Slower scenarios build on the same harness from other files in the package.
+missing.
 
 ## What it is
 
