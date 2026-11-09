@@ -291,7 +291,7 @@ func TestOriginCheckRefreshedEveryIntervalAfterConfigAccepted(t *testing.T) {
 	}
 	// Heartbeats arrive a little unevenly, so the interval is met with a tenth to spare; just short
 	// of that, still nothing.
-	due := gitsync.OriginCheckIntervalForTest - gitsync.OriginCheckIntervalForTest/10
+	due := gitsync.OriginCheckFailingIntervalForTest - gitsync.OriginCheckFailingIntervalForTest/10
 	clk.advance(due - gateway.DefaultHeartbeatInterval - 2*time.Second)
 	heartbeat(t, c, s)
 	waitProbeDone(t, c)
@@ -346,7 +346,7 @@ func TestOriginCheckAbsentOnLocalFault(t *testing.T) {
 		t.Fatalf("probe ran %d times, want 1", prober.calls.Load())
 	}
 	c.HandleMessage(ctx, s, "git_sync_config", configWithExtras("1"))
-	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+	clk.advance(gitsync.OriginCheckFailingIntervalForTest + time.Second)
 	heartbeat(t, c, s)
 	waitProbeDone(t, c)
 	if prober.calls.Load() != 2 {
@@ -419,7 +419,7 @@ func TestCancelledProbeKeepsTheCachedResultAndIsRetried(t *testing.T) {
 	// A refresh is under way when the connection drops.
 	block := make(chan struct{})
 	prober.set(gitsync.OriginUnreachable, nil, block)
-	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+	clk.advance(gitsync.OriginCheckHealthyIntervalForTest + time.Second)
 	if err := c.OnHeartbeat(ctx1, s); err != nil {
 		t.Fatalf("OnHeartbeat: %v", err)
 	}
@@ -481,7 +481,7 @@ func TestNoProbePileUpBehindASlowOrigin(t *testing.T) {
 	waitFor(t, func() bool { return prober.calls.Load() == 1 })
 
 	for range 10 {
-		clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+		clk.advance(gitsync.OriginCheckHealthyIntervalForTest + time.Second)
 		heartbeat(t, c, s)
 	}
 	if n := prober.calls.Load(); n != 1 {
@@ -490,7 +490,7 @@ func TestNoProbePileUpBehindASlowOrigin(t *testing.T) {
 
 	close(block)
 	waitProbeDone(t, c)
-	clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+	clk.advance(gitsync.OriginCheckHealthyIntervalForTest + time.Second)
 	heartbeat(t, c, s)
 	waitFor(t, func() bool { return prober.calls.Load() == 2 })
 	waitProbeDone(t, c)
@@ -523,25 +523,26 @@ func TestProbeOfASupersededConnectionNeitherStoresNorClears(t *testing.T) {
 			// A refresh is running on the first connection when the second one takes over.
 			block := make(chan struct{})
 			prober.set(finish.res, finish.err, block)
-			clk.advance(gitsync.OriginCheckIntervalForTest + time.Second)
+			clk.advance(gitsync.OriginCheckHealthyIntervalForTest + time.Second)
 			heartbeat(t, c, s1)
 			waitFor(t, func() bool { return prober.calls.Load() == 2 })
 			s2 := &stubSender{}
 			c.OnConnected(context.Background(), s2)
 			sent1, sent2 := len(s1.messages()), len(s2.messages())
 
-			close(block)
-			waitProbeDone(t, c)
-
-			// The superseded attempt gave its cadence slot back (asserted below), so the first
-			// heartbeat on the new connection starts a fresh probe of its own. Hold that probe, or it
-			// can land between maybeProbe and the status OnHeartbeat builds and replace the very cache
-			// this heartbeat is meant to observe, and send a status of its own.
+			// The new connection asked for a check while the superseded one was still running, so it is
+			// started the moment that one ends. Hold it (it reads its script when it starts, so the
+			// superseded attempt, already waiting, is unaffected), or it can land between the end of the
+			// superseded attempt and the status the heartbeat below builds, and replace the very cache
+			// that heartbeat is meant to observe.
 			hold := make(chan struct{})
 			var release sync.Once
 			releaseProbe := func() { release.Do(func() { close(hold) }) }
 			t.Cleanup(releaseProbe)
 			prober.set(gitsync.OriginUnreachable, nil, hold)
+
+			close(block)
+			waitFor(t, func() bool { return prober.calls.Load() == 3 })
 
 			if hb := heartbeat(t, c, s2); hb.OriginCheck == nil || *hb.OriginCheck != *cached {
 				t.Errorf("origin_check on the current connection = %+v, want the cached %+v", hb.OriginCheck, cached)
@@ -553,9 +554,8 @@ func TestProbeOfASupersededConnectionNeitherStoresNorClears(t *testing.T) {
 				t.Errorf("the current connection was sent %d statuses, want only the heartbeat's", n)
 			}
 
-			// The abandoned attempt did not use up the cadence slot: that heartbeat started a probe at
-			// once, and when it finishes it is committed to the current connection.
-			waitFor(t, func() bool { return prober.calls.Load() == 3 })
+			// The abandoned attempt did not use up the cadence slot: the current connection's own check
+			// started at once, and when it finishes it is committed to that connection.
 			releaseProbe()
 			waitProbeDone(t, c)
 			if got := latestOriginCheck(s2.messages()); got == nil || got.Result != "unreachable" {

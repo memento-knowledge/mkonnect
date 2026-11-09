@@ -261,7 +261,7 @@ func (d syncDeps) learnDefaultBranch(ctx context.Context, home string, t syncTas
 // originEnv is the environment for a git invocation that talks to the origin: the locked-down base
 // plus the origin credential scoped to the canonical URL.
 func (d syncDeps) originEnv(home string, t syncTask) []string {
-	return gitConfigEnv(gitBaseEnv(home), credConfig(t.CanonicalURL, t.Origin.Auth, t.Origin.Username, t.Origin.Token))
+	return originGitEnv(home, t.CanonicalURL, t.Origin)
 }
 
 // fetchEnv is originEnv plus the limits that bear on a fetch: the pack settings and, when a size

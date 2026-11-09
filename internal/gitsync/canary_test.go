@@ -210,6 +210,9 @@ type canaryScenario struct {
 	tweak func(r *canaryRun)
 	// wantState and wantType are the expected outcome of the sync.
 	wantState, wantType string
+	// wantOrigin, when set, is the origin_check the connector's own reachability check reports for the
+	// repository once the configuration is accepted (result, scope, error_type).
+	wantOrigin *proto.OriginCheck
 	// reload, when set, runs after the first sync has finished and its outcome has been checked. It
 	// changes the provider configuration under the running connector; whatever it makes the run
 	// handle is then searched for the credentials like everything else.
@@ -221,10 +224,12 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		t.Skip("git not installed")
 	}
 	scenarios := []canaryScenario{
-		{name: "success with bearer", auth: "bearer", wantState: gitsync.StateOK},
+		{name: "success with bearer", auth: "bearer", wantState: gitsync.StateOK,
+			wantOrigin: &proto.OriginCheck{Result: "reachable", Scope: "repository"}},
 		{name: "success with basic", auth: "basic", wantState: gitsync.StateOK},
 		{
 			name: "origin rejects the token", auth: "bearer", wantState: gitsync.StateError, wantType: gitsync.ErrOriginAccessDenied,
+			wantOrigin: &proto.OriginCheck{Result: "access_denied", Scope: "repository", ErrorType: "origin_access_denied"},
 			tweak: func(r *canaryRun) {
 				r.origin.update(func(s *canaryServer) { s.wantAuth = "Bearer some-other-token-0123456789" })
 			},
@@ -264,7 +269,8 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		{
 			// The origin tries to send the connector to the replica, hoping the origin credential follows.
 			name: "origin redirects to the replica", auth: "bearer", wantState: gitsync.StateError, wantType: gitsync.ErrOriginURLRedirected,
-			tweak: func(r *canaryRun) { r.origin.update(func(s *canaryServer) { s.redirectTo = r.replica.URL }) },
+			wantOrigin: &proto.OriginCheck{Result: "reachable", Scope: "repository", ErrorType: "origin_url_redirected"},
+			tweak:      func(r *canaryRun) { r.origin.update(func(s *canaryServer) { s.redirectTo = r.replica.URL }) },
 		},
 	}
 	for _, sc := range scenarios {
@@ -380,6 +386,19 @@ func runCanaryScenario(t *testing.T, sc canaryScenario) {
 
 	if r.status.State != sc.wantState || (sc.wantType != "" && r.status.ErrorType != sc.wantType) {
 		t.Fatalf("outcome = %s/%s (%q), want %s/%s", r.status.State, r.status.ErrorType, r.status.ErrorDetail, sc.wantState, sc.wantType)
+	}
+
+	if want := sc.wantOrigin; want != nil {
+		waitFor(t, func() bool {
+			oc := latestOriginCheck(r.sender.messages())
+			return oc != nil && oc.Result == want.Result
+		})
+		// A refusal the sync meets first closes the gate before the check dials, and the check then
+		// reports it without a scope or error_type; otherwise it carries both.
+		oc := latestOriginCheck(r.sender.messages())
+		if oc.Scope == "" && (oc.Result != "access_denied" || oc.ErrorType != "") || oc.Scope != "" && (oc.Scope != want.Scope || oc.ErrorType != want.ErrorType) {
+			t.Fatalf("origin_check = %+v, want %+v (or, with the credential held, access_denied with no scope)", oc, want)
+		}
 	}
 
 	if sc.reload != nil {

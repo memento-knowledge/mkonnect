@@ -1,7 +1,9 @@
 package gitsync
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"net/http/cgi"
 	"net/http/httptest"
@@ -38,7 +40,30 @@ type gitHTTPServer struct {
 	// checked, so a test can make a server redirect, refuse or rate limit like a real one. A 3xx
 	// carries a Location that must never reach a status.
 	forceStatus atomic.Int32
+
+	// routeStatus, when set, answers a request whose path it maps to a non-zero status with that
+	// status before any credential is checked, so a test can make the base URL and a repository
+	// answer differently (a sign-in redirect at the root, a 404 for one repository).
+	routeStatus atomic.Pointer[func(path string) int]
+	// protocols records the Git-Protocol header of every request, and bodies the body of every POST.
+	protocols []string
+	bodies    []string
 }
+
+func (s *gitHTTPServer) requestBodies() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.bodies)
+}
+
+func (s *gitHTTPServer) gitProtocols() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.protocols)
+}
+
+// route sets the per-path answers; a path it maps to 0 is served normally.
+func (s *gitHTTPServer) route(f func(path string) int) { s.routeStatus.Store(&f) }
 
 // forcedLocation is where a forced 3xx points: a host and path that must not appear in any detail.
 const forcedLocation = "https://other.example.net/moved/location"
@@ -69,8 +94,18 @@ func newGitHTTPServer(t *testing.T, root, wantAuth string, denyStatus int) *gitH
 		got := r.Header.Get("Authorization")
 		s.mu.Lock()
 		s.seen = append(s.seen, got)
+		s.protocols = append(s.protocols, r.Header.Get("Git-Protocol"))
+		if r.Method == http.MethodPost && r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			s.bodies = append(s.bodies, string(b))
+			r.Body = io.NopCloser(bytes.NewReader(b))
+		}
 		s.mu.Unlock()
-		if code := int(s.forceStatus.Load()); code != 0 {
+		code := int(s.forceStatus.Load())
+		if f := s.routeStatus.Load(); f != nil && code == 0 {
+			code = (*f)(r.URL.Path)
+		}
+		if code != 0 {
 			if code >= 300 && code < 400 {
 				w.Header().Set("Location", forcedLocation)
 			}

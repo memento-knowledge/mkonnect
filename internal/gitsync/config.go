@@ -94,6 +94,11 @@ type repoState struct {
 	attemptStartedAt time.Time
 }
 
+// schedulable says the connector may sync r: it is bound to a local provider and has a usable replica.
+// The gates of a provider's credential are kept for exactly these repositories (see
+// providerGates.retain), so the origin check only dials repositories that satisfy it.
+func (r repoState) schedulable() bool { return r.matched && r.replicaURL != "" }
+
 // bindRepo returns r bound against set: matched exactly when a provider serves its origin's host. A
 // repository whose binding changes (bound, unbound, or bound to another provider or another
 // generation of its credential) starts over: what its last attempt reported was said about a
@@ -286,11 +291,18 @@ func (c *Client) applyConfig(raw json.RawMessage) bool {
 	runsChanged := c.reconcileRunsLocked(next)
 	// next is c.repos now, which syncs update under mu: count it before letting go of the lock.
 	repoCount := len(next)
+	// A check that is dialling what this configuration no longer lists (the base URL it replaces, a
+	// repository whose URL changed) is stopped, and a provider whose check is no longer about what is
+	// configured is checked now, so a result about the base URL does not stand in for the repository
+	// check for a whole interval. A configuration that leaves every provider's targets as they were
+	// (the platform re-sends it on a token refresh) changes neither.
+	c.cancelStaleProbeLocked()
 	c.mu.Unlock()
 	if runsChanged {
 		c.markRunsDirty()
 	}
 	slog.Info("git_sync_config accepted", "repo_count", repoCount)
+	c.maybeProbe()
 	return true
 }
 

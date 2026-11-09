@@ -26,8 +26,12 @@ func (c *Client) EffectiveLimitsForTest() Limits { return c.effectiveLimits() }
 // it to stop before asserting that something did not happen.
 func (c *Client) ProbeInFlightForTest() bool { return c.probing.Load() }
 
-// OriginCheckIntervalForTest is the probe spacing once a configuration has been accepted.
-const OriginCheckIntervalForTest = originCheckInterval
+// The origin check spacing once a configuration has been accepted: for a provider whose last check
+// was clean, and for one whose last check was not.
+const (
+	OriginCheckHealthyIntervalForTest = healthyProbeInterval
+	OriginCheckFailingIntervalForTest = failingProbeInterval
+)
 
 // CanonicalHostKeyForTest exposes the host-canonicalization used by the match guard so a test can
 // assert that a bad host is rejected (an error), not merely that it fails to match a provider.

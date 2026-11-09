@@ -516,7 +516,7 @@ fix a problem, and exits non-zero if any check `FAIL`s. It never prints a creden
 | `gateway-url`, `gateway-dns`, `gateway-tls` | `GATEWAY_URL` is valid, its name resolves, and a TLS connection to the gateway succeeds with a trusted certificate. |
 | `replica-dns`, `replica-https` | The pinned replica host (`GIT_SYNC_REPLICA_HOST`) can be reached: its name resolves, and an unauthenticated HTTPS request to it is answered over a TLS connection that git trusts. The request is made by git, as the push is, with the same proxy settings and the same CA bundle (`GIT_SSL_CAINFO` replaces git's trust store, for the replica too). Like the origin check, any HTTP answer, including `401`, `403` and `404`, counts as reachable; `FAIL` means a connection, proxy or TLS problem. No credential of any kind is sent, and the push itself, which needs a token the platform issues once the connector is enrolled, is not tested. With an HTTPS proxy configured, the name is not looked up from here, because whether git uses the proxy for the host depends on `NO_PROXY`. |
 | `provider-config` | The provider configuration is one the connector accepts (the same rules as `connector config check`, except that preflight never changes the file; `config check` tightens a loose file mode to 0600, as the connector does at startup). A file whose mode is wider than the connector accepts (anything beyond owner access plus group read) is a failure: the connector tightens such a file to 0600 at startup where it can and refuses it where it cannot, and preflight cannot tell which without changing the file, which it never does. Run `chmod 600` on it (or let `connector config check` tighten it), then run preflight again.
-| `origin:<name>` | Each configured git server answers a `git ls-remote` against its base URL, with that provider's credential, using the same code and the same locked-down git environment as the connector's own reachability check. |
+| `origin:<name>` | Each configured git server answers a `git ls-remote` against its base URL, with that provider's credential, using the same code and the same locked-down git environment as the connector's own reachability check before a configuration has been accepted. Once the platform has sent repositories, the running connector checks a repository it lists instead (see [Verify](#verify)); preflight runs before there is one, so it can only check the base URL. |
 
 **The gateway check** makes one `HEAD` request to the gateway's address, with no body, no
 credential and no WebSocket upgrade, and any user information, query or fragment in `GATEWAY_URL`
@@ -531,7 +531,10 @@ a proxy applies, the proxy resolves the gateway's name, so `gateway-dns` has not
 including a 404, a server error, or a redirect (git is told not to follow redirects): a forge whose
 base address redirects to a sign-in page passes whatever the credential is. Many servers also
 answer a request to their base URL without asking for a credential. So a `PASS` does not prove that
-the credential is accepted or that it can read any repository; that shows at the first sync. A
+the credential is accepted or that it can read any repository. Preflight cannot do better, because
+it runs before the platform has told git-sync which repositories exist. Once it has, the running
+connector checks one of them instead, which does exercise the credential (see [Verify](#verify));
+until then, the first sync is where a rejected credential shows. A
 `FAIL` for `origin:<name>` means the server was unreachable (DNS, firewall, proxy, or a certificate
 git does not trust: see [Trusting an internal CA for git](#trusting-an-internal-ca-for-git)), or it
 asked for a credential and rejected the one configured. Each credential is sent only to its own
@@ -905,14 +908,41 @@ enrollment and the reason a repository failed are shown in the Memento portal.
 git-sync should register and connect within a few seconds.
 
 - **Portal:** the git-sync connector shows as connected, with a recent heartbeat. Once a provider
-  is configured, the portal also shows a reachability result for your git servers (one combined result, the worst
-  across the servers you configured: `reachable`, `access_denied`, or `unreachable`), before any
-  repository is added. `reachable` does not prove that the credential works: only a 401 or 403 from
-  the server's base address reads as `access_denied`, so a server that answers its base address without a
-  credential, or redirects it to a sign-in page, reads `reachable` with a wrong token. git-sync re-checks it about
-  every 30 seconds until the platform's first configuration is accepted and about every 5 minutes
-  afterwards, and keeps reporting it once repositories are syncing, so a credential that is later
-  revoked can show up there too, if the server's base address rejects it. The result is absent while no provider is configured, until the
+  is configured, the portal also shows a reachability result for your git servers (one combined result,
+  the worst across the servers you configured: `reachable`, `access_denied`, or `unreachable`), before
+  any repository is added. What it exercises depends on whether the platform has sent repositories
+  yet:
+  - **Before the first configuration is accepted,** git-sync checks each git server's base URL
+    (`git ls-remote` against it), about every 30 seconds. `reachable` then does not prove that the
+    credential works: only a 401 or 403 from the base URL reads as `access_denied`, so a server that
+    answers its base URL without a credential, or redirects it to a sign-in page, reads `reachable`
+    with a wrong token.
+  - **After the first configuration is accepted,** git-sync checks a **repository you listed**
+    instead, with the credential and the classifier a sync uses, so the check and a sync cannot
+    disagree about one failure. For each git server it picks one repository that git-sync can sync
+    and that synced successfully (else the one with the lowest repository ID), and keeps to it: it
+    changes only when the outcome of a sync does, or when repositories are added or removed. A server
+    with no repository git-sync can sync is still checked at its base URL. A server that refuses the
+    credential (401) reads `access_denied`: a server that redirects its
+    base URL to a sign-in page no longer reads `reachable` with a wrong token. A 403 or 404, or a
+    redirect, on a listed repository is about that repository, not about the server: it reads
+    `reachable`, and the repository's own status says what is wrong. After a 403, a 404 or a redirect,
+    git-sync tries one other repository before reporting, so one deleted or moved repository does
+    not colour the result. The check lists the repository's branches (`git ls-remote --heads`) and is
+    limited to 15 seconds, so a repository with a very large number of branches, or a very slow link to
+    the server, can read `unreachable` while syncs succeed.
+    A server that cannot be reached (DNS, firewall, proxy, certificate, a server error or a timeout)
+    reads `unreachable`.
+
+  The result is re-checked about every 15 minutes while a server answers cleanly and about every
+  5 minutes while it does not, so recovery shows quickly, and it keeps being reported once
+  repositories are syncing. A server whose credential was refused is not contacted again until the
+  hold described under [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it)
+  ends: the check reports `access_denied` without a request, and a refusal the check meets starts the
+  same hold. The result also carries two optional fields for newer consumers, `scope` (`host` for a
+  base URL check, `repository` for a repository check) and `error_type` (the repository error type,
+  for example `origin_access_denied` or `origin_url_redirected`); a consumer that ignores them reads
+  the same three values as before. The result is absent while no provider is configured, until the
   first check has finished, and when the check cannot run at all (for example git is missing from
   the image; the log says `origin reachability check could not run`). After you add repositories,
   each shows its sync state, when it last succeeded, and the outcome of its last attempt (see
@@ -1096,7 +1126,11 @@ The hold is kept in memory, like the rest of the backoff. After a restart each r
 once, but a sync still waiting for a free slot when the first rejection comes back is stopped. The
 reachability check shown in the portal (see [Verify](#verify)) uses the same credential every few
 minutes, so it is held back too: while a credential is held it reports `access_denied` for that
-provider without contacting the server.
+provider without contacting the server. A 401 that the check itself meets, on the repository it
+dials, is the same evidence as one a sync meets: it starts the hold. (A server that is only asked for
+its base URL, before the first configuration or because it has no repository to dial, does not.) A
+configuration that lists repositories for a server whose credential was just refused can cost one more
+failed login before the hold closes: the check and the first syncs start together.
 
 A successful sync clears the backoff. A repository whose origin or replica changes in a new
 configuration starts again with a fresh schedule; a configuration that leaves them unchanged (for
@@ -1461,9 +1495,10 @@ clears the error.
 |---|---|
 | `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. When the server refused the credential itself (401), the other repositories of that provider wait too; see [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it). It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
-| `origin_url_redirected` | The git server answered the repository URL with a redirect (301, 302, 307 or 308), and git-sync does not follow redirects (git runs with `http.followRedirects=false`, so a credential cannot be carried to another host). The detail is a fixed hint and never names where the server redirected to. The repository URL must be the exact canonical clone URL, character for character: a URL a server redirects (for example one without the `.git` suffix, such as `https://git.example.com/group/repository` instead of `https://git.example.com/group/repository.git`, or the old address of a renamed or moved project) fails this way. Use the URL the server itself shows for cloning, or correct the redirect on the server, and have the repository's URL corrected in Memento. A corrected URL is picked up by the next configuration and synced at once, and the repository's earlier error and retry delay do not carry over; if you fix the redirect on the server instead, the next scheduled retry succeeds (the delay is the ordinary one, see [Failures and backoff](#failures-and-backoff)). A server or proxy that answers an unauthenticated request with a redirect to a sign-in page ends here too; if the URL is already the canonical clone URL, check the credential and the authentication mode instead (see [Configure your git server credential](#configure-your-git-server-credential)). The origin reachability check does not catch this, because a redirect counts as reachable. |
+| `origin_url_redirected` | The git server answered the repository URL with a redirect (301, 302, 307 or 308), and git-sync does not follow redirects (git runs with `http.followRedirects=false`, so a credential cannot be carried to another host). The detail is a fixed hint and never names where the server redirected to. The repository URL must be the exact canonical clone URL, character for character: a URL a server redirects (for example one without the `.git` suffix, such as `https://git.example.com/group/repository` instead of `https://git.example.com/group/repository.git`, or the old address of a renamed or moved project) fails this way. Use the URL the server itself shows for cloning, or correct the redirect on the server, and have the repository's URL corrected in Memento. A corrected URL is picked up by the next configuration and synced at once, and the repository's earlier error and retry delay do not carry over; if you fix the redirect on the server instead, the next scheduled retry succeeds (the delay is the ordinary one, see [Failures and backoff](#failures-and-backoff)). A server or proxy that answers an unauthenticated request with a redirect to a sign-in page ends here too; if the URL is already the canonical clone URL, check the credential and the authentication mode instead (see [Configure your git server credential](#configure-your-git-server-credential)). The reachability check shown in the portal reports it as `reachable` with the error type `origin_url_redirected` once the platform has sent repositories, because it is about that repository and not about the server. |
 | `unclassified` with `mismatched algorithms: client sha1; server sha256` in the detail | The origin repository uses the SHA-256 object format, and git-sync's local mirror uses git's default, SHA-1, so the fetch fails; git-sync does not check for it. It is unsupported; see [Requirements](#requirements). |
-| The reachability check or `connector preflight` says `PASS`/`reachable`, yet a repository fails `origin_access_denied`, or a private one does not sync | The check is only about reachability: any answer other than 401, 403 or 407, including a redirect to a sign-in page, counts as reachable, whatever the credential. Check the credential against the repository itself, and the authentication mode: some servers ignore `bearer` and need `basic` with a username (see [Configure your git server credential](#configure-your-git-server-credential)). |
+| `connector preflight`, or the portal before the first configuration, says `PASS`/`reachable`, yet a repository fails `origin_access_denied`, or a private one does not sync | Those checks only ask the server's base URL, and any answer other than 401, 403 or 407, including a redirect to a sign-in page, counts as reachable, whatever the credential. Once the platform has sent repositories, the portal's check uses one of them and a refused credential reads `access_denied`. Check the credential against the repository itself, and the authentication mode: some servers ignore `bearer` and need `basic` with a username (see [Configure your git server credential](#configure-your-git-server-credential)). |
+| The portal says `reachable`, with the error type `origin_access_denied` | The check reached the server, but a repository it asked for answered 403 or 404 (and so did the one other it tried): the credential may lack access to the repositories, or they were deleted or renamed. Each repository's own status says which. This is not a refused credential, so nothing is held back. |
 | A **public** repository syncs, but a private one on the same server fails `origin_access_denied` | Likely the credential is not being accepted at all (for example `bearer` against a server that accepts only HTTP Basic): a public repository needs no credential, so it syncs anyway. Try `basic` with a username. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out before it was made (a connection that stalls after it was made runs into the push time limit and is `push_timeout`), so check the two requirements on your side: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from a machine on the same network path (the same egress address and proxy settings; the git-sync image has no `openssl` or `curl`), for example `openssl s_client -connect <replica-host>:<port> -servername <replica-host> -tls1_3 </dev/null` (a working connection prints `New, TLSv1.3`; it does not use `HTTPS_PROXY`), and see what `connector preflight` reports for `replica-https`. |
 | `replica_rate_limited` | The replica answered a push with HTTP 429: it is rate limiting pushes. The detail is a fixed hint. Nothing needs fixing on your side; git-sync retries later with the ordinary delay (see [Failures and backoff](#failures-and-backoff)). If it persists, contact Memento with the repository ID. |

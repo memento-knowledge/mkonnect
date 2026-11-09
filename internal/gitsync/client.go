@@ -185,12 +185,12 @@ type Client struct {
 	// wire order matches sequence order.
 	seq atomic.Uint64
 
-	// originCheck caches the most recent origin reachability result, reported in every status; nil
-	// when there is none (no local provider, or the last probe could not run). probing is guarded so
-	// only one probe runs at a time, and see maybeProbe for how often it runs.
+	// originCheck is the connector-level origin reachability result, reported in every status; nil
+	// when there is none (no local provider, or no check could run). It is derived from provChecks
+	// (see publishOriginCheckLocked). probing is guarded so only one check runs at a time, and see
+	// maybeProbe for how often it runs.
 	originCheck atomic.Pointer[proto.OriginCheck]
 	probing     atomic.Bool
-	lastProbe   atomic.Int64 // UnixNano of the last probe start
 
 	// mu guards the configured set and version, which OnHeartbeat (its own goroutine) and
 	// HandleMessage (the read loop) both reach.
@@ -233,8 +233,13 @@ type Client struct {
 	connSender gateway.Sender
 	// connGen counts connections, so work started on one can tell it has been superseded.
 	connGen uint64
-	// probeCancel stops the origin probe now running, if any; see maybeProbe.
-	probeCancel context.CancelFunc
+	// probeRun is the origin check now running, if any; see maybeProbe. provChecks holds each
+	// provider's latest check by provider name, guarded by mu like the providers it is about.
+	probeRun   *probeRun
+	provChecks map[string]providerCheck
+	// probePending says something that a running check may be about changed while it ran, so it looks
+	// again when it ends. probeRun, provChecks and probePending are guarded by mu.
+	probePending bool
 	// reload watches the provider file for changes; nil when the providers were not loaded from a file.
 	reload        *reloader
 	reloadRunning atomic.Bool
@@ -275,6 +280,7 @@ func NewClient(cfg *config.Config, keyStore *auth.KeyStore, local *Store, prober
 		now:            now,
 		bootID:         bootID,
 		repos:          map[string]repoState{},
+		provChecks:     map[string]providerCheck{},
 		attempts:       map[string]*attempt{},
 		runStore:       newRunStateStore(root),
 		runSaveEvery:   o.runSaveInterval,
@@ -697,7 +703,7 @@ func (c *Client) schedulableTargets() map[string]targetKey {
 	defer c.mu.Unlock()
 	out := make(map[string]targetKey, len(c.repos))
 	for id, r := range c.repos {
-		if r.matched && r.replicaURL != "" {
+		if r.schedulable() {
 			out[id] = targetKey{r.canonicalURL, r.replicaURL, r.bind}
 		}
 	}
@@ -764,7 +770,7 @@ func (c *Client) syncableRepos() []string {
 	snapshot := c.snapshotRepos()
 	var out []string
 	for _, r := range snapshot {
-		if r.matched && r.replicaURL != "" {
+		if r.schedulable() {
 			out = append(out, r.repoID)
 		}
 	}

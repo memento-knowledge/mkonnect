@@ -39,7 +39,7 @@ func (c *Client) syncable(repoID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r, ok := c.repos[repoID]
-	return ok && r.matched && r.replicaURL != ""
+	return ok && r.schedulable()
 }
 
 // claimTask snapshots what a sync of repoID needs, or reports that the repository is not (or no

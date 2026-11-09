@@ -196,8 +196,8 @@ func (s *scheduler) completed(repoID string, t syncTask, res syncResult) {
 		e.failures++
 		e.lastErr = res.ErrorType
 		if res.OriginCredentialRejected {
-			tier := max(effectiveInterval(s.hooks.limits()), backoffCap)
-			if s.gates.arm(e.key.bind, now, tier) {
+			existed, tier := s.armGate(e.key.bind, now)
+			if existed {
 				slog.Info("origin rejected the provider credential again; its repositories keep waiting", "repo_id", repoID, "retry_after", tier)
 			} else {
 				slog.Warn("origin rejected the provider credential; its other repositories wait before retrying", "repo_id", repoID, "retry_after", tier)
@@ -210,6 +210,18 @@ func (s *scheduler) completed(repoID string, t syncTask, res syncResult) {
 	e.staggered = success && !e.synced
 	e.synced = true
 	e.base, e.r = now, s.draw()
+}
+
+// armGate closes b's gate from at, for the tier that follows a rejected credential: max(interval,
+// backoffCap). It reports whether the gate already existed. The scheduler's sync completions and the
+// origin reachability check both use it, so a rejection seen by either is the same evidence.
+//
+// It takes only the gates' own lock, which is a leaf, and reads the limits through a hook that must
+// not take a lock: never s.mu. The reachability check calls it with the client's lock held, and the
+// lock order is scheduler -> manager -> client, so taking s.mu here would invert it.
+func (s *scheduler) armGate(b binding, at time.Time) (existed bool, tier time.Duration) {
+	tier = max(effectiveInterval(s.hooks.limits()), backoffCap)
+	return s.gates.arm(b, at, tier), tier
 }
 
 // poll starts every repository that is due. While syncing is suspended it does nothing at all: it
