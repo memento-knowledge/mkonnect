@@ -160,11 +160,12 @@ Two behaviours follow from "mirror the branches and tags as they are":
   runner with a single-platform `docker build` (see [`Dockerfile.gitsync`](../Dockerfile.gitsync)),
   as it does the API connector's image, which the [Installation guide](installation.md) describes
   as amd64-only. Run it on an amd64 host; on arm64 it runs only under emulation.
-- **Repositories in the SHA-1 object format.** The replica uses the SHA-1 object format, so an
-  origin repository that uses the SHA-256 object format (`git init --object-format=sha256`) cannot
-  be pushed. git-sync does not check for it: git reports `fatal: mismatched algorithms: client sha1;
-  server sha256` on the fetch (observed with a local transport and git 2.50), which git-sync
-  reports as `unclassified` with that detail. It is unsupported.
+- **Repositories in the SHA-1 object format.** git-sync creates its local mirror with git's
+  default object format, SHA-1, so an origin repository that uses the SHA-256 object format
+  (`git init --object-format=sha256`) cannot be mirrored. git-sync does not check for it: git
+  reports `fatal: mismatched algorithms: client sha1; server sha256` on the fetch (observed with a
+  local transport and git 2.50), which git-sync reports as `unclassified` with that detail. It is
+  unsupported.
 - **TLS 1.3 to the replica.** The replica is reached over HTTPS with TLS 1.3 only. The host that
   runs git-sync, and any proxy or firewall that terminates or inspects TLS between it and the
   replica, must be able to negotiate TLS 1.3 with it. git-sync sets no TLS version of its own and
@@ -363,7 +364,7 @@ Run every `helm` and `kubectl` command in this guide in the namespace of the API
 release (add `--namespace <namespace>` / `-n <namespace>`, or set it in your current context): the
 Secrets you create here must be in the release's namespace for the pod to mount them, and
 `helm upgrade` and `kubectl exec` act on the release and Deployment there. The examples omit the
-flag, except where a command is run against a specific pod.
+flag, except a few that show it.
 
 `--reset-then-reuse-values` (Helm 3.14+) takes the new chart's defaults and then re-applies the
 values you set on earlier installs and upgrades. The connector guide uses `--reuse-values`, which
@@ -528,7 +529,7 @@ a proxy applies, the proxy resolves the gateway's name, so `gateway-dns` has not
 **An origin result is about reachability.** `PASS` means the git server answered. The check runs
 `git ls-remote <base URL> HEAD`, and any answer other than 401, 403 or 407 counts as reachable,
 including a 404, a server error, or a redirect (git is told not to follow redirects): a forge whose
-root address redirects to a sign-in page passes whatever the credential is. Many servers also
+base address redirects to a sign-in page passes whatever the credential is. Many servers also
 answer a request to their base URL without asking for a credential. So a `PASS` does not prove that
 the credential is accepted or that it can read any repository; that shows at the first sync. A
 `FAIL` for `origin:<name>` means the server was unreachable (DNS, firewall, proxy, or a certificate
@@ -625,12 +626,12 @@ visible in the process list and shell history, is rejected); an authentication m
 `basic`, it sends `Authorization: Basic` with the username and the token (or password), which
 `--username` supplies; `basic` requires `--username` and `bearer` rejects it. Use the mode that
 your git server documents for authenticating `git fetch` over HTTPS with an access token. Some
-servers' HTTP git endpoint ignores a Bearer header and accepts only HTTP Basic. GitLab, as an
-example, documents cloning with a personal access token as the Basic password together with any
-non-blank username: for such a server use `--auth basic --username <any-non-blank-name>`, and use
-`bearer` only for a server that accepts it. (This is the vendor's documented behaviour; it has not
-been tested here against a live instance with a valid token.) The mismatch is easy to miss: with
-`bearer` against a server that ignores it, a private repository fails as `origin_access_denied`,
+servers' HTTP git endpoint accepts only HTTP Basic. GitLab, as an example, documents cloning with
+an access token as the Basic password together with a non-blank username: for such a server use
+`--auth basic --username <non-blank-name>`, and use `bearer` only for a server that accepts it.
+(This is the vendor's documented behaviour; it has not been tested here against a live instance
+with a valid token.) The mismatch is easy to miss: with `bearer` against a server that does not
+accept it, a private repository fails as `origin_access_denied`,
 and a **public** repository syncs without using the credential at all. With neither mode,
 requests carry no credential. Use a dedicated service account with read-only access (see
 [Use a least-privilege git account](git-sync-security.md#use-a-least-privilege-git-account)).
@@ -907,7 +908,7 @@ git-sync should register and connect within a few seconds.
   is configured, the portal also shows a reachability result for your git servers (one combined result, the worst
   across the servers you configured: `reachable`, `access_denied`, or `unreachable`), before any
   repository is added. `reachable` does not prove that the credential works: only a 401 or 403 from
-  the server's base address reads as `access_denied`, so a server that answers its root without a
+  the server's base address reads as `access_denied`, so a server that answers its base address without a
   credential, or redirects it to a sign-in page, reads `reachable` with a wrong token. git-sync re-checks it about
   every 30 seconds until the platform's first configuration is accepted and about every 5 minutes
   afterwards, and keeps reporting it once repositories are syncing, so a credential that is later
@@ -1457,7 +1458,7 @@ clears the error.
 | `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. When the server refused the credential itself (401), the other repositories of that provider wait too; see [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it). It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
 | `unclassified` with `returned error: 301` (or 302, 307, 308) in the detail | The git server redirected the request, and git-sync does not follow redirects (git runs with `http.followRedirects=false`, so a credential cannot be carried to another host). The detail looks like `fatal: unable to access '': The requested URL returned error: 301`. The repository URL must therefore be the exact canonical clone URL, character for character: a URL a server redirects (for example one without the `.git` suffix, or the old address of a renamed or moved project) fails this way. Use the URL the server itself shows for cloning, or correct the redirect on the server, and have the repository's URL corrected in Memento. The origin reachability check does not catch this, because a redirect counts as reachable. |
-| `unclassified` with `mismatched algorithms: client sha1; server sha256` in the detail | The origin repository uses the SHA-256 object format, which the replica (SHA-1) cannot take; git-sync does not check for it. It is unsupported; see [Requirements](#requirements). |
+| `unclassified` with `mismatched algorithms: client sha1; server sha256` in the detail | The origin repository uses the SHA-256 object format, and git-sync's local mirror uses git's default, SHA-1, so the fetch fails; git-sync does not check for it. It is unsupported; see [Requirements](#requirements). |
 | The reachability check or `connector preflight` says `PASS`/`reachable`, yet a repository fails `origin_access_denied`, or a private one does not sync | The check is only about reachability: any answer other than 401, 403 or 407, including a redirect to a sign-in page, counts as reachable, whatever the credential. Check the credential against the repository itself, and the authentication mode: some servers ignore `bearer` and need `basic` with a username (see [Configure your git server credential](#configure-your-git-server-credential)). |
 | A **public** repository syncs, but a private one on the same server fails `origin_access_denied` | Likely the credential is not being accepted at all (for example `bearer` against a server that accepts only HTTP Basic): a public repository needs no credential, so it syncs anyway. Try `basic` with a username. |
 | `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out before it was made (a connection that stalls after it was made runs into the push time limit and is `push_timeout`), so check the two requirements on your side: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from a machine on the same network path (the same egress address and proxy settings; the git-sync image has no `openssl` or `curl`), for example `openssl s_client -connect <replica-host>:<port> -servername <replica-host> -tls1_3 </dev/null` (a working connection prints `New, TLSv1.3`; it does not use `HTTPS_PROXY`), and see what `connector preflight` reports for `replica-https`. |
