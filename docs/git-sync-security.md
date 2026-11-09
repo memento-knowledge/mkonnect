@@ -30,7 +30,7 @@ against [`internal/gitsync`](../internal/gitsync) and [`cmd/mkonnect-gitsync`](.
 | Destination | Port | Direction | Purpose |
 |---|---|---|---|
 | Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`), unless that URL names another port | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration and requests for an immediate sync. |
-| Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. |
+| Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. The replica accepts TLS 1.3 only, and only connections from public addresses Memento has allowed for you (see below). |
 | Your git server(s): the base URL(s) you configure as providers | as in each base URL (443 for `https://`) | outbound | Read-only `git ls-remote` and `git fetch`. |
 | Container registry (`public.ecr.aws`) | 443 | outbound, from the container runtime or the cluster nodes, and from where you run `helm` | Pulling the image at install and upgrade, and, on Kubernetes, pulling the Helm chart (`oci://public.ecr.aws/...`). The running git-sync process does not contact it. |
 | DNS | 53 | outbound | Name resolution. |
@@ -40,6 +40,13 @@ It needs `github.com` (the release metadata, and build provenance attestations) 
 signature, Sigstore's public infrastructure, as described in the
 [cosign documentation](https://docs.sigstore.dev/cosign/system_config/installation/); none of that
 is contacted by the running connector.
+
+The replica is reached over HTTPS with TLS 1.3 only, and it accepts connections only from public
+addresses that Memento has allowed for you; Memento allows them before the first push, so the
+addresses are sent to Memento first (see [Requirements](git-sync.md#requirements) in the
+git-sync guide). git-sync itself neither sets a TLS version nor knows the allowed addresses: both
+are enforced by the replica, and a mismatch shows up as a failed push (see
+[Troubleshooting](git-sync.md#troubleshooting)).
 
 There are no inbound connections. Exact gateway and replica host names are given in the
 installation instructions for your tenant; they are not listed here because they are specific to
@@ -74,10 +81,14 @@ For each configured repository, one sync does the following:
 1. `git fetch --prune --force` of `refs/heads/*` and `refs/tags/*` from your git server into a
    bare repository on the data volume. The mirror is created on first use.
 2. A check that the mirror holds at least one branch or tag. If your git server advertises none,
-   the sync stops with an error and **does not touch the replica**. This prevents an empty or
-   misbehaving origin from deleting everything that was replicated.
+   the sync stops with an error (type `unclassified`, detail `origin has no branches or tags;
+   replica left unchanged`) and **does not touch the replica**. This prevents an origin that
+   advertises no branches or tags from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
-   no longer exists on your git server is removed from the replica. When the platform sets a push
+   no longer exists on your git server is removed from the replica. The push is forced, so a
+   force-push or history rewrite on your git server moves the same branch or tag on the replica
+   (see [What is copied, and what is not](git-sync.md#what-is-copied-and-what-is-not)). When the
+   platform sets a push
    batch size and the mirror holds more refs than that, git-sync first asks the replica what a
    push would change (a request that sends no data); if more refs than the batch size would be
    written, they go in batches, and the removals are made by one final push only once every batch
@@ -98,8 +109,10 @@ Only `refs/heads/*` and `refs/tags/*`, together with the objects reachable from 
 complete history behind every branch and tag, including files that were later deleted. It does
 **not** receive other namespaces your server may keep (for example pull or merge request refs),
 Git LFS object contents (git-sync uses plain `git fetch` and `git push`; a repository that appears
-to use LFS is reported with the warning `lfs_not_replicated`), repository hooks or
-settings, or anything outside the repository. Review what the repositories you select contain
+to use LFS is reported with the warning `lfs_not_replicated`), the repositories that submodules
+point to, repository hooks or settings, anything your git server keeps outside the repository's
+branches and tags (such as issues, merge-request discussions and wikis), or anything outside the
+repository. Review what the repositories you select contain
 before replicating them.
 
 ### What is stored, and where

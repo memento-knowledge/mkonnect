@@ -339,9 +339,14 @@ card) in the Memento portal:
 
 - The connector reports each plugin's state — **configured & connected**, **configured (error)**,
   or **not configured** — on connect, whenever the local config changes, and on each heartbeat.
-- Use **Test connection** to trigger an on-demand connectivity probe. The connector runs a request
-  against the tool's base URL and reports the result: `connected`, `auth_failure`, `unreachable`,
-  or `timeout`. No credential is ever included in the test request or its result.
+- Use **Test connection** to trigger an on-demand connectivity probe. The connector sends a `HEAD` request
+  to the tool's base URL (redirects are not followed) and reports the result: `connected`,
+  `auth_failure`, `unreachable`, or `timeout`. The request carries the tool's local credential, if
+  one is configured, but the credential is never included in the result sent to Memento. Only a
+  401 or 403 reads as `auth_failure`; any other 2xx or 3xx answer, a 404 or a 405 reads as
+  `connected`. The test therefore shows that the base URL answers, not that the credential is
+  right: a tool that answers its base URL without asking for a credential, or redirects it to a
+  sign-in page, reads `connected` even with a wrong token.
 
 ## Tuning the upstream timeout
 
