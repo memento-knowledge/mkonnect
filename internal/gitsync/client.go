@@ -36,6 +36,12 @@ const (
 // host-match guard); ErrUnclassified is the fallback that carries a sanitised detail so no failure
 // is dropped. See classifyGitFailure for how a failed git invocation maps onto them.
 //
+// ErrOriginURLRedirected is an origin answering a redirect (301, 302, 307 or 308) for the repository
+// URL: git runs with http.followRedirects=false, so the URL has to be the canonical clone URL.
+// ErrReplicaRateLimited (HTTP 429) and ErrReplicaRepositoryNotFound (HTTP 404, or git's "repository
+// not found") are the replica's own answers to a push; both are retried with the ordinary backoff.
+// Each of the three carries a fixed hint as its error_detail (see classifyGitFailure).
+//
 // ErrReplicaRejected includes a replica refusal over its own size or quota limit. The separate
 // ErrRepositoryOverLimit is reserved for the connector's own repository-size ceiling, a local check
 // that is never inferred from git output. It is enforced after the fetch, against the mirror's size
@@ -51,7 +57,12 @@ const (
 	ErrJobOutOfMemory      = "job_out_of_memory"
 	ErrRepositoryOverLimit = "repository_over_limit"
 	ErrPushTokenExpired    = "push_token_expired"
-	ErrUnclassified        = "unclassified"
+
+	ErrReplicaRateLimited        = "replica_rate_limited"
+	ErrReplicaRepositoryNotFound = "replica_repository_not_found"
+	ErrOriginURLRedirected       = "origin_url_redirected"
+
+	ErrUnclassified = "unclassified"
 )
 
 // WarnLFSNotReplicated marks a repository that synced but appears to use Git LFS, whose objects are

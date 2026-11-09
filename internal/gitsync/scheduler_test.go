@@ -405,6 +405,50 @@ func TestSchedulerCredentialFailuresWaitAnHourFromTheFirst(t *testing.T) {
 	})
 }
 
+// The three failures that need a fix outside git-sync but add no failed login stay on the ordinary
+// ladder, like replica_unreachable: they are not credential errors, so a repository does not wait an
+// hour from the first one.
+func TestSchedulerNewFailureTypesUseTheOrdinaryLadder(t *testing.T) {
+	for _, typ := range []string{ErrReplicaRateLimited, ErrReplicaRepositoryNotFound, ErrOriginURLRedirected, ErrReplicaUnreachable} {
+		t.Run(typ, func(t *testing.T) {
+			if slices.Contains(credentialErrors, typ) {
+				t.Fatalf("%s is in credentialErrors", typ)
+			}
+			h := newSchedHarness(t)
+			h.setRand(0)
+			h.configure("repo-a")
+			for i, want := range []time.Duration{15 * time.Minute, 30 * time.Minute, time.Hour, time.Hour} {
+				h.complete("repo-a", failResult(typ))
+				if got := h.dueIn("repo-a"); got != want {
+					t.Errorf("after failure %d: next due in %v, want %v", i+1, got, want)
+				}
+			}
+		})
+	}
+
+	t.Run("a long interval is kept", func(t *testing.T) {
+		h := newSchedHarness(t)
+		h.setInterval(24 * time.Hour)
+		h.setRand(0)
+		h.configure("repo-a")
+		h.complete("repo-a", failResult(ErrOriginURLRedirected))
+		if got := h.dueIn("repo-a"); got != 24*time.Hour {
+			t.Errorf("next due in %v, want the 24h interval", got)
+		}
+	})
+
+	t.Run("a credential failure after one still takes the hour", func(t *testing.T) {
+		h := newSchedHarness(t)
+		h.setRand(0)
+		h.configure("repo-a")
+		h.complete("repo-a", failResult(ErrOriginURLRedirected))
+		h.complete("repo-a", failResult(ErrOriginAccessDenied))
+		if got := h.dueIn("repo-a"); got != time.Hour {
+			t.Errorf("next due in %v, want 1h", got)
+		}
+	})
+}
+
 // Jitter must never make a retry earlier than the backoff floor: for a failing credential that
 // would defeat the point of the delay.
 func TestSchedulerFailureJitterNeverShortensTheDelay(t *testing.T) {

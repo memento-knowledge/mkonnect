@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/memento-knowledge/mkonnect/internal/auth"
 	"github.com/memento-knowledge/mkonnect/internal/config"
+	"github.com/memento-knowledge/mkonnect/internal/proto"
 )
 
 // These tests wire a real Client, manager and scheduler together over a fake git, with a clock the
@@ -46,6 +48,19 @@ type schedEnv struct {
 	providerPath string
 	// limits, when set, is sent as the configuration's "limits" object.
 	limits string
+	// originURL, when set, gives the origin_url a configuration sends for a repository.
+	originURL func(id string) string
+	// redirectNoGit makes a fetch of a URL without the ".git" suffix fail with a 301, as a forge does.
+	redirectNoGit atomic.Bool
+	// fetchedURLs are the URLs the fetches were made against, in order.
+	urlMu       sync.Mutex
+	fetchedURLs []string
+}
+
+func (e *schedEnv) fetched() []string {
+	e.urlMu.Lock()
+	defer e.urlMu.Unlock()
+	return slices.Clone(e.fetchedURLs)
 }
 
 const schedProviderJSON = `{"origin":{"base_url":"https://git.example.com/"}}`
@@ -66,12 +81,22 @@ func newSchedEnvProviders(t *testing.T, now func() time.Time, providerJSON strin
 			return nil, nil
 		}
 		e.fetches.Add(1)
+		var fetchURL string
+		if i := slices.Index(argv, "--"); i >= 0 && i+1 < len(argv) {
+			fetchURL = argv[i+1]
+		}
+		e.urlMu.Lock()
+		e.fetchedURLs = append(e.fetchedURLs, fetchURL)
+		e.urlMu.Unlock()
 		if g := e.gate.Load(); g != nil {
 			select {
 			case <-*g:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
+		}
+		if e.redirectNoGit.Load() && !strings.HasSuffix(fetchURL, ".git") {
+			return []byte("fatal: unable to access 'https://git.example.com/group/repo-a/': The requested URL returned error: 301"), errExit
 		}
 		if e.failing.Load() {
 			status := e.failStatus.Load()
@@ -117,7 +142,11 @@ func newSchedEnvProviders(t *testing.T, now func() time.Time, providerJSON strin
 func (e *schedEnv) configure(replicaSuffix string, ids ...string) {
 	repos := make([]string, len(ids))
 	for i, id := range ids {
-		repos[i] = fmt.Sprintf(`{"repo_id":%q,"origin_url":"https://git.example.com/group/%s.git","replica_push_url":"https://replica.example.com/r/%s%s.git","push_token":"push-token-abcdefghij"}`, id, id, id, replicaSuffix)
+		origin := fmt.Sprintf("https://git.example.com/group/%s.git", id)
+		if e.originURL != nil {
+			origin = e.originURL(id)
+		}
+		repos[i] = fmt.Sprintf(`{"repo_id":%q,"origin_url":%q,"replica_push_url":"https://replica.example.com/r/%s%s.git","push_token":"push-token-abcdefghij"}`, id, origin, id, replicaSuffix)
 	}
 	limits := ""
 	if e.limits != "" {
@@ -295,4 +324,117 @@ func TestClientRunDrivesTheSchedulerAndStopsItOnShutdown(t *testing.T) {
 func schedulerGoroutineRunning() bool {
 	buf := make([]byte, 1<<20)
 	return strings.Contains(string(buf[:runtime.Stack(buf, true)]), "(*scheduler).start.func")
+}
+
+// repoStatus is the repository's entry in the status the client would send now.
+func (e *schedEnv) repoStatus(t *testing.T, id string) proto.GitSyncRepoStatus {
+	t.Helper()
+	for _, r := range e.c.buildStatus().Repositories {
+		if r.RepoID == id {
+			return r
+		}
+	}
+	t.Fatalf("no status for %s", id)
+	return proto.GitSyncRepoStatus{}
+}
+
+// A repository whose origin URL redirects fails as origin_url_redirected and backs off. When the
+// platform sends the corrected URL for the same repository id, that is a new sync target: the error
+// and the backoff of the old one do not carry over, and the accepted configuration syncs every
+// syncable repository at once, the unchanged ones included.
+func TestClientCorrectedOriginURLStartsOverAndSyncsEveryRepositoryAtOnce(t *testing.T) {
+	e := newSchedEnv(t, nil)
+	var corrected atomic.Bool
+	e.originURL = func(id string) string {
+		url := "https://git.example.com/group/" + id
+		if id != "repo-a" || corrected.Load() {
+			url += ".git"
+		}
+		return url
+	}
+	e.redirectNoGit.Store(true)
+
+	e.configure("", "repo-a", "repo-b")
+	e.settle(t)
+	a := e.repoStatus(t, "repo-a")
+	if a.State != StateError || a.ErrorType != ErrOriginURLRedirected || a.ErrorDetail != detailOriginURLRedirected {
+		t.Fatalf("redirected repository = %+v, want error/%s with its hint", a, ErrOriginURLRedirected)
+	}
+	if b := e.repoStatus(t, "repo-b"); b.State != StateOK {
+		t.Fatalf("repo-b = %+v, want ok: a redirect on one repository is its own", b)
+	}
+	if got := e.dueIn(t, "repo-a"); got != 15*time.Minute {
+		t.Fatalf("first failure: next run in %v, want 15m on the ordinary ladder", got)
+	}
+
+	// The same configuration again: still redirected, and the failure count keeps growing.
+	e.configure("", "repo-a", "repo-b")
+	e.settle(t)
+	if got := e.dueIn(t, "repo-a"); got != 30*time.Minute {
+		t.Fatalf("second failure: next run in %v, want 30m", got)
+	}
+
+	corrected.Store(true)
+	before := e.fetches.Load()
+	gate := e.holdSyncs() // look at the repository while the sync the configuration starts is running
+	e.configure("", "repo-a", "repo-b")
+	eventually(t, func() bool { return e.fetches.Load() == before+2 })
+	if a := e.repoStatus(t, "repo-a"); a.ErrorType != "" || a.ErrorDetail != "" || a.State == StateError {
+		t.Errorf("repo-a after the corrected URL = %+v, want the old error gone", a)
+	}
+	if got := e.dueIn(t, "repo-a"); got != 15*time.Minute {
+		t.Errorf("corrected URL: next run in %v, want a fresh first run in 15m, not the old 30m/1h backoff", got)
+	}
+	close(gate)
+	e.gate.Store(nil)
+	e.settle(t)
+
+	if a := e.repoStatus(t, "repo-a"); a.State != StateOK || a.ErrorType != "" {
+		t.Errorf("repo-a after syncing the corrected URL = %+v, want ok", a)
+	}
+	urls := e.fetched()
+	if len(urls) < 2 {
+		t.Fatalf("fetched %v, want at least the last two fetches", urls)
+	}
+	if got := urls[len(urls)-2:]; !slices.ContainsFunc(got, func(u string) bool { return u == "https://git.example.com:443/group/repo-a.git" }) {
+		t.Errorf("last fetches %v never used the corrected URL", got)
+	}
+}
+
+// Correcting the URL while a sync of the old one is still running: the old attempt's outcome is about a
+// target that is gone and is dropped, and the corrected URL is synced right after it, not on the old
+// schedule.
+func TestClientCorrectedOriginURLWhileTheOldOneIsSyncing(t *testing.T) {
+	e := newSchedEnv(t, nil)
+	var corrected atomic.Bool
+	e.originURL = func(id string) string {
+		if corrected.Load() {
+			return "https://git.example.com/group/" + id + ".git"
+		}
+		return "https://git.example.com/group/" + id
+	}
+	e.redirectNoGit.Store(true)
+
+	gate := e.holdSyncs()
+	e.configure("", "repo-a")
+	eventually(t, func() bool { return e.fetches.Load() == 1 })
+	corrected.Store(true)
+	e.configure("", "repo-a") // folds into one trailing rerun of the new target
+	close(gate)
+	e.gate.Store(nil)
+	e.settle(t)
+	eventually(t, func() bool { return e.fetches.Load() == 2 })
+	e.settle(t)
+
+	urls := e.fetched()
+	want := []string{"https://git.example.com:443/group/repo-a", "https://git.example.com:443/group/repo-a.git"}
+	if !slices.Equal(urls, want) {
+		t.Fatalf("fetched %v, want the old URL once and then the corrected one", urls)
+	}
+	if a := e.repoStatus(t, "repo-a"); a.State != StateOK || a.ErrorType != "" || a.ErrorDetail != "" {
+		t.Errorf("repo-a = %+v, want ok: the old attempt's redirect must not be attributed to the corrected URL", a)
+	}
+	if got := e.dueIn(t, "repo-a"); got != 15*time.Minute {
+		t.Errorf("next run in %v, want the fresh schedule (15m), not a backoff", got)
+	}
 }

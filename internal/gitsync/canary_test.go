@@ -263,7 +263,7 @@ func TestCanaryNeverLeaks(t *testing.T) {
 		},
 		{
 			// The origin tries to send the connector to the replica, hoping the origin credential follows.
-			name: "origin redirects to the replica", auth: "bearer", wantState: gitsync.StateError,
+			name: "origin redirects to the replica", auth: "bearer", wantState: gitsync.StateError, wantType: gitsync.ErrOriginURLRedirected,
 			tweak: func(r *canaryRun) { r.origin.update(func(s *canaryServer) { s.redirectTo = r.replica.URL }) },
 		},
 	}
