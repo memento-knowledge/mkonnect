@@ -30,7 +30,7 @@ against [`internal/gitsync`](../internal/gitsync) and [`cmd/mkonnect-gitsync`](.
 | Destination | Port | Direction | Purpose |
 |---|---|---|---|
 | Memento Bridge Gateway (the Gateway URL in the installation instructions you were given for your tenant) | 443 (`wss://`), unless that URL names another port | outbound | Registration on first start, authentication, heartbeat and status, and receiving repository configuration and requests for an immediate sync. |
-| Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. The replica accepts TLS 1.3 only, and only connections from the public source address Memento has allowed for you (see below). |
+| Memento replica host (the replica host in the same instructions) | 443, or the port you pinned | outbound | HTTPS `git push` of branches and tags. The replica accepts TLS 1.3 only, and only connections from public addresses Memento has allowed for you (see below). |
 | Your git server(s): the base URL(s) you configure as providers | as in each base URL (443 for `https://`) | outbound | Read-only `git ls-remote` and `git fetch`. |
 | Container registry (`public.ecr.aws`) | 443 | outbound, from the container runtime or the cluster nodes, and from where you run `helm` | Pulling the image at install and upgrade, and, on Kubernetes, pulling the Helm chart (`oci://public.ecr.aws/...`). The running git-sync process does not contact it. |
 | DNS | 53 | outbound | Name resolution. |
@@ -41,10 +41,10 @@ signature, Sigstore's public infrastructure, as described in the
 [cosign documentation](https://docs.sigstore.dev/cosign/system_config/installation/); none of that
 is contacted by the running connector.
 
-The replica is reached over HTTPS with TLS 1.3 only, and it accepts connections only from the
-public source address that Memento has allowed for you; Memento allows it before the first push,
-so the address is sent to Memento first (see [Requirements](git-sync.md#requirements) in the
-git-sync guide). git-sync itself neither sets a TLS version nor knows the allowed address: both
+The replica is reached over HTTPS with TLS 1.3 only, and it accepts connections only from public
+addresses that Memento has allowed for you; Memento allows them before the first push, so the
+addresses are sent to Memento first (see [Requirements](git-sync.md#requirements) in the
+git-sync guide). git-sync itself neither sets a TLS version nor knows the allowed addresses: both
 are enforced by the replica, and a mismatch shows up as a failed connection (see
 [Troubleshooting](git-sync.md#troubleshooting)).
 
@@ -82,8 +82,8 @@ For each configured repository, one sync does the following:
    bare repository on the data volume. The mirror is created on first use.
 2. A check that the mirror holds at least one branch or tag. If your git server advertises none,
    the sync stops with an error (type `unclassified`, detail `origin has no branches or tags;
-   replica left unchanged`) and **does not touch the replica**. This prevents an empty or
-   misbehaving origin from deleting everything that was replicated.
+   replica left unchanged`) and **does not touch the replica**. This prevents an origin that
+   advertises no refs at all from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
    no longer exists on your git server is removed from the replica. The push is forced, so a
    force-push or history rewrite on your git server moves the same branch or tag on the replica

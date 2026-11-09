@@ -24,19 +24,21 @@ issued the values git-sync needs. In order:
    [Sizing](#sizing) against the host or cluster you will use.
 2. **Collect the values from Memento.** The git-sync connector ID, the one-time registration token,
    the replica host and the gateway URL are issued to you and must exist before you install (see
-   [What you'll collect](#what-youll-collect)). Memento allows the public source address that your
-   outbound traffic leaves from before git-sync's first push, so send that address to Memento
-   first (see [Requirements](#requirements)).
+   [What you'll collect](#what-youll-collect)). Memento allows the public source address(es) that your
+   outbound traffic leaves from before git-sync's first push, so send them to Memento first (see
+   [Requirements](#requirements)).
 3. **Check the release and verify the image.** Confirm that the release has a git-sync image, and
    verify its signature (see [Check that the release has a git-sync image](#check-that-the-release-has-a-git-sync-image)
    and [Verify the image signature](#verify-the-image-signature)).
 4. **Install** with [Docker](#option-a-docker) or [Kubernetes (Helm)](#option-b-kubernetes-helm),
    adding [a proxy](#using-an-http-proxy) or [an internal CA](#trusting-an-internal-ca-for-git) if
-   your network needs one.
+   your network needs one. With Docker, run preflight (below) before you start the container: the
+   first start uses the one-time registration token. On Kubernetes the pod starts at install, so
+   run it right after.
 5. **Configure your git server credential**, a read-only service account's token (see
    [Configure your git server credential](#configure-your-git-server-credential)).
-6. **Run preflight**, before the first start where you can and again once the credential is
-   configured (see [Check the host before the first start (preflight)](#check-the-host-before-the-first-start-preflight)).
+6. **Run preflight**, or run it again now that the credential is configured (see
+   [Check the host before the first start (preflight)](#check-the-host-before-the-first-start-preflight)).
 7. **[Verify](#verify)** that git-sync is connected and that each repository syncs.
 8. **[Remove the registration token](#remove-the-registration-token)** once the connector is
    connected.
@@ -88,32 +90,43 @@ and the push use only the refs `refs/heads/*` and `refs/tags/*`, so these are **
   refs, notes (`refs/notes/*`) and hidden refs. git-sync never fetches them.
 - The contents of Git LFS objects: the replica gets the pointer files only (see the
   `lfs_not_replicated` warning above).
-- Submodules. A submodule is a link to another repository; git-sync copies the link, not the
-  repository it points to.
+- Submodule contents. A submodule is a link to another repository: the link is part of the commit
+  and is replicated, but git-sync does not follow it, so the repository it points to is not
+  copied.
+- `HEAD` and the default branch. git-sync reads the origin's default branch and reports its name
+  as information; it does not push `HEAD`. Other refs outside branches and tags, such as
+  `refs/stash`, are not copied either.
 - Anything your git server stores outside the repository's branches and tags: hooks, repository
   settings and permissions, issues, merge-request discussions and wikis.
 
 Two behaviours follow from "mirror the branches and tags as they are":
 
-- **A force-push or history rewrite on your git server is replicated.** Fetching and pushing both
-  use force refspecs, so when a branch is force-pushed, amended, rebased or reset to an older commit,
+- **A force-push or history rewrite on your git server is replicated.** The fetch and the push
+  are both forced, so when a branch is force-pushed, amended, rebased or reset to an older commit,
   or a tag is moved, the next sync moves the same branch or tag on the replica to the new commit. It
   does not need a fast-forward. A branch or tag you delete is deleted on the replica. git-sync's
   tests cover each of these against a stand-in for the replica. git-sync only moves refs: it cannot
   delete objects on the replica, and what the replica keeps of commits that no branch or tag
-  reaches any more is not decided by git-sync.
+  reaches any more is not decided by git-sync. Nor does it purge the old commits from its own
+  mirror: git-sync runs no explicit cleanup, so they stay on the data volume until git's automatic
+  maintenance removes them, which can take a while. If you rewrite history to remove a secret and
+  need it gone from the mirror, stop git-sync and delete the mirror (see [Mirror layout](#mirror-layout));
+  the next sync downloads the repository again.
 - **An origin with no branch and no tag stops with an error and never touches the replica.** If,
   after the fetch, the mirror holds no branch and no tag (the repository is empty, it holds only
   refs outside branches and tags, or the server advertised none), the sync fails and git-sync does
-  not contact the replica at all, so nothing already replicated is removed. This prevents an empty
-  or misbehaving origin from wiping the replica. The repository's state is `error`, the error type
+  not contact the replica at all, so nothing already replicated is removed. This prevents an origin
+  that advertises nothing from wiping the replica. The guard applies only when there are no
+  branches and no tags at all: individual deleted branches and tags are still deleted on the
+  replica, and an origin URL that points at a different, non-empty repository would overwrite it. The repository's state is `error`, the error type
   is `unclassified`, and the detail is `origin has no branches or tags; replica left unchanged`.
   The detail appears in the `sync failed` log line (`error_type` and `detail`) and in the
   repository's status in Memento; `connector status` cannot show why an attempt failed. To fix it,
   push a branch or tag to the origin, or, if the origin should be empty or the repository should
   not be synced, remove the repository from the configuration in Memento. If the origin used to
-  have branches or tags, check the git server first. The next sync after the origin has a branch
-  or tag succeeds (the error is retried with the usual [backoff](#failures-and-backoff)); the
+  have branches or tags, check the git server first. The next attempt after the origin has a
+  branch or tag succeeds (the error is retried with the usual [backoff](#failures-and-backoff),
+  which can be an hour or more; an immediate sync from Memento or a restart retries sooner); the
   earlier replica contents stay until then.
 
 ## Before you start
@@ -129,8 +142,7 @@ Two behaviours follow from "mirror the branches and tags as they are":
   Helm release and takes its gateway URL from it by default.
 - **A git-sync connector** registered for your tenant, following the installation instructions you
   were given. It has its own connector ID, which is **not** the API connector's. Memento issues its
-  connector ID, registration token and replica host before you install; you cannot create them
-  yourself.
+  connector ID, registration token and replica host before you install.
 - **A git server reachable over HTTP or HTTPS** from the host that runs git-sync. SSH remotes are
   not supported. A credential (bearer token, or username and token for HTTP Basic) can only be used
   with an `https://` server.
@@ -139,17 +151,21 @@ Two behaviours follow from "mirror the branches and tags as they are":
 - **Outbound HTTPS (443)** to the Memento Bridge Gateway, to the Memento replica host, and to your
   git server(s), plus the container registry when you install or upgrade. No inbound ports are
   needed or opened. See [Network destinations](git-sync-security.md#network-destinations).
-- **TLS 1.3 to the replica.** The replica is reached over HTTPS and accepts TLS 1.3 only. The host
-  that runs git-sync, and any proxy or firewall that terminates or inspects TLS between it and the
-  replica, must be able to negotiate TLS 1.3. This is a requirement of the replica: git-sync sets no
-  TLS version of its own and does not check for this (git negotiates the connection), so a mismatch
-  shows up as a failed connection. See [Troubleshooting](#troubleshooting).
+- **TLS 1.3 to the replica.** The replica is reached over HTTPS with TLS 1.3 only. The host that
+  runs git-sync, and any proxy or firewall that terminates or inspects TLS between it and the
+  replica, must be able to negotiate TLS 1.3 with it. git-sync sets no TLS version of its own and
+  does not check for this (git negotiates the connection), so a mismatch shows up as a failed
+  connection. See [Troubleshooting](#troubleshooting).
 - **A public source address that Memento has allowed.** The replica accepts connections only from
-  the public source address that Memento has allowed for you. That is the address the replica sees:
-  behind NAT, a cloud NAT gateway or an egress proxy, it is that gateway's or proxy's public
-  address, not the host's private one. Send the address to Memento **before the first sync**, and
-  again before it changes, because a connection from any other address is refused. git-sync does
-  not know which address Memento allowed, so a passing preflight does not show that yours is
+  public addresses that Memento has allowed for you. That is the address the replica sees: behind
+  NAT, a cloud NAT gateway or an egress proxy, it is that gateway's or proxy's public address, not
+  the host's private one. Send Memento **every** public address your git-sync traffic can leave
+  from, **before the first sync**, and again before any of them changes. On Kubernetes, unless you
+  route egress through a fixed NAT gateway or proxy, the address depends on the node the pod runs
+  on and can change when it is rescheduled; if your egress is dual-stack, it may be an IPv6
+  address. A connection from an address that has not been allowed is not accepted; how that shows
+  up varies. git-sync does not know which addresses Memento allowed, and a preflight run from
+  another machine tests that machine's address, so a passing preflight does not show that yours is
   allowed. See [Troubleshooting](#troubleshooting).
 - **Disk.** A persistent volume holding a mirror of every replicated repository, and separate
   scratch space for git (see [Sizing](#sizing)).
@@ -163,7 +179,7 @@ Two behaviours follow from "mirror the branches and tags as they are":
 | Gateway URL | `GATEWAY_URL` | Copy it **exactly** as given; it must be `wss://`. |
 | Connector ID | `CONNECTOR_ID` | The ID of the **git-sync** connector, not the API connector's. |
 | Replica host | `GIT_SYNC_REPLICA_HOST` | A host name or `host:port`; no `https://`, no path. The port defaults to 443. git-sync pushes only to this host and port. |
-| Public source address | (you send it to Memento) | The public address your outbound traffic leaves from. Memento allows it before the first push; send it first (see [Requirements](#requirements)). |
+| Public source address(es) | (you send them to Memento) | The public addresses your outbound traffic leaves from. Memento allows them before the first push; send them first (see [Requirements](#requirements)). |
 | Registration token | read from a file | **One-time**, used only on first start. |
 | Release ID / chart version | image tag / `--version` | Pin an explicit version; never a moving tag. |
 
@@ -497,8 +513,9 @@ host.
 **A replica result is about reachability too.** A `PASS` for `replica-https` means git completed a
 TLS handshake with the replica host from here and got an HTTP answer. A `FAIL` ("connection, proxy
 or TLS") is what a failed TLS 1.3 negotiation looks like, and so is a connection that is refused,
-dropped or times out because the source address is not allowed; preflight cannot tell these apart,
-and it does not look at the TLS version it negotiated (see [Requirements](#requirements)). It also
+dropped or times out because the source address is not allowed; preflight cannot tell these apart
+(and its remedy text mentions only the firewall, proxy and certificates), and it does not look at
+the TLS version it negotiated (see [Requirements](#requirements)). It also
 cannot see which source address Memento allowed: a replica that answers a disallowed address with an
 HTTP status, instead of refusing the connection, still counts as reachable. If this check fails
 and the network path is open, test TLS 1.3 to the replica as described under `replica_unreachable`
@@ -1397,8 +1414,8 @@ clears the error.
 |---|---|
 | `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. When the server refused the credential itself (401), the other repositories of that provider wait too; see [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it). It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
-| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out, so check the two requirements of the replica: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from the host or pod that runs git-sync, for example `openssl s_client -connect <replica-host>:443 -servername <replica-host> -tls1_3 </dev/null` (a working connection prints `New, TLSv1.3`), and see what `connector preflight` reports for `replica-https`. |
-| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. git-sync classifies any HTTP 401 or 403 from the replica as this type, so it cannot tell a refused token from a refused source address: if the connector is connected and the clock is right, also confirm with Memento that the source address they allowed is the one the replica sees. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
+| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out, so check the two requirements on your side: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from the host or pod that runs git-sync, for example `openssl s_client -connect <replica-host>:443 -servername <replica-host> -tls1_3 </dev/null` (a working connection prints `New, TLSv1.3`), and see what `connector preflight` reports for `replica-https`. |
+| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. git-sync classifies any HTTP 401 or 403 from the replica as this type, so depending on how a refusal reaches git, a source address that has not been allowed can show here or as `replica_unreachable`: if the connector is connected and the clock is right, also confirm with Memento that the addresses they allowed include the one the replica sees. After Memento has allowed an address, an immediate sync or a restart retries now instead of waiting out the delay. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `replica_rejected` | The replica refused the push: a rejected ref, a policy decision, or a size or quota limit. Contact Memento with the repository ID. |
 | `push_timeout` | A push ran past its time limit (30 minutes unless Memento set another), typically a very large first push over a slow link. Check bandwidth to the replica; later syncs push less. |
