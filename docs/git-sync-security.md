@@ -45,7 +45,7 @@ The replica is reached over HTTPS with TLS 1.3 only, and it accepts connections 
 addresses that Memento has allowed for you; Memento allows them before the first push, so the
 addresses are sent to Memento first (see [Requirements](git-sync.md#requirements) in the
 git-sync guide). git-sync itself neither sets a TLS version nor knows the allowed addresses: both
-are enforced by the replica, and a mismatch shows up as a failed connection (see
+are enforced by the replica, and a mismatch shows up as a failed push (see
 [Troubleshooting](git-sync.md#troubleshooting)).
 
 There are no inbound connections. Exact gateway and replica host names are given in the
@@ -83,7 +83,7 @@ For each configured repository, one sync does the following:
 2. A check that the mirror holds at least one branch or tag. If your git server advertises none,
    the sync stops with an error (type `unclassified`, detail `origin has no branches or tags;
    replica left unchanged`) and **does not touch the replica**. This prevents an origin that
-   advertises no refs at all from deleting everything that was replicated.
+   advertises no branches or tags from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
    no longer exists on your git server is removed from the replica. The push is forced, so a
    force-push or history rewrite on your git server moves the same branch or tag on the replica
