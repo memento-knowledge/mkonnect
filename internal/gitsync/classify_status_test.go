@@ -83,6 +83,18 @@ func TestClassifyGitFailureStatusIgnoresRemoteText(t *testing.T) {
 			"remote: fatal: repository 'x' not found\n ! [remote rejected] main -> main (hook declined)", ErrReplicaRejected},
 		{"replica rejection reason spells the phrase", replicaSide,
 			" ! [remote rejected] main -> main (fatal: repository 'x' not found)", ErrReplicaRejected},
+		// Text the remote chose that git relays on a line of its own, or as a rejected ref's reason, is
+		// not git's status either.
+		{"replica rejection reason claims a 404", replicaSide,
+			" ! [remote rejected] main -> main (upstream returned error: 404)", ErrReplicaRejected},
+		{"replica rejection reason claims a 429", replicaSide,
+			" ! [remote rejected] main -> main (The requested URL returned error: 429)", ErrReplicaRejected},
+		{"replica relayed error claims a 429", replicaSide,
+			"fatal: remote error: The requested URL returned error: 429", ErrUnclassified},
+		{"replica unpack failure claims a 404", replicaSide,
+			"error: remote unpack failed: The requested URL returned error: 404", ErrUnclassified},
+		{"origin relayed error claims a redirect", originSide,
+			"fatal: remote error: The requested URL returned error: 301", ErrUnclassified},
 		// A real 429 whose own text mentions words other arms read: the status wins.
 		{"replica 429 with quota and timeout words in a remote line", replicaSide,
 			"remote: quota exceeded, too large a burst, timed out waiting for ssl\n" + httpFailure("429"), ErrReplicaRateLimited},
@@ -99,7 +111,8 @@ func TestClassifyGitFailureStatusIgnoresRemoteText(t *testing.T) {
 }
 
 // The detail of the three new types is a fixed hint. Whatever git or the server printed (the redirect
-// target, a host, a path, a branch, a credential) must not reach it.
+// target, a host, a path, a branch, a credential) must not reach it: the detail is the constant, and
+// the constants themselves carry none of those.
 func TestClassifyGitFailureHintsNeverCarryServerText(t *testing.T) {
 	exit := errors.New("exit status 128")
 	needles := []string{

@@ -393,6 +393,9 @@ func TestClientCorrectedOriginURLStartsOverAndSyncsEveryRepositoryAtOnce(t *test
 		t.Errorf("repo-a after syncing the corrected URL = %+v, want ok", a)
 	}
 	urls := e.fetched()
+	if len(urls) < 2 {
+		t.Fatalf("fetched %v, want at least the last two fetches", urls)
+	}
 	if got := urls[len(urls)-2:]; !slices.ContainsFunc(got, func(u string) bool { return u == "https://git.example.com:443/group/repo-a.git" }) {
 		t.Errorf("last fetches %v never used the corrected URL", got)
 	}

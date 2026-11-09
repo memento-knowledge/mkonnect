@@ -119,13 +119,14 @@ func containsAny(s string, markers []string) bool {
 // Three further answers are specific to the replica. HTTP 429 is replica_rate_limited, and HTTP 404 (or
 // git's "repository not found") is replica_repository_not_found: the repository may not have been
 // created yet. The same 404 from an origin stays origin_access_denied. HTTP 503 is replica_unreachable
-// (the replica answers it when it cannot check a push token). HTTP 401 and 403 are credential_rejected
-// (or push_token_expired): a 403 can also come from a firewall in front of the replica, which git-sync
-// cannot tell from the replica refusing the token, and the platform uses 429, not 403, for its rate
-// limit.
+// (the replica could not serve the request, for example because it cannot check a push token). HTTP
+// 401 and 403 are credential_rejected (or push_token_expired): a 403 can also come from a firewall in
+// front of the replica, which git-sync cannot tell from the replica refusing the token, so the
+// replica reports a rate limit as 429, not 403.
 //
-// The HTTP status is read from git's own lines only. A "remote:" line is text the far end chose and
-// must not be able to pick the error type.
+// The HTTP status is read from git's own message lines only (see gitOwnText): text the far end chose,
+// whether a "remote:" line, a relayed error or a rejected ref's reason, cannot pick the error type
+// through it. The keyword arms still read the whole text, as they always have.
 func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired bool) (errorType, detail string) {
 	if err == nil {
 		return "", ""
@@ -153,7 +154,7 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	}
 
 	status := ""
-	if m := httpStatusRE.FindStringSubmatch(local); m != nil {
+	if m := httpStatusRE.FindStringSubmatch(gitOwnText(local)); m != nil {
 		status = m[1]
 	}
 	serverError := len(status) == 3 && status[0] == '5'
@@ -262,6 +263,21 @@ func matchText(stderr []byte) string {
 // delete a healthy mirror and download the whole repository again.
 func isCorruptMirror(stderr []byte) bool {
 	return containsAny(localLines(matchText(stderr)), corruptMirrorMarkers)
+}
+
+// gitOwnText narrows localLines further to what git itself wrote, for reading an HTTP status: the
+// remote's text after "fatal: remote error:" or "error: remote unpack failed:" is dropped, and so is
+// every per-ref status line (scrubRefLines leaves those as "[remote rejected] (<reason>)", and the
+// reason is the replica's own words). A server can put "returned error: 404" in either.
+func gitOwnText(local string) string {
+	var out []string
+	for _, line := range strings.Split(local, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			continue
+		}
+		out = append(out, remoteTextRE.ReplaceAllString(line, "${1}"))
+	}
+	return strings.Join(out, "\n")
 }
 
 // localLines returns s with every "remote:"-prefixed line removed.
