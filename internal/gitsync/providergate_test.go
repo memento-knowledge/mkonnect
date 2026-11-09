@@ -88,6 +88,9 @@ func TestGateIsOpenedOnlyByAFailureThatRejectsTheCredential(t *testing.T) {
 		"credential_rejected (replica side)":      {State: StateError, ErrorType: ErrCredentialRejected},
 		"push_token_expired":                      {State: StateError, ErrorType: ErrPushTokenExpired},
 		"origin_unreachable":                      {State: StateError, ErrorType: ErrOriginUnreachable},
+		"origin_url_redirected":                   {State: StateError, ErrorType: ErrOriginURLRedirected},
+		"replica_rate_limited":                    {State: StateError, ErrorType: ErrReplicaRateLimited},
+		"replica_repository_not_found":            {State: StateError, ErrorType: ErrReplicaRepositoryNotFound},
 		"a flagged result that succeeded":         {State: StateOK, OriginCredentialRejected: true},
 	} {
 		t.Run(name, func(t *testing.T) {

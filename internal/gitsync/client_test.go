@@ -566,12 +566,14 @@ func TestWireStringsPinned(t *testing.T) {
 		gitsync.ErrOriginUnreachable, gitsync.ErrOriginAccessDenied, gitsync.ErrReplicaUnreachable,
 		gitsync.ErrCredentialRejected, gitsync.ErrReplicaRejected, gitsync.ErrPushTimeout,
 		gitsync.ErrLocalDiskExhausted, gitsync.ErrJobOutOfMemory, gitsync.ErrRepositoryOverLimit,
-		gitsync.ErrPushTokenExpired, gitsync.ErrUnclassified,
+		gitsync.ErrPushTokenExpired, gitsync.ErrReplicaRateLimited, gitsync.ErrReplicaRepositoryNotFound,
+		gitsync.ErrOriginURLRedirected, gitsync.ErrUnclassified,
 	}
 	wantErrs := []string{
 		"origin_unreachable", "origin_access_denied", "replica_unreachable", "credential_rejected",
 		"replica_rejected", "push_timeout", "local_disk_exhausted", "job_out_of_memory",
-		"repository_over_limit", "push_token_expired", "unclassified",
+		"repository_over_limit", "push_token_expired", "replica_rate_limited", "replica_repository_not_found",
+		"origin_url_redirected", "unclassified",
 	}
 	if !reflect.DeepEqual(gotErrs, wantErrs) {
 		t.Errorf("error_type wire strings drifted:\n got %v\nwant %v", gotErrs, wantErrs)

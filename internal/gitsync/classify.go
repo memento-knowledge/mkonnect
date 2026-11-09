@@ -44,6 +44,20 @@ var (
 	// server can put anything there, including the credential it was sent, so rawDetail keeps the
 	// label and withholds the text.
 	remoteTextRE = regexp.MustCompile(`(?i)(^remote:|\bremote (?:error|unpack failed):)\s*\S.*$`)
+
+	// repoNotFoundRE matches git's own whole line for an HTTP 404 on a repository, once matchText has
+	// blanked the quoted URL: "fatal: repository '' not found". It is anchored to the line so a
+	// rejection reason or relayed text that merely mentions the words cannot match.
+	repoNotFoundRE = regexp.MustCompile(`(?m)^\s*fatal: repository '' not found\s*$`)
+)
+
+// The error_detail carried by the three failures whose fix is outside git-sync. They are fixed
+// strings, never built from git's output: the redirect target, URL, host and path stay out of the
+// report whatever the server sent.
+const (
+	detailOriginURLRedirected       = "the origin redirected the repository URL: use the repository's canonical clone URL (renamed or moved?)"
+	detailReplicaRateLimited        = "the replica is rate limiting pushes; git-sync retries later"
+	detailReplicaRepositoryNotFound = "the replica did not find the repository (it may not be provisioned yet); git-sync retries later"
 )
 
 var (
@@ -81,14 +95,19 @@ func containsAny(s string, markers []string) bool {
 	return false
 }
 
-// classifyGitFailure maps a failed git invocation to a typed error_type and, for the fallback
-// "unclassified" type only, a sanitized single-line detail. It returns ("", "") when err is nil. It
+// classifyGitFailure maps a failed git invocation to a typed error_type and a detail: the sanitized
+// single-line detail of the fallback "unclassified" type, or the fixed hint of origin_url_redirected,
+// replica_rate_limited and replica_repository_not_found; every other type has none. It returns
+// ("", "") when err is nil. It
 // never reports success for a failure it does not recognise. As in classifyLsRemote, the URL git
 // echoes (single-quoted) is removed before keyword matching so a hostname containing "tls" or "ssl"
 // cannot be mistaken for a connection failure.
 //
 // A 404 / "repository not found" from the origin is reported as origin_access_denied: forges answer
 // 404 for a repository the credential cannot see, and the contract has no separate "not found" code.
+// An origin 301, 302, 307 or 308 is origin_url_redirected: git runs with http.followRedirects=false, so
+// a URL the server redirects (no ".git" suffix, a renamed or moved project) cannot be fetched. It is
+// not a credential failure and its detail is a fixed hint that never echoes the redirect target.
 // An HTTP 407 (proxy authentication) is not the customer's credential being rejected, so it is
 // origin_unreachable. A deadline is attributed by side: a push that outlives its deadline is
 // push_timeout, a fetch that does is origin_unreachable.
@@ -96,6 +115,17 @@ func containsAny(s string, markers []string) bool {
 // A replica refusal over size or quota (HTTP 413, "size limit", "quota", ...) is replica_rejected,
 // whether it arrives as a status or as the reason in a rejected-ref line. repository_over_limit is
 // never produced here: it is reserved for the connector's own repository-size ceiling.
+//
+// Three further answers are specific to the replica. HTTP 429 is replica_rate_limited, and HTTP 404 (or
+// git's "repository not found") is replica_repository_not_found: the repository may not have been
+// created yet. The same 404 from an origin stays origin_access_denied. HTTP 503 is replica_unreachable
+// (the replica answers it when it cannot check a push token). HTTP 401 and 403 are credential_rejected
+// (or push_token_expired): a 403 can also come from a firewall in front of the replica, which git-sync
+// cannot tell from the replica refusing the token, and the platform uses 429, not 403, for its rate
+// limit.
+//
+// The HTTP status is read from git's own lines only. A "remote:" line is text the far end chose and
+// must not be able to pick the error type.
 func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired bool) (errorType, detail string) {
 	if err == nil {
 		return "", ""
@@ -123,7 +153,7 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 	}
 
 	status := ""
-	if m := httpStatusRE.FindStringSubmatch(s); m != nil {
+	if m := httpStatusRE.FindStringSubmatch(local); m != nil {
 		status = m[1]
 	}
 	serverError := len(status) == 3 && status[0] == '5'
@@ -131,6 +161,8 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 
 	if side == originSide {
 		switch {
+		case isRedirectStatus(status):
+			return ErrOriginURLRedirected, detailOriginURLRedirected
 		case authFailed,
 			status == "404",
 			strings.Contains(s, "repository") && strings.Contains(s, "not found"):
@@ -141,7 +173,13 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 		return ErrUnclassified, rawDetail(err, stderr)
 	}
 
+	// The statuses that name their own error type come before every keyword arm, which would otherwise
+	// match words in text the replica sent.
 	switch {
+	case status == "429":
+		return ErrReplicaRateLimited, detailReplicaRateLimited
+	case status == "404", repoNotFoundRE.MatchString(local):
+		return ErrReplicaRepositoryNotFound, detailReplicaRepositoryNotFound
 	case status == "413", containsAny(s, replicaQuotaMarkers):
 		return ErrReplicaRejected, ""
 	case authFailed:
@@ -155,6 +193,16 @@ func classifyGitFailure(side gitSide, err error, stderr []byte, tokenExpired boo
 		return ErrReplicaUnreachable, ""
 	}
 	return ErrUnclassified, rawDetail(err, stderr)
+}
+
+// isRedirectStatus reports whether an HTTP status is one of the redirects an origin answers for a moved
+// or renamed repository.
+func isRedirectStatus(status string) bool {
+	switch status {
+	case "301", "302", "307", "308":
+		return true
+	}
+	return false
 }
 
 // credentialMarkers are the git messages that say the credential itself was refused or was not

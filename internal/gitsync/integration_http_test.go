@@ -33,7 +33,15 @@ type gitHTTPServer struct {
 	// between two others.
 	failAdvert  atomic.Int32
 	advertCount atomic.Int32
+
+	// forceStatus, when non-zero, answers every request with that status before any credential is
+	// checked, so a test can make a server redirect, refuse or rate limit like a real one. A 3xx
+	// carries a Location that must never reach a status.
+	forceStatus atomic.Int32
 }
+
+// forcedLocation is where a forced 3xx points: a host and path that must not appear in any detail.
+const forcedLocation = "https://other.example.net/moved/location"
 
 func (s *gitHTTPServer) authHeaders() []string {
 	s.mu.Lock()
@@ -62,6 +70,13 @@ func newGitHTTPServer(t *testing.T, root, wantAuth string, denyStatus int) *gitH
 		s.mu.Lock()
 		s.seen = append(s.seen, got)
 		s.mu.Unlock()
+		if code := int(s.forceStatus.Load()); code != 0 {
+			if code >= 300 && code < 400 {
+				w.Header().Set("Location", forcedLocation)
+			}
+			http.Error(w, http.StatusText(code), code)
+			return
+		}
 		if got != wantAuth {
 			http.Error(w, "denied", denyStatus)
 			return
