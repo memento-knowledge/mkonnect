@@ -9,7 +9,9 @@ Guides for administrators deploying and operating the mkonnect on-prem connector
 - **[git-sync guide](git-sync.md)** — optional add-on that mirrors selected internal git
   repositories (branches and tags) to Memento: install with Docker or Helm, configure your git
   server credential, verify, understand the sync schedule, retries and what it keeps on disk,
-  upgrade, uninstall, and troubleshoot.
+  upgrade, uninstall, and troubleshoot. The Memento side of the setup (what Memento needs from you,
+  the order of work, and the portal checklist) is in the Git source replication setup guide that
+  your Memento contact provides.
 - **[git-sync security and data handling](git-sync-security.md)** — for security reviewers: network
   destinations, data flow, credential custody and revocation, hardening, network policy, and the
   supply chain (image signatures and provenance).

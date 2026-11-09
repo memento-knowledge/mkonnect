@@ -14,6 +14,12 @@ git-sync is a **separate connector** from the API connector described in the
 registration token, its own signing key, and its own volume. You can run both on the same host or
 cluster; they share nothing.
 
+This guide covers the connector. The Memento side of the setup is in the **Git source replication
+setup guide**, which your Memento contact provides. It describes what Memento needs from you
+(including the public source address that Memento must allow), the order of work across the API
+connector and git-sync, and the checklist in the Memento portal that shows when replication is
+ready. It points back to this guide for the install commands, so read the two together.
+
 ## How it works
 
 For each repository that you configure in the Memento portal, git-sync:
