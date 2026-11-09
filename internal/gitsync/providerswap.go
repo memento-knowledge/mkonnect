@@ -56,11 +56,11 @@ func (c *Client) setProviders(next *Store) {
 			waits = append(waits, att)
 		}
 	}
-	if c.probeCancel != nil {
-		c.probeCancel()
+	if c.probeRun != nil {
+		c.probeRun.cancel()
 	}
 	c.originCheck.Store(nil)
-	c.lastProbe.Store(0)
+	c.provChecks = map[string]providerCheck{}
 	runCtx := c.runCtx
 	c.mu.Unlock()
 

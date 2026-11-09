@@ -142,10 +142,15 @@ git server. It also sends the configuration version it accepted, the reason when
 configuration, whether syncing is suspended pending a critical update, the earliest push-token
 expiry it holds, a per-process boot ID and sequence number, and one aggregated reachability result
 for your configured git servers (`reachable`, `access_denied`, or `unreachable`; the worst outcome
-across them, not one per server) with the time it was checked. That result is re-checked about
-every 30 seconds until a configuration is accepted and about every 5 minutes afterwards, and is
-absent when no provider is configured, before the first check has finished, and when the check
-cannot run. It never sends your git server credential, a repository's
+across them, not one per server) with the time it was checked, and two optional words that say what
+the check asked (`scope`: `host` or `repository`) and, when it was not a clean pass, which repository
+error type it matches (for example `origin_access_denied`). Neither carries a URL, a host name or a
+repository name. That result is re-checked about every 30 seconds until a configuration is accepted
+and afterwards about every 15 minutes while a server answers cleanly and every 5 minutes while it does
+not; once a configuration is accepted the check is a read-only `git ls-remote` of one repository you
+listed (a second one, when the first answers 403, 404 or a redirect), using only the credential of the
+git server that repository is on. It is absent when no provider is configured, before the first check
+has finished, and when the check cannot run. It never sends your git server credential, a repository's
 contents, or file paths.
 
 ### What is logged

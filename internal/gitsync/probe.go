@@ -39,14 +39,61 @@ type OriginProber interface {
 	Probe(ctx context.Context, e LocalEntry) (OriginResult, error)
 }
 
-// gitProber probes with `git ls-remote`. run is a seam so tests can assert the argv/env without a
-// real subprocess; it defaults to runGit.
-type gitProber struct {
-	run func(ctx context.Context, argv, env []string, dir string) (stderr []byte, err error)
+// RepositoryProber is an OriginProber that can also check one repository the configuration lists,
+// which exercises the credential and the repository path rather than only the server's base URL. The
+// connector uses it, when the prober offers it, once a configuration has been accepted; a prober
+// without it keeps checking the base URL.
+type RepositoryProber interface {
+	ProbeRepository(ctx context.Context, t RepoTarget) (RepoCheck, error)
 }
+
+// RepoTarget is a repository a RepositoryProber may dial, paired with the provider credential to dial
+// it with. Only this package can make one, and only from a URL the host-match guard produced for a
+// repository bound to that provider, so a credential can never be paired with a URL on another host.
+type RepoTarget struct {
+	entry LocalEntry
+	url   string
+}
+
+// URL is the canonical repository URL the probe dials.
+func (t RepoTarget) URL() string { return t.url }
+
+// RepoCheck is what a repository probe found, in the same terms the sync reports a failure in (see
+// classifyGitFailure, origin side).
+type RepoCheck struct {
+	// Result is the wire result: access_denied for a 401 or another sign that the credential was
+	// refused (or is missing), unreachable for a failure to reach the server or one git's output
+	// cannot name (never reachable for those), reachable otherwise.
+	Result OriginResult
+	// ErrorType is the repository error_type naming a failure that is not a clean pass: it is set
+	// for every Result other than a clean reachable. A 403 or a 404 is reachable with
+	// origin_access_denied: a forge answers either for a repository the credential cannot see.
+	ErrorType string
+	// CredentialRejected says the origin refused the provider credential itself (a 401, never a
+	// 403 or 404) and a credential was sent. It implies Result access_denied, but not the converse: a
+	// server that wants a credential nobody configured answers access_denied without it. It is the
+	// evidence that closes the provider's gate (see providerGates).
+	CredentialRejected bool
+}
+
+// gitProber probes with `git ls-remote`. run is a seam so tests can assert the argv/env without a
+// real subprocess; it defaults to runGit. timeout bounds one probe and defaults to probeTimeout.
+type gitProber struct {
+	run     func(ctx context.Context, argv, env []string, dir string) (stderr []byte, err error)
+	timeout time.Duration
+}
+
+var _ RepositoryProber = (*gitProber)(nil)
 
 // NewGitProber returns a prober backed by the git binary.
 func NewGitProber() *gitProber { return &gitProber{run: runGit} }
+
+func (p *gitProber) limit() time.Duration {
+	if p.timeout > 0 {
+		return p.timeout
+	}
+	return probeTimeout
+}
 
 // MinGitMajor and MinGitMinor are the oldest git the connector supports: GIT_CONFIG_COUNT
 // credential injection needs git >= 2.31.
@@ -109,7 +156,7 @@ func GitVersionOK() (ok bool, detail string) {
 // and git is run with a locked-down environment so no ambient config, credential helper, or askpass
 // can change the target or weaken TLS.
 func (p *gitProber) Probe(ctx context.Context, e LocalEntry) (OriginResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	ctx, cancel := context.WithTimeout(ctx, p.limit())
 	defer cancel()
 
 	// An empty HOME keeps git from reading the invoking user's ~/.gitconfig or credential store.
@@ -134,11 +181,77 @@ func (p *gitProber) Probe(ctx context.Context, e LocalEntry) (OriginResult, erro
 	return classifyLsRemote(err, stderr), nil
 }
 
+// ProbeRepository runs `git ls-remote --heads -- <url>` against one repository, in the environment a
+// sync uses for the origin (originGitEnv: the credential in a header scoped to exactly that URL,
+// redirects not followed, an empty HOME), and reads the outcome with the sync's own classifier so a
+// check and a sync cannot disagree about one failure.
+//
+// --heads is what keeps the advertisement small: git speaks protocol v2 (the default of every
+// supported git, and nothing in this environment can change it), under which it then asks the server
+// for refs/heads/ only, so the refs a forge keeps for merge requests are not sent. A pattern such as
+// HEAD would not do it: git 2.50 sends no ref-prefix for a pattern and the server lists every ref. The
+// 15 second limit still bounds a repository with very many branches; its standard output is discarded
+// and its standard error capped.
+//
+// A non-nil error is a local fault or a cancellation, never an origin result: git cannot start, the
+// temp home cannot be made, the disk or memory ran out, or ctx ended. The detail of git's own message
+// is never carried in it.
+func (p *gitProber) ProbeRepository(ctx context.Context, t RepoTarget) (RepoCheck, error) {
+	cctx, cancel := context.WithTimeout(ctx, p.limit())
+	defer cancel()
+	home, cleanup, err := newTempHome()
+	if err != nil {
+		return RepoCheck{}, fmt.Errorf("probe setup failed: %w", err)
+	}
+	defer cleanup()
+
+	argv := []string{"git", "ls-remote", "--heads", "--", t.url}
+	stderr, err := p.run(cctx, argv, originGitEnv(home, t.url, t.entry), home)
+	if err != nil {
+		if ctx.Err() != nil {
+			// Stopped from outside: whatever git printed while it was killed says nothing about the origin.
+			return RepoCheck{}, ctx.Err()
+		}
+		var execErr *exec.Error
+		var pathErr *fs.PathError
+		if errors.As(err, &execErr) || errors.As(err, &pathErr) {
+			return RepoCheck{}, fmt.Errorf("git ls-remote could not run: %w", err)
+		}
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+			// A git killed at the deadline reports a bare "signal: killed"; the sync wraps it the same
+			// way (see runBounded) so it reads as a timeout and not as an out-of-memory kill.
+			err = fmt.Errorf("git ls-remote: %w", context.DeadlineExceeded)
+		}
+	}
+	return repoCheckOf(t.entry, err, stderr)
+}
+
+// repoCheckOf reads a finished repository probe with the sync's classifier (classifyGitFailure, origin
+// side). The error is non-nil for a local fault, which says nothing about the origin.
+func repoCheckOf(e LocalEntry, err error, stderr []byte) (RepoCheck, error) {
+	typ, _ := classifyGitFailure(originSide, err, stderr, false)
+	switch typ {
+	case "":
+		return RepoCheck{Result: OriginReachable}, nil
+	case ErrOriginAccessDenied:
+		if originCredentialRejected(stderr) {
+			return RepoCheck{Result: OriginAccessDenied, ErrorType: typ, CredentialRejected: e.Auth != ""}, nil
+		}
+		return RepoCheck{Result: OriginReachable, ErrorType: typ}, nil
+	case ErrOriginURLRedirected:
+		return RepoCheck{Result: OriginReachable, ErrorType: typ}, nil
+	case ErrLocalDiskExhausted, ErrJobOutOfMemory:
+		return RepoCheck{}, errors.New("git reported a local fault: " + typ)
+	}
+	// origin_unreachable, and anything the classifier cannot name: never reachable.
+	return RepoCheck{Result: OriginUnreachable, ErrorType: ErrOriginUnreachable}, nil
+}
+
 // probeEnv builds the locked-down environment for probing e: the shared base environment plus the
 // credential as a header scoped to e's base URL (see credConfig), so the origin credential is never
 // attached to a request for any other URL.
 func probeEnv(e LocalEntry, home string) []string {
-	return gitConfigEnv(gitBaseEnv(home), credConfig(e.BaseURL, e.Auth, e.Username, e.Token))
+	return originGitEnv(home, e.BaseURL, e)
 }
 
 var (

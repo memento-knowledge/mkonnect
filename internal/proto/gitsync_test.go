@@ -446,3 +446,38 @@ func TestProtoSecretRedaction(t *testing.T) {
 		t.Errorf("push token did not decode to its real value")
 	}
 }
+
+// TestOriginCheckWireShape pins origin_check for a consumer written before scope and error_type
+// existed: result is one of exactly three values, a check without the optional fields marshals to
+// exactly today's two keys, and a consumer that decodes only those two reads the same values from a
+// check that carries the new ones.
+func TestOriginCheckWireShape(t *testing.T) {
+	plain := marshalToObject(t, proto.OriginCheck{Result: "reachable", CheckedAt: "2026-01-02T03:04:05.000000000Z"})
+	if len(plain) != 2 || plain["result"] != "reachable" || plain["checked_at"] != "2026-01-02T03:04:05.000000000Z" {
+		t.Errorf("a check without scope and error_type = %v, want exactly result and checked_at", plain)
+	}
+
+	rich := proto.OriginCheck{Result: "access_denied", CheckedAt: "2026-01-02T03:04:05.000000000Z",
+		Scope: proto.OriginCheckScopeRepository, ErrorType: "origin_access_denied"}
+	b, err := json.Marshal(rich)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var old struct {
+		Result    string `json:"result"`
+		CheckedAt string `json:"checked_at"`
+	}
+	if err := json.Unmarshal(b, &old); err != nil {
+		t.Fatalf("decode as the old shape: %v", err)
+	}
+	if old.Result != "access_denied" || old.CheckedAt != rich.CheckedAt {
+		t.Errorf("an old consumer reads %+v from %s", old, b)
+	}
+	obj := marshalToObject(t, rich)
+	if obj["scope"] != "repository" || obj["error_type"] != "origin_access_denied" {
+		t.Errorf("scope and error_type = %v", obj)
+	}
+	if proto.OriginCheckScopeHost != "host" || proto.OriginCheckScopeRepository != "repository" {
+		t.Error("origin_check scope wire strings drifted")
+	}
+}

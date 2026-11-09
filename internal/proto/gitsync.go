@@ -151,8 +151,9 @@ type GitSyncStatusMsg struct {
 	BootID string `json:"boot_id"`
 	// OriginCheck reports origin reachability at the connector level. It is present in every status
 	// for as long as the connector has a result, and the platform should read it afresh from each
-	// one: it is re-checked about every 30 seconds until a configuration is accepted and about every
-	// 5 minutes afterwards, and its checked_at says when. It is absent when no local provider is
+	// one: it is re-checked about every 30 seconds until a configuration is accepted and, afterwards,
+	// about every 15 minutes while a provider answers cleanly and every 5 minutes while one does not,
+	// and its checked_at says when. It is absent when no local provider is
 	// configured (there is nothing to check), when the connector could not run the check (for
 	// example git is not installed, which says nothing about the origin), and in the statuses
 	// sent after the connector starts until the first check finishes.
@@ -232,9 +233,26 @@ type GitSyncConfigError struct {
 // providers, so the portal can show "origin reachable" / "access denied" during setup and keep
 // showing it once repositories are syncing.
 type OriginCheck struct {
-	Result    string `json:"result"`     // "reachable" | "access_denied" | "unreachable"
+	// Result is exactly one of "reachable", "access_denied" and "unreachable". No other value is ever
+	// sent: consumers constrain the column. Finer detail goes in Scope and ErrorType.
+	Result    string `json:"result"`
 	CheckedAt string `json:"checked_at"` // RFC3339
+	// Scope says what the check exercised: OriginCheckScopeHost (the git server's base URL) or
+	// OriginCheckScopeRepository (a repository the configuration lists). Omitted when nothing was
+	// dialled: a provider whose credential the origin refused is held back and reads access_denied.
+	Scope string `json:"scope,omitempty"`
+	// ErrorType is the repository error_type vocabulary (for example origin_access_denied,
+	// origin_url_redirected, origin_unreachable) naming why a repository-scoped check was not a
+	// clean pass; omitted for a clean pass. A consumer that ignores Scope and ErrorType reads the
+	// same three Result values it always did.
+	ErrorType string `json:"error_type,omitempty"`
 }
+
+// The values of OriginCheck.Scope.
+const (
+	OriginCheckScopeHost       = "host"
+	OriginCheckScopeRepository = "repository"
+)
 
 // GitSyncRepoStatus is the connector's report for one repository.
 type GitSyncRepoStatus struct {

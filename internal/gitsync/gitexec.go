@@ -92,6 +92,13 @@ func credConfig(remoteURL, auth, username string, token Secret) [][2]string {
 	return append(cfg, [2]string{"http." + strings.TrimSuffix(remoteURL, "/") + "/.extraHeader", header})
 }
 
+// originGitEnv is the environment for a git invocation that talks to an origin at remoteURL: the
+// locked-down base plus the provider's credential in a header scoped to exactly remoteURL. The sync
+// and both reachability probes build theirs here, so what one sends the others send.
+func originGitEnv(home, remoteURL string, e LocalEntry) []string {
+	return gitConfigEnv(gitBaseEnv(home), credConfig(remoteURL, e.Auth, e.Username, e.Token))
+}
+
 // packConfig returns the git config pairs for the pack limits: pack.threads (the thread count of
 // index-pack on fetch and pack-objects on push) and pack.windowMemory (the per-thread delta-window
 // memory of pack-objects, which a fetch does not run, in MiB). A zero or negative limit means git's
