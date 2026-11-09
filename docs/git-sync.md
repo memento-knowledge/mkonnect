@@ -14,6 +14,33 @@ git-sync is a **separate connector** from the API connector described in the
 registration token, its own signing key, and its own volume. You can run both on the same host or
 cluster; they share nothing.
 
+## Order of work
+
+Install git-sync **after** the API connector is installed and connected, and after Memento has
+issued the values git-sync needs. In order:
+
+1. **Prerequisites.** Install the API connector and confirm that it is connected (see the
+   [Installation guide](installation.md)). Check [Requirements](#requirements) and
+   [Sizing](#sizing) against the host or cluster you will use.
+2. **Collect the values from Memento.** The git-sync connector ID, the one-time registration token,
+   the replica host and the gateway URL are issued to you and must exist before you install (see
+   [What you'll collect](#what-youll-collect)). Memento allows the public source address that your
+   outbound traffic leaves from before git-sync's first push, so send that address to Memento
+   first (see [Requirements](#requirements)).
+3. **Check the release and verify the image.** Confirm that the release has a git-sync image, and
+   verify its signature (see [Check that the release has a git-sync image](#check-that-the-release-has-a-git-sync-image)
+   and [Verify the image signature](#verify-the-image-signature)).
+4. **Install** with [Docker](#option-a-docker) or [Kubernetes (Helm)](#option-b-kubernetes-helm),
+   adding [a proxy](#using-an-http-proxy) or [an internal CA](#trusting-an-internal-ca-for-git) if
+   your network needs one.
+5. **Configure your git server credential**, a read-only service account's token (see
+   [Configure your git server credential](#configure-your-git-server-credential)).
+6. **Run preflight**, before the first start where you can and again once the credential is
+   configured (see [Check the host before the first start (preflight)](#check-the-host-before-the-first-start-preflight)).
+7. **[Verify](#verify)** that git-sync is connected and that each repository syncs.
+8. **[Remove the registration token](#remove-the-registration-token)** once the connector is
+   connected.
+
 ## How it works
 
 For each repository that you configure in the Memento portal, git-sync:
@@ -35,7 +62,8 @@ git-sync syncs a repository:
 The first sync of a repository downloads all of its history; later syncs transfer only what
 changed.
 
-git-sync replicates branches and tags only, so the contents of **Git LFS** objects are not copied:
+git-sync replicates branches and tags only (see [What is copied, and what is not](#what-is-copied-and-what-is-not)),
+so the contents of **Git LFS** objects are not copied:
 the replica receives the small pointer files, not the large files they name. A repository that
 appears to use LFS still syncs and stays `ok`, but its status carries the warning
 `lfs_not_replicated`. The check is a cheap local heuristic: it looks for a `filter=lfs` rule in the
@@ -51,6 +79,43 @@ removes its local mirror after a grace period (see [Mirror cleanup](#mirror-clea
 Your git server's credential stays on your side: it is stored in git-sync's local configuration
 and used only for requests to your git server. It is never sent to Memento.
 
+### What is copied, and what is not
+
+git-sync copies **branches and tags**, and the history and objects reachable from them. The mirror
+and the push use only the refs `refs/heads/*` and `refs/tags/*`, so these are **not** copied:
+
+- Other refs your git server keeps in the repository, for example merge-request or pull-request
+  refs, notes (`refs/notes/*`) and hidden refs. git-sync never fetches them.
+- The contents of Git LFS objects: the replica gets the pointer files only (see the
+  `lfs_not_replicated` warning above).
+- Submodules. A submodule is a link to another repository; git-sync copies the link, not the
+  repository it points to.
+- Anything your git server stores outside the repository's branches and tags: hooks, repository
+  settings and permissions, issues, merge-request discussions and wikis.
+
+Two behaviours follow from "mirror the branches and tags as they are":
+
+- **A force-push or history rewrite on your git server is replicated.** Fetching and pushing both
+  use force refspecs, so when a branch is force-pushed, amended, rebased or reset to an older commit,
+  or a tag is moved, the next sync moves the same branch or tag on the replica to the new commit. It
+  does not need a fast-forward. A branch or tag you delete is deleted on the replica. git-sync's
+  tests cover each of these against a stand-in for the replica. git-sync only moves refs: it cannot
+  delete objects on the replica, and what the replica keeps of commits that no branch or tag
+  reaches any more is not decided by git-sync.
+- **An origin with no branch and no tag stops with an error and never touches the replica.** If,
+  after the fetch, the mirror holds no branch and no tag (the repository is empty, it holds only
+  refs outside branches and tags, or the server advertised none), the sync fails and git-sync does
+  not contact the replica at all, so nothing already replicated is removed. This prevents an empty
+  or misbehaving origin from wiping the replica. The repository's state is `error`, the error type
+  is `unclassified`, and the detail is `origin has no branches or tags; replica left unchanged`.
+  The detail appears in the `sync failed` log line (`error_type` and `detail`) and in the
+  repository's status in Memento; `connector status` cannot show why an attempt failed. To fix it,
+  push a branch or tag to the origin, or, if the origin should be empty or the repository should
+  not be synced, remove the repository from the configuration in Memento. If the origin used to
+  have branches or tags, check the git server first. The next sync after the origin has a branch
+  or tag succeeds (the error is retried with the usual [backoff](#failures-and-backoff)); the
+  earlier replica contents stay until then.
+
 ## Before you start
 
 ### Requirements
@@ -58,8 +123,14 @@ and used only for requests to your git server. It is never sent to Memento.
 - **A runtime:** Docker Engine, or a Kubernetes cluster with **Helm 3.14 or newer** (the Helm
   commands below use `--reset-then-reuse-values`, which was added in 3.14). The API connector's
   own guide still supports Helm 3.8+.
+- **The API connector, installed and connected first.** git-sync is an add-on to it, not a
+  replacement: install it only after the API connector works (see the
+  [Installation guide](installation.md)). On Kubernetes, git-sync is added to the API connector's
+  Helm release and takes its gateway URL from it by default.
 - **A git-sync connector** registered for your tenant, following the installation instructions you
-  were given. It has its own connector ID, which is **not** the API connector's.
+  were given. It has its own connector ID, which is **not** the API connector's. Memento issues its
+  connector ID, registration token and replica host before you install; you cannot create them
+  yourself.
 - **A git server reachable over HTTP or HTTPS** from the host that runs git-sync. SSH remotes are
   not supported. A credential (bearer token, or username and token for HTTP Basic) can only be used
   with an `https://` server.
@@ -68,6 +139,18 @@ and used only for requests to your git server. It is never sent to Memento.
 - **Outbound HTTPS (443)** to the Memento Bridge Gateway, to the Memento replica host, and to your
   git server(s), plus the container registry when you install or upgrade. No inbound ports are
   needed or opened. See [Network destinations](git-sync-security.md#network-destinations).
+- **TLS 1.3 to the replica.** The replica is reached over HTTPS and accepts TLS 1.3 only. The host
+  that runs git-sync, and any proxy or firewall that terminates or inspects TLS between it and the
+  replica, must be able to negotiate TLS 1.3. This is a requirement of the replica: git-sync sets no
+  TLS version of its own and does not check for this (git negotiates the connection), so a mismatch
+  shows up as a failed connection. See [Troubleshooting](#troubleshooting).
+- **A public source address that Memento has allowed.** The replica accepts connections only from
+  the public source address that Memento has allowed for you. That is the address the replica sees:
+  behind NAT, a cloud NAT gateway or an egress proxy, it is that gateway's or proxy's public
+  address, not the host's private one. Send the address to Memento **before the first sync**, and
+  again before it changes, because a connection from any other address is refused. git-sync does
+  not know which address Memento allowed, so a passing preflight does not show that yours is
+  allowed. See [Troubleshooting](#troubleshooting).
 - **Disk.** A persistent volume holding a mirror of every replicated repository, and separate
   scratch space for git (see [Sizing](#sizing)).
 - **Memory and CPU.** The Helm chart defaults to a `250m` CPU / `512Mi` memory request and a `1`
@@ -80,6 +163,7 @@ and used only for requests to your git server. It is never sent to Memento.
 | Gateway URL | `GATEWAY_URL` | Copy it **exactly** as given; it must be `wss://`. |
 | Connector ID | `CONNECTOR_ID` | The ID of the **git-sync** connector, not the API connector's. |
 | Replica host | `GIT_SYNC_REPLICA_HOST` | A host name or `host:port`; no `https://`, no path. The port defaults to 443. git-sync pushes only to this host and port. |
+| Public source address | (you send it to Memento) | The public address your outbound traffic leaves from. Memento allows it before the first push; send it first (see [Requirements](#requirements)). |
 | Registration token | read from a file | **One-time**, used only on first start. |
 | Release ID / chart version | image tag / `--version` | Pin an explicit version; never a moving tag. |
 
@@ -229,8 +313,9 @@ Notes:
 - `--read-only` makes the root file system read-only. Docker still provides a small in-memory
   `/dev/shm`, which these options do not manage.
 
-Next, [configure your git server credential](#configure-your-git-server-credential), then
-[verify the connection](#verify) and [remove the registration token](#remove-the-registration-token).
+Next, [run preflight](#check-the-host-before-the-first-start-preflight) (it can also run before
+the container starts), [configure your git server credential](#configure-your-git-server-credential),
+then [verify the connection](#verify) and [remove the registration token](#remove-the-registration-token).
 
 ## Option B: Kubernetes (Helm)
 
@@ -409,6 +494,16 @@ asked for a credential and rejected the one configured. Each credential is sent 
 provider's server, and git is told not to follow redirects, so it cannot be passed on to another
 host.
 
+**A replica result is about reachability too.** A `PASS` for `replica-https` means git completed a
+TLS handshake with the replica host from here and got an HTTP answer. A `FAIL` ("connection, proxy
+or TLS") is what a failed TLS 1.3 negotiation looks like, and so is a connection that is refused,
+dropped or times out because the source address is not allowed; preflight cannot tell these apart,
+and it does not look at the TLS version it negotiated (see [Requirements](#requirements)). It also
+cannot see which source address Memento allowed: a replica that answers a disallowed address with an
+HTTP status, instead of refusing the connection, still counts as reachable. If this check fails
+and the network path is open, test TLS 1.3 to the replica as described under `replica_unreachable`
+in [Troubleshooting](#troubleshooting), and check the source address with Memento.
+
 A check that cannot run because an earlier one failed is shown as `SKIP`, with the reason; a
 skipped check is not a pass. The origin checks are skipped while `git`, `tmpdir` or
 `provider-config` fails, because the probe needs all three; `replica-https` needs `git` and `tmpdir`
@@ -477,6 +572,13 @@ reported as `origin_access_denied` and never contacted with a credential.
 Token rules: at least 16 characters; given only on standard input (`--token`, which would be
 visible in the process list and shell history, is rejected); an authentication mode requires an
 `https://` base URL. A provider name is 1 to 64 letters, digits, `.`, `_`, or `-`.
+
+**Bearer or basic.** With `bearer`, git-sync sends the token as `Authorization: Bearer <token>`. With
+`basic`, it sends `Authorization: Basic` with the username and the token (or password), which
+`--username` supplies; `basic` requires `--username` and `bearer` rejects it. Use the mode that
+your git server documents for authenticating `git fetch` over HTTPS with an access token. With
+neither, requests carry no credential. Use a dedicated service account with read-only access (see
+[Use a least-privilege git account](git-sync-security.md#use-a-least-privilege-git-account)).
 
 **Docker.** Read the token without echoing it and pipe it in. Run from Bash or Zsh:
 
@@ -1295,15 +1397,15 @@ clears the error.
 |---|---|
 | `origin_access_denied` | Your git server rejected the credential (401, 403), or the repository was not found (a 404; many servers answer 404 for a repository the credential cannot see). Check the token's permissions and expiry; a credential you change in the provider configuration is picked up without a restart, and the repositories that use it are synced again at once. Scheduled retries wait at least an hour (to avoid piling up failed logins), but a configuration refresh from the platform or an immediate-sync request still makes one attempt at once. When the server refused the credential itself (401), the other repositories of that provider wait too; see [A rejected credential holds back every repository that uses it](#a-rejected-credential-holds-back-every-repository-that-uses-it). It is also reported, with the detail `host not configured locally`, when no provider matches the repository's scheme, host, and port: run `connector config list` and add the provider for that exact host. Such a repository is not retried at all until you add the provider, which git-sync picks up without a restart. |
 | `origin_unreachable` | git-sync could not connect to your git server: DNS, firewall, proxy, a TLS certificate it does not trust (see [Trusting an internal CA](#trusting-an-internal-ca-for-git)), a server error (5xx), or a fetch that ran past its 30-minute limit (the repacking git does after a fetch runs inside that limit, so a very large repository can reach it that way). Test from the host that runs git-sync. |
-| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. |
-| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
+| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out, so check the two requirements of the replica: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from the host or pod that runs git-sync, for example `openssl s_client -connect <replica-host>:443 -servername <replica-host> -tls1_3 </dev/null` (a working connection prints `New, TLSv1.3`), and see what `connector preflight` reports for `replica-https`. |
+| `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. git-sync classifies any HTTP 401 or 403 from the replica as this type, so it cannot tell a refused token from a refused source address: if the connector is connected and the clock is right, also confirm with Memento that the source address they allowed is the one the replica sees. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `push_token_expired` | The push token was past its expiry when a push was due. Usually the host clock is wrong, or the connector was disconnected and could not receive a refreshed token. Check NTP and the connection. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
 | `replica_rejected` | The replica refused the push: a rejected ref, a policy decision, or a size or quota limit. Contact Memento with the repository ID. |
 | `push_timeout` | A push ran past its time limit (30 minutes unless Memento set another), typically a very large first push over a slow link. Check bandwidth to the replica; later syncs push less. |
 | `repository_over_limit` | The repository's mirror is larger than the size ceiling Memento configured, so nothing was pushed. Raising the ceiling is a Memento-side setting; contact Memento with the repository ID. The mirror stays on the data volume. |
 | `local_disk_exhausted` | The data volume or the `/tmp` scratch space is full. The mirrors are on the data volume: grow `gitSync.persistence.size` (or the Docker volume's backing disk). For `/tmp`, raise `gitSync.tmp.sizeLimit`. See [Sizing](#sizing). |
 | `job_out_of_memory` | git was killed for lack of memory. Raise the memory limit (`gitSync.resources.limits.memory`, or `--memory` with Docker). |
-| `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. Text a server sent in its own error (git's `remote error:` and `remote:` lines) is replaced by a fixed note, and any credential git-sync held for the sync is removed from git's output before it is read. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. |
+| `unclassified` | A failure that does not fit the types above. The report carries a short, scrubbed detail line; `docker logs` / `kubectl logs` have the same. Text a server sent in its own error (git's `remote error:` and `remote:` lines) is replaced by a fixed note, and any credential git-sync held for the sync is removed from git's output before it is read. The detail `origin has no branches or tags; replica left unchanged` means the origin is empty or advertised no branches or tags; git-sync deliberately does not touch the replica in that case. See [What is copied, and what is not](#what-is-copied-and-what-is-not). |
 | The status carries a `config_error` (how the portal shows it is up to the platform) | The platform sent a configuration that git-sync rejected as a whole, and the previous configuration stays in effect. See [Rejected configuration](#rejected-configuration-config_error) for each reason, including the two replica-host pin errors, `replica_host_not_pinned` and `replica_host_mismatch`, that you can fix yourself. |
 | The status carries `suspended: critical_update_required`, and the log says `gateway requires a critical security update` | git-sync starts no new sync until it is upgraded. Upgrade to the latest release; see [While syncing is suspended](#while-syncing-is-suspended). |
 | A repository stays `syncing` for a long time | The first sync of a large repository is slow, or other repositories are ahead of it (four sync at a time by default, and a repository waiting for a slot is also reported as `syncing`). Watch `kubectl logs` / `docker logs` for the outcome. |
