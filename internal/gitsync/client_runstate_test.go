@@ -367,6 +367,9 @@ func TestAnOriginEmptiedAfterASuccessKeepsTheLastSuccessAndRecovers(t *testing.T
 	if str(r.LastSuccessAt) != str(ok.LastSuccessAt) {
 		t.Errorf("last_success_at = %s, want the earlier success %s carried across", str(r.LastSuccessAt), str(ok.LastSuccessAt))
 	}
+	if w := h.wire("repo-a"); string(w["last_success_at"]) != `"`+str(ok.LastSuccessAt)+`"` {
+		t.Errorf("wire last_success_at = %s, want the earlier success carried", w["last_success_at"])
+	}
 	if str(r.LastAttemptAt) == str(ok.LastAttemptAt) {
 		t.Errorf("last_attempt_at = %s, want the failed attempt's own start", str(r.LastAttemptAt))
 	}

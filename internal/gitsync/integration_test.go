@@ -282,6 +282,16 @@ func TestSyncRepoAgainstRealGitEmptyOriginThenFirstCommitSyncs(t *testing.T) {
 		PushToken: Secret("push-token-abcdefghij"),
 	}
 
+	// A branch only the replica has: it proves the empty attempt pushed and pruned nothing, and it is
+	// the one the first real sync removes.
+	git(t, "", "init", "-b", "main", work)
+	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, work, "add", "file.txt")
+	git(t, work, "commit", "-m", "one")
+	git(t, work, "push", replica, "main:refs/heads/replica-only")
+
 	got := syncRepo(context.Background(), d, task)
 	if got.State != StateError || got.ErrorType != ErrOriginEmpty || got.ErrorDetail != detailOriginEmpty {
 		t.Fatalf("sync of an empty origin = %+v, want error/%s with its fixed hint", got, ErrOriginEmpty)
@@ -289,16 +299,10 @@ func TestSyncRepoAgainstRealGitEmptyOriginThenFirstCommitSyncs(t *testing.T) {
 	if got.Stats.RefsPushed == nil || *got.Stats.RefsPushed != 0 || got.Stats.DefaultBranch != "" || !got.Stats.NewestCommitAt.IsZero() {
 		t.Errorf("stats = %+v, want 0 refs pushed and nothing learned about the origin", got.Stats)
 	}
-	if r := refs(t, replica); len(r) != 0 {
-		t.Fatalf("replica refs = %v, want none: nothing was pushed", r)
+	if r := refs(t, replica); !slices.Equal(r, []string{"refs/heads/replica-only"}) {
+		t.Fatalf("replica refs = %v, want only the replica-only branch, untouched", r)
 	}
 
-	git(t, "", "init", "-b", "main", work)
-	if err := os.WriteFile(filepath.Join(work, "file.txt"), []byte("one"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	git(t, work, "add", "file.txt")
-	git(t, work, "commit", "-m", "one")
 	git(t, work, "push", origin, "main")
 
 	got = syncRepo(context.Background(), d, task)
@@ -306,7 +310,7 @@ func TestSyncRepoAgainstRealGitEmptyOriginThenFirstCommitSyncs(t *testing.T) {
 		t.Fatalf("sync after the first commit = %+v, want ok", got)
 	}
 	if r := refs(t, replica); !slices.Equal(r, []string{"refs/heads/main"}) {
-		t.Errorf("replica refs = %v, want main", r)
+		t.Errorf("replica refs = %v, want main only: the replica-only branch is pruned like any branch the origin lacks", r)
 	}
 	if a, b := git(t, "", "--git-dir="+replica, "rev-parse", "main"), git(t, "", "--git-dir="+origin, "rev-parse", "main"); a != b {
 		t.Errorf("replica main = %s, want the origin's %s", a, b)

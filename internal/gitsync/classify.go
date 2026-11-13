@@ -51,7 +51,7 @@ var (
 	repoNotFoundRE = regexp.MustCompile(`(?m)^\s*fatal: repository '' not found\s*$`)
 )
 
-// The error_detail carried by the failures whose fix is outside git-sync. They are fixed strings,
+// The error_detail carried by the failures that have a fixed hint. They are fixed strings,
 // never built from git's output: the redirect target, URL, host and path stay out of the report
 // whatever the server sent. detailOriginEmpty is set by the empty-origin guard, not by the classifier,
 // and claims only what is known: no branch or tag was found, not that the repository is empty.
