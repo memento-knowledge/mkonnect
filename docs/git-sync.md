@@ -123,7 +123,7 @@ Two behaviours follow from "mirror the branches and tags as they are":
   replica, and an origin URL that points at a different, non-empty repository would overwrite it. The
   repository's state is `error`, the error type is `origin_empty`, and the detail is the fixed text
   `no branches or tags were found on the origin; the replica was left unchanged`. git-sync cannot tell
-  an empty repository from a server that advertised no branch or tag, so the type says only that none
+  an empty repository from a server that advertised no branch or tag, so the detail says only that none
   was found. A repository that synced before keeps its earlier `last_success_at`; one that never
   synced has none. The type and detail appear in the `sync failed` log line (`error_type` and
   `detail`) and in the repository's status in Memento; `connector status` cannot show why an attempt
@@ -1094,7 +1094,7 @@ configuration changes, and repeated failed logins can lock a service account out
 
 The other failures, including `origin_url_redirected`, `replica_rate_limited`,
 `replica_repository_not_found` and `origin_empty`, use the delays in the table above: a retry of those
-adds no failed login, and a corrected repository URL starts the repository over at once.
+adds no failed login. A corrected repository URL starts that repository over at once.
 
 #### A rejected credential holds back every repository that uses it
 

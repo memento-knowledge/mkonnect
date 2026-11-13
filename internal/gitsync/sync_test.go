@@ -223,7 +223,7 @@ func TestSyncRepoRefCheckFailureIsNotAnEmptyOrigin(t *testing.T) {
 	}}
 	got := syncRepo(context.Background(), newTestDeps(t, f), testTask())
 
-	if got.State != StateError || got.ErrorType == ErrOriginEmpty || strings.Contains(got.ErrorDetail, "no branches or tags") {
+	if got.State != StateError || got.ErrorType != ErrUnclassified || strings.Contains(got.ErrorDetail, "no branches or tags") {
 		t.Fatalf("result = %+v, want an error that does not claim the origin is empty", got)
 	}
 	if slices.Contains(f.subs(), "push") {
