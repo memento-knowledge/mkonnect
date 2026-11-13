@@ -205,6 +205,7 @@ func TestGitSyncStatusFullGolden(t *testing.T) {
 	i := func(n int) *int { return &n }
 	d := int64(8250)
 	d2 := int64(120)
+	d3 := int64(35)
 	msg := proto.GitSyncStatusMsg{
 		Type:                       "git_sync_status",
 		ConfigVersion:              json.RawMessage(`"2026-01-02.1"`),
@@ -223,6 +224,12 @@ func TestGitSyncStatusFullGolden(t *testing.T) {
 				DurationMS: &d2, ErrorType: "origin_unreachable",
 			},
 			{RepoID: "repo-c", State: "pending"},
+			{
+				// An origin that showed no branch or tag after an earlier success: the earlier last_success_at is carried.
+				RepoID: "repo-d", State: "error", LastAttemptAt: ts("2026-01-02T03:02:00Z"), LastSuccessAt: ts("2026-01-02T02:00:00Z"),
+				DurationMS: &d3, RefsPushed: i(0), ErrorType: "origin_empty",
+				ErrorDetail: "no branches or tags were found on the origin; the replica was left unchanged",
+			},
 		},
 		ConfigError: &proto.GitSyncConfigError{ConfigVersion: json.RawMessage("8"), Reason: proto.GitSyncConfigErrLimitsOutOfRange},
 		Suspended:   proto.GitSyncSuspendedCriticalUpdate,

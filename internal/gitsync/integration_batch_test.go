@@ -402,7 +402,7 @@ func TestBatchedPushEmptyOriginNeverWipesReplica(t *testing.T) {
 	gitStdin(t, "", cmds.String(), "--git-dir="+e.origin, "update-ref", "--stdin")
 
 	res := e.sync(context.Background())
-	if res.State != StateError || !strings.Contains(res.ErrorDetail, "no branches or tags") {
+	if res.State != StateError || res.ErrorType != ErrOriginEmpty || res.ErrorDetail != detailOriginEmpty {
 		t.Fatalf("sync of an emptied origin = %+v, want the empty-origin error", res)
 	}
 	if got := len(e.rec.kinds()); got != pushes {

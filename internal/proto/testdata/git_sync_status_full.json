@@ -28,6 +28,16 @@
       "repo_id": "repo-c",
       "state": "pending",
       "last_success_at": null
+    },
+    {
+      "repo_id": "repo-d",
+      "state": "error",
+      "last_attempt_at": "2026-01-02T03:02:00Z",
+      "last_success_at": "2026-01-02T02:00:00Z",
+      "duration_ms": 35,
+      "refs_pushed": 0,
+      "error_type": "origin_empty",
+      "error_detail": "no branches or tags were found on the origin; the replica was left unchanged"
     }
   ],
   "config_error": {

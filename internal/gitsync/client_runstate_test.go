@@ -323,6 +323,70 @@ func TestAnEmptyOriginIsAFailedAttempt(t *testing.T) {
 	if r.State != gitsync.StateError || r.LastSuccessAt != nil || r.LastAttemptAt == nil {
 		t.Errorf("status = %+v, want an error with an attempt recorded and no success", r)
 	}
+	if r.ErrorType != gitsync.ErrOriginEmpty || r.ErrorDetail != "no branches or tags were found on the origin; the replica was left unchanged" {
+		t.Errorf("error = %q %q, want origin_empty with its fixed hint", r.ErrorType, r.ErrorDetail)
+	}
+	// Never synced: last_success_at is on the wire as an explicit null, and nothing is known about the
+	// origin or pushed.
+	w := h.wire("repo-a")
+	if string(w["last_success_at"]) != "null" || string(w["error_type"]) != `"origin_empty"` {
+		t.Errorf("wire last_success_at = %s, error_type = %s, want null and origin_empty", w["last_success_at"], w["error_type"])
+	}
+	if r.OriginDefaultBranch != "" || r.NewestOriginCommitAt != nil {
+		t.Errorf("status = %+v, want no origin facts: the attempt stopped before learning any", r)
+	}
+	if r.RefsPushed == nil || *r.RefsPushed != 0 {
+		t.Errorf("refs_pushed = %v, want 0: nothing was pushed", r.RefsPushed)
+	}
+	if n := h.git.count("push"); n != 0 {
+		t.Errorf("%d push(es) ran against an empty origin, want none", n)
+	}
+}
+
+// A repository that synced before and whose origin then shows no branch or tag keeps its last success
+// (the contract carries it across statuses) and what it learned about the origin; the next attempt that
+// finds a ref succeeds and clears the error.
+func TestAnOriginEmptiedAfterASuccessKeepsTheLastSuccessAndRecovers(t *testing.T) {
+	h := newHarness(t)
+	h.configA()
+	ok := h.settle()
+	if ok.State != gitsync.StateOK || ok.LastSuccessAt == nil {
+		t.Fatalf("setup: %+v", ok)
+	}
+	pushes := h.git.count("push")
+
+	h.clock.advance(time.Hour)
+	h.git.set(func() { h.git.exit1["show-ref"] = true })
+	h.syncNow()
+	waitFor(t, func() bool { return h.status("repo-a").State == gitsync.StateError })
+	r := h.settle()
+
+	if r.ErrorType != gitsync.ErrOriginEmpty {
+		t.Fatalf("status = %+v, want origin_empty", r)
+	}
+	if str(r.LastSuccessAt) != str(ok.LastSuccessAt) {
+		t.Errorf("last_success_at = %s, want the earlier success %s carried across", str(r.LastSuccessAt), str(ok.LastSuccessAt))
+	}
+	if w := h.wire("repo-a"); string(w["last_success_at"]) != `"`+str(ok.LastSuccessAt)+`"` {
+		t.Errorf("wire last_success_at = %s, want the earlier success carried", w["last_success_at"])
+	}
+	if str(r.LastAttemptAt) == str(ok.LastAttemptAt) {
+		t.Errorf("last_attempt_at = %s, want the failed attempt's own start", str(r.LastAttemptAt))
+	}
+	if r.OriginDefaultBranch != ok.OriginDefaultBranch || str(r.NewestOriginCommitAt) != str(ok.NewestOriginCommitAt) {
+		t.Errorf("status = %+v, want the origin facts of the last attempt that learned them (%+v)", r, ok)
+	}
+	if r.RefsPushed == nil || *r.RefsPushed != 0 || h.git.count("push") != pushes {
+		t.Errorf("refs_pushed = %v, pushes %d -> %d, want nothing pushed", r.RefsPushed, pushes, h.git.count("push"))
+	}
+
+	h.clock.advance(time.Hour)
+	h.git.set(func() { h.git.exit1["show-ref"] = false })
+	h.syncNow()
+	waitFor(t, func() bool { return h.status("repo-a").State == gitsync.StateOK })
+	if r := h.settle(); r.ErrorType != "" || r.ErrorDetail != "" || r.LastSuccessAt == nil || str(r.LastSuccessAt) == str(ok.LastSuccessAt) {
+		t.Errorf("status after the origin has a branch again = %+v, want ok, no error, and a new last_success_at", r)
+	}
 }
 
 func TestACancelledSyncRecordsNothing(t *testing.T) {

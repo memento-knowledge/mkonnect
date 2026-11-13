@@ -169,15 +169,18 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 
 	// Never prune the replica from a mirror with nothing to send: an origin that advertises no
 	// branches or tags (an empty repository, or a transient bad advertisement) leaves the mirror
-	// with no refs, and `push --prune` would then delete every branch and tag on the replica. This
-	// also covers a mirror that was initialised but never fetched into (for example after a crash).
+	// with no refs, and `push --prune` would then delete every branch and tag on the replica. The
+	// fetch above has always just succeeded, so a mirror that was initialised and never fetched into
+	// (for example after a crash) is not a separate case: it is the same observation. The connector
+	// cannot tell an empty origin from one that advertised nothing, which is why the result says only
+	// that no branch or tag was found, and a later attempt clears it.
 	// It is the only guard of that kind, and it precedes every push, the planning push included.
 	if stderr, err := d.hasPushableRefs(ctx, home, t); err != nil {
 		if ctx.Err() != nil {
 			return syncResult{State: StatePending}
 		}
 		if errors.Is(err, errNoRefs) {
-			return syncResult{State: StateError, ErrorType: ErrUnclassified, ErrorDetail: errOriginEmpty}
+			return syncResult{State: StateError, ErrorType: ErrOriginEmpty, ErrorDetail: detailOriginEmpty}
 		}
 		typ, detail := classifyGitFailure(originSide, err, stderr, false)
 		return syncResult{State: StateError, ErrorType: typ, ErrorDetail: detail}
@@ -216,10 +219,6 @@ func (d syncDeps) syncAttempt(ctx context.Context, t syncTask, stats *syncStats)
 	warnings, decided := d.detectLFS(ctx, home, t, stats.DefaultBranch)
 	return syncResult{State: StateOK, Warnings: warnings, WarningsUndecided: !decided}
 }
-
-// errOriginEmpty is the detail reported when the origin has no branches or tags to replicate. The
-// replica is left exactly as it was.
-const errOriginEmpty = "origin has no branches or tags; replica left unchanged"
 
 var (
 	errNoRefs       = errors.New("mirror has no branches or tags")
