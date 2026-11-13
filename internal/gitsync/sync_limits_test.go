@@ -297,7 +297,7 @@ func TestCeilingIsCheckedAfterTheFetchAndTheEmptyOriginGuard(t *testing.T) {
 	task := testTask()
 	writeSparse(t, filepath.Join(d.mirrors.Dir(task.RepoID), "objects", "x"), 2*mebibyte)
 	got := syncRepo(context.Background(), d, task)
-	if got.ErrorType != ErrUnclassified || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+	if got.ErrorType != ErrOriginEmpty || got.ErrorDetail != detailOriginEmpty {
 		t.Errorf("result = %+v, want the empty-origin error (the guard comes first)", got)
 	}
 	if !slices.Equal(f.subs(), []string{"fetch", "show-ref"}) {
@@ -461,7 +461,7 @@ func TestEmptyMirrorReachesNoPushEvenWhenBatching(t *testing.T) {
 	}, stdout: planOutput(50, 50)}
 	d := limitsDeps(t, f, Limits{PushBatchRefs: 5})
 	got := syncRepo(context.Background(), d, testTask())
-	if got.State != StateError || !strings.Contains(got.ErrorDetail, "no branches or tags") {
+	if got.State != StateError || got.ErrorType != ErrOriginEmpty || got.ErrorDetail != detailOriginEmpty {
 		t.Fatalf("result = %+v, want the empty-origin error", got)
 	}
 	if want := []string{"init", "fetch", "show-ref"}; !slices.Equal(f.subs(), want) {

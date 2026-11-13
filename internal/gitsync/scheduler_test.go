@@ -405,11 +405,11 @@ func TestSchedulerCredentialFailuresWaitAnHourFromTheFirst(t *testing.T) {
 	})
 }
 
-// The three failures that need a fix outside git-sync but add no failed login stay on the ordinary
-// ladder, like replica_unreachable: they are not credential errors, so a repository does not wait an
-// hour from the first one.
+// The failures that need a fix outside git-sync but add no failed login, and an origin with no branch or
+// tag, stay on the ordinary ladder, like replica_unreachable: they are not credential errors, so a
+// repository does not wait an hour from the first one.
 func TestSchedulerNewFailureTypesUseTheOrdinaryLadder(t *testing.T) {
-	for _, typ := range []string{ErrReplicaRateLimited, ErrReplicaRepositoryNotFound, ErrOriginURLRedirected, ErrReplicaUnreachable} {
+	for _, typ := range []string{ErrReplicaRateLimited, ErrReplicaRepositoryNotFound, ErrOriginURLRedirected, ErrOriginEmpty, ErrReplicaUnreachable} {
 		t.Run(typ, func(t *testing.T) {
 			if slices.Contains(credentialErrors, typ) {
 				t.Fatalf("%s is in credentialErrors", typ)

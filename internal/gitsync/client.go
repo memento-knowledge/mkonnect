@@ -42,6 +42,11 @@ const (
 // not found") are the replica's own answers to a push; both are retried with the ordinary backoff.
 // Each of the three carries a fixed hint as its error_detail (see classifyGitFailure).
 //
+// ErrOriginEmpty is reported when, after a successful fetch, the mirror holds no branch and no tag: the
+// origin is empty, holds only refs outside branches and tags, or advertised none. It is not a git
+// failure, so classifyGitFailure never returns it; the empty-origin guard in syncAttempt does, with a
+// fixed hint as its error_detail, and the replica is not contacted.
+//
 // ErrReplicaRejected includes a replica refusal over its own size or quota limit. The separate
 // ErrRepositoryOverLimit is reserved for the connector's own repository-size ceiling, a local check
 // that is never inferred from git output. It is enforced after the fetch, against the mirror's size
@@ -61,6 +66,7 @@ const (
 	ErrReplicaRateLimited        = "replica_rate_limited"
 	ErrReplicaRepositoryNotFound = "replica_repository_not_found"
 	ErrOriginURLRedirected       = "origin_url_redirected"
+	ErrOriginEmpty               = "origin_empty"
 
 	ErrUnclassified = "unclassified"
 )

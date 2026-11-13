@@ -202,8 +202,8 @@ func TestReplicaRigEmptyOriginNeverWipesTheReplica(t *testing.T) {
 
 	r.updateOriginRefs(deleteAll(refs(t, r.origin))...)
 	res := r.syncOnce()
-	if res.State != StateError || res.ErrorType != ErrUnclassified || res.ErrorDetail != errOriginEmpty {
-		t.Fatalf("sync of an emptied origin = %+v, want error/%s %q", res, ErrUnclassified, errOriginEmpty)
+	if res.State != StateError || res.ErrorType != ErrOriginEmpty || res.ErrorDetail != detailOriginEmpty {
+		t.Fatalf("sync of an emptied origin = %+v, want error/%s %q", res, ErrOriginEmpty, detailOriginEmpty)
 	}
 	if got := refs(t, r.replica); !slices.Equal(got, want) {
 		t.Errorf("replica refs = %v, want them untouched: %v", got, want)
@@ -227,7 +227,7 @@ func TestReplicaRigOriginEmptiedBeforeTheFirstSyncLeavesAStockedReplicaAlone(t *
 	r.updateOriginRefs(deleteAll(refs(t, r.origin))...)
 
 	res := r.syncOnce()
-	if res.State != StateError || res.ErrorDetail != errOriginEmpty {
+	if res.State != StateError || res.ErrorType != ErrOriginEmpty || res.ErrorDetail != detailOriginEmpty {
 		t.Fatalf("sync = %+v, want the empty-origin error", res)
 	}
 	if got := refs(t, r.replica); !slices.Contains(got, "refs/heads/kept") {

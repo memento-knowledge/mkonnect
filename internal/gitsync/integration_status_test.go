@@ -213,7 +213,7 @@ func TestCorrectedOriginURLSyncsAnExistingMirror(t *testing.T) {
 		git(t, "", "init", "--bare", "-b", "main", empty)
 		before := git(t, "", "--git-dir="+f.replicaDir, "rev-parse", "main")
 		f.task.CanonicalURL = f.origin.URL + "/empty.git"
-		if got := f.sync(); got.State != StateError || got.ErrorType != ErrUnclassified || got.ErrorDetail != errOriginEmpty {
+		if got := f.sync(); got.State != StateError || got.ErrorType != ErrOriginEmpty || got.ErrorDetail != detailOriginEmpty {
 			t.Fatalf("sync of an empty repository = %+v, want the empty-origin error", got)
 		}
 		if after := git(t, "", "--git-dir="+f.replicaDir, "rev-parse", "main"); after != before {

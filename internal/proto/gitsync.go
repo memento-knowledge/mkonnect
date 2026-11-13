@@ -290,7 +290,8 @@ type GitSyncRepoStatus struct {
 	ErrorType string `json:"error_type,omitempty"`
 	// ErrorDetail is a short, sanitised detail (never a URL, host, or path). It carries the raw
 	// detail for the "unclassified" error type and a fixed hint for "origin_url_redirected",
-	// "replica_rate_limited" and "replica_repository_not_found"; omitted when there is no error.
+	// "replica_rate_limited", "replica_repository_not_found" and "origin_empty"; omitted when there is
+	// no error.
 	ErrorDetail string `json:"error_detail,omitempty"`
 	// Warnings are non-fatal GitSyncWarn* codes (for example "lfs_not_replicated") a healthy
 	// repository can carry. They are recomputed by every sync, so a warning disappears from the status

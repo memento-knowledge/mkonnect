@@ -81,9 +81,9 @@ For each configured repository, one sync does the following:
 1. `git fetch --prune --force` of `refs/heads/*` and `refs/tags/*` from your git server into a
    bare repository on the data volume. The mirror is created on first use.
 2. A check that the mirror holds at least one branch or tag. If your git server advertises none,
-   the sync stops with an error (type `unclassified`, detail `origin has no branches or tags;
-   replica left unchanged`) and **does not touch the replica**. This prevents an origin that
-   advertises no branches or tags from deleting everything that was replicated.
+   the sync stops with an error (type `origin_empty`, detail `no branches or tags were found on
+   the origin; the replica was left unchanged`) and **does not touch the replica**. This prevents
+   an origin that advertises no branches or tags from deleting everything that was replicated.
 3. `git push --prune --force` of the same two ref namespaces to the replica. A branch or tag that
    no longer exists on your git server is removed from the replica. The push is forced, so a
    force-push or history rewrite on your git server moves the same branch or tag on the replica

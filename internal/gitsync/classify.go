@@ -51,10 +51,12 @@ var (
 	repoNotFoundRE = regexp.MustCompile(`(?m)^\s*fatal: repository '' not found\s*$`)
 )
 
-// The error_detail carried by the three failures whose fix is outside git-sync. They are fixed
-// strings, never built from git's output: the redirect target, URL, host and path stay out of the
-// report whatever the server sent.
+// The error_detail carried by the failures whose fix is outside git-sync. They are fixed strings,
+// never built from git's output: the redirect target, URL, host and path stay out of the report
+// whatever the server sent. detailOriginEmpty is set by the empty-origin guard, not by the classifier,
+// and claims only what is known: no branch or tag was found, not that the repository is empty.
 const (
+	detailOriginEmpty               = "no branches or tags were found on the origin; the replica was left unchanged"
 	detailOriginURLRedirected       = "the origin redirected the repository URL: use the repository's canonical clone URL (renamed or moved?)"
 	detailReplicaRateLimited        = "the replica is rate limiting pushes; git-sync retries later"
 	detailReplicaRepositoryNotFound = "the replica did not find the repository (it may not be provisioned yet); git-sync retries later"
@@ -97,7 +99,8 @@ func containsAny(s string, markers []string) bool {
 
 // classifyGitFailure maps a failed git invocation to a typed error_type and a detail: the sanitized
 // single-line detail of the fallback "unclassified" type, or the fixed hint of origin_url_redirected,
-// replica_rate_limited and replica_repository_not_found; every other type has none. It returns
+// replica_rate_limited and replica_repository_not_found (origin_empty has one too, but it is not a git
+// failure and comes from the empty-origin guard); every other type has none. It returns
 // ("", "") when err is nil. It
 // never reports success for a failure it does not recognise. As in classifyLsRemote, the URL git
 // echoes (single-quoted) is removed before keyword matching so a hostname containing "tls" or "ssl"

@@ -30,7 +30,8 @@ const (
 // history (which can lock a service account out). They wait max(interval, backoffCap) from the
 // first failure rather than climbing the ladder. A failure that also needs a fix but adds no failed
 // login stays on the ladder: origin_url_redirected (a corrected URL is a new target and starts over
-// at once), replica_rate_limited and replica_repository_not_found.
+// at once), replica_rate_limited and replica_repository_not_found. origin_empty is no failed login
+// either (the fetch was served), and a retry is what picks up the first commit.
 var credentialErrors = []string{ErrOriginAccessDenied, ErrCredentialRejected, ErrPushTokenExpired}
 
 // targetKey identifies what a repository syncs from and to, the same identity targetMatches uses. A

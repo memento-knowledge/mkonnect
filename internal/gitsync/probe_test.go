@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -234,4 +235,23 @@ func TestGitProberIntegration(t *testing.T) {
 			t.Errorf("refused connection -> %q, want unreachable", res)
 		}
 	})
+}
+
+// The repository check asks for the heads only and reads the exit status, so an origin with no branch
+// or tag answers it like any other repository: reachable, no error type. The empty-origin type belongs
+// to a sync's guard alone and is never produced by the probe.
+func TestProbeRepositoryOfAnEmptyOriginIsReachable(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	empty := filepath.Join(t.TempDir(), "empty.git")
+	git(t, "", "init", "--bare", "-b", "main", empty)
+	p := &gitProber{run: runGit}
+	got, err := p.ProbeRepository(context.Background(), RepoTarget{entry: LocalEntry{BaseURL: "file://" + filepath.Dir(empty) + "/"}, url: "file://" + empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != (RepoCheck{Result: OriginReachable}) {
+		t.Errorf("probe of an empty repository = %+v, want reachable with no error type", got)
+	}
 }
