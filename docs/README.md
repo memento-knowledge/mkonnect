@@ -5,7 +5,7 @@ Guides for administrators deploying and operating the mkonnect on-prem connector
 - **[Installation guide](installation.md)** — deploy the connector with Docker or Helm, verify it
   connected, and upgrade or uninstall it.
 - **[Setup guide](setup.md)** — make your internal tools reachable through the connector and attach
-  credentials safely.
+  credentials safely, including on Kubernetes clusters that do not allow `kubectl exec`.
 - **[git-sync guide](git-sync.md)** — optional add-on, installed after the API connector, that
   mirrors selected internal git repositories (branches and tags) to Memento: the order of work and
   requirements, install with Docker or Helm, configure your git server credential, run preflight,

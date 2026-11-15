@@ -8,14 +8,17 @@ to attach credentials safely.
 
 The platform addresses each tool by a **plugin name** (an opaque label like `jenkins` or
 `prometheus`). The connector maps that name to an internal base URL and forwards the request. You
-define a plugin in one of two ways:
+define a plugin in one of these ways:
 
 | Method | Use it for | Authentication |
 |---|---|---|
-| `PLUGIN_<NAME>` environment variable | Unauthenticated internal endpoints | None injected |
+| `PLUGIN_<NAME>` environment variable (on Kubernetes, the chart's `plugins:` values) | Unauthenticated internal endpoints | None injected |
 | `connector config set` (local credential store) | Tools that need a token or username/password | Injected locally, on-prem |
+| A credentials file mounted from a Kubernetes `Secret` | Tools that need a token or username/password, when `exec` is not available | Injected locally, on-prem |
 
-If the same plugin name is defined both ways, the local credential store wins.
+If the same plugin name is defined both ways, the local credential store wins. To configure a tool
+on a cluster that does not allow `kubectl exec`, see
+[Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec).
 
 **The tool names in this guide are examples.** `jenkins`, `grafana`, and `prometheus` are
 illustrative plugin names standing in for your own tools — mkonnect is tool-agnostic and forwards to
@@ -54,6 +57,117 @@ not a credential and is not stripped; add it to `strip_query_params` if your too
 documented consequence: a call that deliberately relies on a URL credential, such as GitLab's
 `POST /projects/:id/trigger/pipeline?token=…`, no longer works through a plugin that has its own
 local credential — that is the intended guarantee, not a regression.
+
+## Configuring tools without `kubectl exec`
+
+Some Kubernetes clusters do not allow `pods/exec`, which rules out running `connector config set`
+inside the pod (see [Running the connector CLI](#running-the-connector-cli)). You can still
+configure every kind of tool without it. There are three ways to configure a tool:
+
+| Path | Needs `exec`? | Use it for | Where the configuration lives |
+|---|---|---|---|
+| `connector config set` | Yes (`docker exec` / `kubectl exec`) | Any tool, credentialed or not | `/data/credentials.json` on the connector's volume |
+| Mounted Secret (`credentials.secretName`) | No | Tools that need a credential; also anonymous tools and per-tool options | A `Secret` you create in the release's namespace, mounted read-only |
+| `plugins:` Helm values | No | Anonymous tools: a base URL and nothing else | The Helm release, as `PLUGIN_<NAME>` environment variables |
+
+Neither of the two paths that avoid `exec` sends a credential through the Memento platform: the
+Secret is one you create in your own cluster, so credentials stay local, as described in
+[the trust boundary](#how-the-connector-reaches-a-tool).
+
+**What "anonymous" means.** A base-URL-only tool is one for which the connector adds no credential
+of its own: it injects no `Authorization` header and does not apply the default credential-header
+and query-parameter stripping described above, which applies only when a local credential is
+applied. Headers that arrive with a request are passed through (except hop-by-hop headers, and any
+names you list in the entry's `strip_headers`), query parameters are passed through (except any
+names you list in `strip_query_params`), and the connector still honours the ambient
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` settings. An entry in the credentials file with no `auth` is
+valid and is an anonymous tool, and so is a `plugins:` value.
+
+### A credentialed tool: the mounted Secret
+
+Create the Secret and point the chart at it as described in
+[Mounting a Secret as the credential file](#mounting-a-secret-as-the-credential-file-kubernetes);
+no `exec` is involved. The file can hold credentialed and anonymous entries side by side:
+
+```json
+{
+  "jenkins": {
+    "base_url": "http://jenkins.internal:8080",
+    "auth": "basic",
+    "username": "REPLACE_WITH_USERNAME",
+    "token": "REPLACE_WITH_API_TOKEN"
+  },
+  "prometheus": {
+    "base_url": "http://prometheus.internal:9090"
+  }
+}
+```
+
+The Secret must exist in the release's namespace before the pod starts: the volume is not
+optional, so a missing Secret leaves the pod in `ContainerCreating`, which has no logs;
+`kubectl describe pod --namespace <namespace> <pod>` shows the reason. A file that is not valid
+JSON, or that holds an entry with an invalid credential or option, stops the connector at startup
+with a `creds store load failed` error and the pod restarts repeatedly; read
+`kubectl logs --previous deployment/mkonnect --namespace <namespace>` to see which entry is
+rejected. A malformed `base_url` is not checked at startup: requests and **Test connection** for
+that tool fail with an `invalid base URL` error instead.
+
+### An anonymous tool: the `plugins:` Helm values
+
+Each entry under `plugins:` in the chart values is rendered as a `PLUGIN_<NAME>` environment
+variable on the connector's Deployment: `plugins.jenkins` becomes `PLUGIN_JENKINS`, and the plugin
+name is its lower-case form, `jenkins`. Nothing else is needed: no Secret, no `exec`, and no
+credential.
+
+```yaml
+plugins:
+  jenkins: http://jenkins.internal:8080
+```
+
+Put the same setting in the install command, or add it to a running release:
+
+```bash
+helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+  --namespace <namespace> --version <chart-version> --reuse-values \
+  --set plugins.jenkins=http://jenkins.internal:8080
+```
+
+The value must be an absolute `http` or `https` URL with no userinfo, query parameters or
+fragment. The connector validates every `PLUGIN_*` value at startup and exits with a
+`plugin registry load failed` error if one is malformed, so if the pod restarts repeatedly after a
+change, read `kubectl logs --previous deployment/mkonnect --namespace <namespace>`.
+
+### If a name is defined in more than one place
+
+The credential entry wins. When a credentials-file entry for a plugin name sets a `base_url`, the
+connector uses that URL and the entry's own credential and options, and ignores the
+`PLUGIN_<NAME>` value for the same name. The `PLUGIN_<NAME>` URL is used when there is no entry for
+that name. (`connector config set` always requires a base URL. A hand-written file entry that
+leaves `base_url` out is accepted: the connector then sends requests to the `PLUGIN_<NAME>` URL
+with that entry's credential and options, so do not rely on it.) Define each tool in one place to
+keep this unambiguous.
+
+### Applying a change without `exec`
+
+Neither path needs `exec` to take effect:
+
+- **`plugins:` values.** `helm upgrade` changes the Deployment's pod template, so Kubernetes rolls
+  out a replacement pod by itself. The connector reads `PLUGIN_*` only at startup; a `SIGHUP` does
+  not re-read them. (With Docker, where the variables come from an env file, recreate the container
+  after editing the file: `docker restart` keeps the old environment.)
+- **Mounted Secret.** Updating the Secret refreshes the mounted file in the pod after the kubelet's
+  delay, but the connector reads that file only at startup and on `SIGHUP`, and the chart adds
+  nothing that restarts the pod when the Secret changes. Restart the workload:
+
+  ```bash
+  kubectl rollout restart deployment/mkonnect --namespace <namespace>
+  ```
+
+  This needs permission to patch Deployments, not `pods/exec`.
+
+To check the result without `exec`, read the connector's logs
+(`kubectl logs deployment/mkonnect --namespace <namespace>`, which needs `pods/log`) and use
+**Test connection**, as described in [Verify a tool from the portal](#verify-a-tool-from-the-portal).
 
 ## How your credentials are stored
 
@@ -103,13 +217,15 @@ restrictive permissions outside your checkout and remove it after the Secret has
    EOF
    # Replace the REPLACE_WITH_* placeholders in a local editor; do not paste a real token into this shell block.
    ${EDITOR:-vi} "$credentials_file"
-   kubectl create secret generic mkonnect-tool-creds \
+   kubectl create secret generic mkonnect-tool-creds --namespace <namespace> \
      --from-file=credentials.json="$credentials_file" \
      && rm "$credentials_file"
    ```
 
    If creating the Secret fails, the owner-only file remains in the temporary directory so you can
-   correct the problem and retry. Do not add it to source control.
+   correct the problem and retry. Do not add it to source control. Create the Secret in the
+   namespace of the release, because a pod can mount only Secrets from its own namespace (see
+   [Use one namespace for every command](installation.md#use-one-namespace-for-every-command)).
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
    `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), an
@@ -131,7 +247,8 @@ restrictive permissions outside your checkout and remove it after the Secret has
 The chart then mounts the Secret **read-only** at `/etc/mkonnect/credentials.json` (mode `0440`, so
 the non-root connector can read it via its `fsGroup`) and sets `CREDS_FILE` accordingly. Because the
 mount is read-only, `connector config set` cannot write there — manage credentials by updating the
-Secret and restarting the workload (`kubectl rollout restart deployment/mkonnect`). Leaving
+Secret and restarting the workload
+(`kubectl rollout restart deployment/mkonnect --namespace <namespace>`). Leaving
 `credentials.secretName` empty keeps the default behavior (a writable `/data/credentials.json` you
 manage with the CLI).
 
@@ -168,7 +285,8 @@ Configure it one of two ways:
 The path must be **absolute** (the long-running connector resolves it with its own
 working directory). As with other credential changes, a running connector caches this in
 memory: reload it (`docker kill -s HUP <container>` or
-`kubectl rollout restart deployment/mkonnect`) to apply a new or rotated bundle — see
+`kubectl rollout restart deployment/mkonnect --namespace <namespace>`) to apply a new or rotated
+bundle — see
 [Applying changes](#applying-changes).
 
 **With credentialed tools and the proxy.** A tool that has a local credential is reached
@@ -188,7 +306,7 @@ wiring consistent with the credential mount. Create a Secret holding the PEM bun
 point the chart at it:
 
 ```bash
-kubectl create secret generic mkonnect-ca \
+kubectl create secret generic mkonnect-ca --namespace <namespace> \
   --from-file=ca-bundle.pem=/path/to/internal-ca-bundle.pem
 ```
 
@@ -215,9 +333,13 @@ with `executable file not found in $PATH`.
 Run it inside the already-running container:
 
 - **Docker:** `docker exec -i mkonnect /mkonnect connector ...`
-- **Kubernetes:** `kubectl exec -i <pod> -- /mkonnect connector ...`
+- **Kubernetes:** `kubectl exec -i --namespace <namespace> <pod> -- /mkonnect connector ...`
 
-Replace `mkonnect` / `<pod>` with your container name or pod. The examples below use `<exec>`
+If your cluster does not allow `pods/exec`, see
+[Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec).
+
+Replace `mkonnect` / `<pod>` with your container name or pod, and `<namespace>` with the
+namespace of the release. The examples below use `<exec>`
 for whichever prefix above applies to you, so each command reads `<exec> connector ...`. The `-i`
 (interactive) flag matters: tokens are read from **stdin**, never from a command-line flag.
 
@@ -326,7 +448,7 @@ own — you must tell it to reload:
   the private key persists on the volume, so it reconnects immediately:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect
+  kubectl rollout restart deployment/mkonnect --namespace <namespace>
   ```
 
 Either way the connector then pushes a fresh status report to the portal. Restarting the Docker
@@ -339,6 +461,9 @@ card) in the Memento portal:
 
 - The connector reports each plugin's state — **configured & connected**, **configured (error)**,
   or **not configured** — on connect, whenever the local config changes, and on each heartbeat.
+  The connector learns a tool's state only when it is tested, and keeps the result in memory, so
+  every tool is reported as **not configured** after each start or restart until you use
+  **Test connection** on it.
 - Use **Test connection** to trigger an on-demand connectivity probe. The connector sends a `HEAD` request
   to the tool's base URL (redirects are not followed) and reports the result: `connected`,
   `auth_failure`, `unreachable`, or `timeout`. The request carries the tool's local credential, if
@@ -393,11 +518,11 @@ See the [project README's Limits section](../README.md#limits) for the connector
 
 | Result | Meaning and fix |
 |---|---|
-| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one with `connector config set` (or, if you mount a Secret, add the entry to it), and confirm the name matches what the platform expects. |
+| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one: `connector config set`, an entry in the mounted Secret, or `plugins.<name>` in the Helm values (see [Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec)), and confirm the name matches what the platform expects. If a tool you did configure shows `not configured` right after the connector started or restarted, run **Test connection** first: see [Verify a tool from the portal](#verify-a-tool-from-the-portal). |
 | `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
 | `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. For Docker, remember that `localhost` is the connector container; see [Reaching a tool from Docker](#reaching-a-tool-from-docker). Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
 | `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. If the tool is simply slow (large commits, a slow self-managed instance), raise its request timeout — see [Tuning the upstream timeout](#tuning-the-upstream-timeout). (The **Test connection** probe itself uses a fixed timeout and is not affected by that setting.) |
-| Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect` (Kubernetes). See [Applying changes](#applying-changes). |
+| Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace <namespace>` (Kubernetes). See [Applying changes](#applying-changes). |
 | A credentialed tool is unreachable but a proxy is set | Requests that carry a **local credential** deliberately bypass ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, so the token goes straight to the tool rather than to a proxy. Ensure the connector has *direct* network access to the tool's host. (Unauthenticated `PLUGIN_<NAME>` requests still honor the ambient proxy settings.) |
 
 For connector-level connection problems (the bridge itself showing degraded), see the

@@ -139,6 +139,7 @@ printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
 unset REGISTRATION_TOKEN
 
 helm upgrade --install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+  --namespace <namespace> --create-namespace \
   --version <chart-version> \
   --set-file config.registrationToken="$mkonnect_config_dir/registration.token" \
   --set image.repository=public.ecr.aws/h2a8k0r3/memento-connector \
@@ -153,7 +154,32 @@ storage class, plugins, service account).
 
 Keep the owner-only token file until [the portal confirms the connector is connected](#verify-the-connection).
 If installation fails, it remains outside your checkout so you can retry without re-entering it;
-the `upgrade --install` command is safe to rerun after correcting the failure.
+the `upgrade --install` command is safe to rerun after correcting the failure, as long as you rerun
+it with the same `--namespace`.
+
+### Use one namespace for every command
+
+Every `helm` and `kubectl` command for Kubernetes in this guide and the [Setup guide](setup.md)
+carries `--namespace <namespace>` (or `-n <namespace>`). Replace `<namespace>` with the namespace
+you chose for the connector and use the same one every time. `--create-namespace` creates it if it
+does not exist and needs permission to create namespaces; leave it out if the namespace already
+exists.
+
+Without the flag, a command acts on whatever namespace your current kubeconfig context points at.
+Helm tracks each release inside a namespace, so `helm upgrade --install` run from a different
+namespace can create a second release instead of upgrading the existing one, and `kubectl` run from
+a different namespace does not find the connector's Deployment, volume claim or Secrets. A Secret
+you create for the connector (such as the [credential Secret](setup.md#mounting-a-secret-as-the-credential-file-kubernetes))
+must be in the release's namespace, because a pod can mount only Secrets from its own namespace.
+
+The chart sets no namespace on its objects, so everything it creates lands in the release's
+namespace, and it creates no `Role` or `ClusterRole`. Installing needs permission to create the
+chart's objects (a `ServiceAccount`, `Secret`, `PersistentVolumeClaim` and `Deployment`, plus
+git-sync's objects if you enable it) in that namespace, and Helm by default stores its release
+records there as Secrets. The commands in these guides assume a release named `mkonnect`, which gives a
+Deployment named `mkonnect` and a volume claim named `mkonnect-data`. A release name that does not
+contain `mkonnect` gives `<release>-mkonnect` and `<release>-mkonnect-data` instead, so adjust
+those names in the commands.
 
 ## Verify the connection
 
@@ -172,9 +198,14 @@ The connector should register and connect within a few seconds.
 - **Inside the container:**
 
   ```bash
-  docker exec -i mkonnect /mkonnect connector status     # Docker
-  kubectl exec -i <pod> -- /mkonnect connector status    # Kubernetes
+  docker exec -i mkonnect /mkonnect connector status                              # Docker
+  kubectl exec -i --namespace <namespace> <pod> -- /mkonnect connector status    # Kubernetes
   ```
+
+  If your cluster does not allow `pods/exec`, skip this check: use the portal status above, or read
+  the pod's logs with `kubectl logs deployment/mkonnect --namespace <namespace>` (which needs
+  `pods/log`). To configure tools without `exec`, see
+  [Configuring tools without `kubectl exec`](setup.md#configuring-tools-without-kubectl-exec).
 
 If the status stays **degraded**, see [Troubleshooting](#troubleshooting).
 
@@ -214,7 +245,7 @@ docker network connect <tool-network> mkonnect
 mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 rm "$mkonnect_config_dir/registration.token"
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version <chart-version> --reuse-values \
+  --namespace <namespace> --version <chart-version> --reuse-values \
   --set config.registrationToken=""
 ```
 
@@ -251,11 +282,11 @@ with `docker network connect <tool-network> mkonnect`.
 
 ```bash
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --version <new-chart-version> --reuse-values
+  --namespace <namespace> --version <new-chart-version> --reuse-values
 
 # roll back a bad upgrade:
-helm history mkonnect
-helm rollback mkonnect <revision>
+helm history mkonnect --namespace <namespace>
+helm rollback mkonnect <revision> --namespace <namespace>
 ```
 
 Each GitHub Release also carries the chart `.tgz` and a `.sha256` checksum; if you install from the
@@ -273,10 +304,10 @@ docker volume rm mkonnect-data     # also removes the private key and local cred
 **Helm:**
 
 ```bash
-helm uninstall mkonnect
+helm uninstall mkonnect --namespace <namespace>
 # the PersistentVolumeClaim may be retained by your storage class; delete it explicitly
 # if you want to discard the key:
-kubectl delete pvc mkonnect-data
+kubectl delete pvc mkonnect-data --namespace <namespace>
 ```
 
 Because credentials for your internal tools are stored on the connector's local volume
