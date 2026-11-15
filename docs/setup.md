@@ -78,7 +78,8 @@ Secret is one you create in your own cluster, so credentials stay local, as desc
 of its own: it injects no `Authorization` header and does not apply the default credential-header
 and query-parameter stripping described above, which applies only when a local credential is
 applied. Headers that arrive with a request are passed through (except hop-by-hop headers, and any
-names you list in the entry's `strip_headers`), and the connector still honours the ambient
+names you list in the entry's `strip_headers`), query parameters are passed through (except any
+names you list in `strip_query_params`), and the connector still honours the ambient
 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` settings. An entry in the credentials file with no `auth` is
 valid and is an anonymous tool, and so is a `plugins:` value.
 
@@ -103,9 +104,13 @@ no `exec` is involved. The file can hold credentialed and anonymous entries side
 ```
 
 The Secret must exist in the release's namespace before the pod starts: the volume is not
-optional, so a missing Secret leaves the pod in `ContainerCreating`. A file that is not valid JSON,
-or that holds an invalid entry, stops the connector at startup with a `creds store load failed`
-error and the pod restarts repeatedly; read `kubectl logs` to see which entry is rejected.
+optional, so a missing Secret leaves the pod in `ContainerCreating`, which has no logs;
+`kubectl describe pod --namespace <namespace> <pod>` shows the reason. A file that is not valid
+JSON, or that holds an entry with an invalid credential or option, stops the connector at startup
+with a `creds store load failed` error and the pod restarts repeatedly; read
+`kubectl logs --previous deployment/mkonnect --namespace <namespace>` to see which entry is
+rejected. A malformed `base_url` is not checked at startup: requests and **Test connection** for
+that tool fail with an `invalid base URL` error instead.
 
 ### An anonymous tool: the `plugins:` Helm values
 
@@ -129,17 +134,20 @@ helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
 
 The value must be an absolute `http` or `https` URL with no userinfo, query parameters or
 fragment. The connector validates every `PLUGIN_*` value at startup and exits with a
-`plugin registry load failed` error if one is malformed, so check `kubectl logs` if the pod
-restarts repeatedly after a change.
+`plugin registry load failed` error if one is malformed, so if the pod restarts repeatedly after a
+change, read `kubectl logs --previous deployment/mkonnect --namespace <namespace>`.
 
 ### If a name is defined in more than one place
 
 The credential entry wins. When a credentials-file entry for a plugin name sets a `base_url`, the
 connector uses that URL and the entry's own credential and options, and ignores the
-`PLUGIN_<NAME>` value for the same name. The `PLUGIN_<NAME>` URL is used only when there is no
-entry for that name. Define each tool in one place to keep this unambiguous.
+`PLUGIN_<NAME>` value for the same name. The `PLUGIN_<NAME>` URL is used when there is no entry for
+that name. (`connector config set` always requires a base URL. A hand-written file entry that
+leaves `base_url` out is accepted: the connector then sends requests to the `PLUGIN_<NAME>` URL
+with that entry's credential and options, so do not rely on it.) Define each tool in one place to
+keep this unambiguous.
 
-### Applying a change
+### Applying a change without `exec`
 
 Neither path needs `exec` to take effect:
 
@@ -453,6 +461,9 @@ card) in the Memento portal:
 
 - The connector reports each plugin's state — **configured & connected**, **configured (error)**,
   or **not configured** — on connect, whenever the local config changes, and on each heartbeat.
+  The connector learns a tool's state only when it is tested, and keeps the result in memory, so
+  every tool is reported as **not configured** after each start or restart until you use
+  **Test connection** on it.
 - Use **Test connection** to trigger an on-demand connectivity probe. The connector sends a `HEAD` request
   to the tool's base URL (redirects are not followed) and reports the result: `connected`,
   `auth_failure`, `unreachable`, or `timeout`. The request carries the tool's local credential, if
@@ -507,7 +518,7 @@ See the [project README's Limits section](../README.md#limits) for the connector
 
 | Result | Meaning and fix |
 |---|---|
-| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one: `connector config set`, an entry in the mounted Secret, or `plugins.<name>` in the Helm values (see [Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec)), and confirm the name matches what the platform expects. A configured tool also reads `not configured` until the first **Test connection** has run, so run one before concluding that the name is wrong. |
+| `not configured` | No `PLUGIN_<NAME>` variable and no credential entry for this plugin name. Add one: `connector config set`, an entry in the mounted Secret, or `plugins.<name>` in the Helm values (see [Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec)), and confirm the name matches what the platform expects. If a tool you did configure shows `not configured` right after the connector started or restarted, run **Test connection** first: see [Verify a tool from the portal](#verify-a-tool-from-the-portal). |
 | `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
 | `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. For Docker, remember that `localhost` is the connector container; see [Reaching a tool from Docker](#reaching-a-tool-from-docker). Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
 | `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. If the tool is simply slow (large commits, a slow self-managed instance), raise its request timeout — see [Tuning the upstream timeout](#tuning-the-upstream-timeout). (The **Test connection** probe itself uses a fixed timeout and is not affected by that setting.) |

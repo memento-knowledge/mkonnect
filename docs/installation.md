@@ -177,8 +177,9 @@ namespace, and it creates no `Role` or `ClusterRole`. Installing needs permissio
 chart's objects (a `ServiceAccount`, `Secret`, `PersistentVolumeClaim` and `Deployment`, plus
 git-sync's objects if you enable it) in that namespace, and Helm by default stores its release
 records there as Secrets. The commands in these guides assume a release named `mkonnect`, which gives a
-Deployment named `mkonnect` and a volume claim named `mkonnect-data`; resource names follow your
-release name if you choose another.
+Deployment named `mkonnect` and a volume claim named `mkonnect-data`. A release name that does not
+contain `mkonnect` gives `<release>-mkonnect` and `<release>-mkonnect-data` instead, so adjust
+those names in the commands.
 
 ## Verify the connection
 
