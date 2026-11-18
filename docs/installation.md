@@ -75,7 +75,8 @@ will follow separately.
 The commands in this guide read your values from shell variables, so you can copy them as
 written: a value you have to type into a command itself, such as `<gateway-url>`, would be read by
 the shell as input redirection and the command would fail. Set the variables first, in the Bash or
-Zsh session you will run the commands from:
+Zsh session you will run the commands from. (If you use Zsh, run `setopt interactivecomments` once
+first, so that the `#` comments in the commands are ignored as they are in Bash.)
 
 ```bash
 # The Gateway URL from the portal, copied exactly. It starts with wss://
@@ -87,12 +88,11 @@ NAMESPACE=mkonnect
 ```
 
 A command that needs `GATEWAY_URL` or `CONNECTOR_ID` stops with a message while the variable is
-empty, instead of running with a missing value; read that message and fix it before you continue
-with the next command. The variables last only for the current shell session: if you open a new
+empty, instead of running with a missing value. Read that message and fix it before you continue: in
+Bash, the rest of a pasted block still runs after a failed guard. The variables last only for the current shell session: if you open a new
 one for a later step (verifying, removing the token, upgrading), set `NAMESPACE` again first,
 because a `helm` or `kubectl` command with an empty namespace silently uses your current context's
-namespace. If you use Zsh, run `setopt interactivecomments` once in the session first, so that the
-`#` comments in the commands are ignored as they are in Bash.
+namespace.
 
 ### Choosing a release
 
@@ -107,7 +107,8 @@ Pin a release only if you want a specific one. Releases are listed on the
 [GitHub Releases page](https://github.com/memento-knowledge/mkonnect/releases), and each has a
 `release-metadata.json` file that gives its release ID (`YYYYMMDD.n`) and its Helm chart version.
 To pin, uncomment and fill in the variable you need before running a command. The Docker commands
-use `RELEASE_ID` as the image tag; for Helm, add `--version "$CHART_VERSION"` to the command:
+use `RELEASE_ID` as the image tag; for Helm, add `--version "${CHART_VERSION:?set CHART_VERSION}"`
+to the command:
 
 ```bash
 # Docker: the release ID.
@@ -315,6 +316,7 @@ remain in `mkonnect.env` and are loaded again:
 ```bash
 mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 mkonnect_image=$(docker inspect --format '{{.Config.Image}}' mkonnect)
+: "${mkonnect_image:?could not read the image of the mkonnect container}" &&
 rm "$mkonnect_config_dir/registration.env"
 docker rm -f mkonnect
 docker run -d --name mkonnect --restart unless-stopped \
@@ -371,12 +373,15 @@ what moves `latest` to the newest release: `docker run` alone reuses the image a
 
 ```bash
 mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
-docker pull public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+# To pin by digest instead (IMAGE_DIGEST from "Choosing a release"):
+# mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector@${IMAGE_DIGEST:?set IMAGE_DIGEST}
+docker pull "$mkonnect_image"
 docker rm -f mkonnect
 docker run -d --name mkonnect --restart unless-stopped \
   -v mkonnect-data:/data \
   --env-file "$mkonnect_config_dir/mkonnect.env" \
-  public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+  "$mkonnect_image"
 ```
 
 Because the key and credential store live on the `mkonnect-data` volume, the connector reconnects

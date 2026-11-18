@@ -13,13 +13,13 @@ connector](installation.md#use-one-namespace-for-every-command). It lasts only f
 session, so set it again in a new one: a `helm` or `kubectl` command with an empty namespace
 silently uses your current context's namespace.
 
+(If you use Zsh, run `setopt interactivecomments` once first, so that the `#` comments in the
+commands are ignored as they are in Bash.)
+
 ```bash
 # Kubernetes only: the namespace of the connector's release.
 NAMESPACE=mkonnect
 ```
-
-If you use Zsh, run `setopt interactivecomments` once in the session so that the `#` comments in
-the commands are ignored as they are in Bash.
 
 The commands that change a Helm value also use `CHART_VERSION`, the chart version you run, so
 that they do not move the release to a newer chart as a side effect; see
@@ -398,12 +398,12 @@ With Docker's normal bridge networking, the base URL is resolved from mkonnect's
 In particular, `localhost` means the mkonnect container itself, not the Docker host where you ran
 the command.
 
-- For a tool running on the Docker host, use `http://host.docker.internal:<port>` on Docker
+- For a tool running on the Docker host, use `http://host.docker.internal:8080` (with your tool's port) on Docker
   Desktop (macOS or Windows). On Linux, add
   `--add-host host.docker.internal:host-gateway` to the `docker run` command that starts mkonnect,
   then use the same URL.
 - On Linux, `--network host` is an alternative when your deployment policy permits it. In that mode
-  `http://localhost:<port>` reaches the Docker host. Use the same network option whenever you
+  `http://localhost:8080` (with your tool's port) reaches the Docker host. Use the same network option whenever you
   recreate mkonnect, including when removing the registration token.
 - For a tool in another container, attach both containers to the same user-defined Docker network
   and use that container's network alias in the base URL. For example:

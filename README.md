@@ -118,7 +118,7 @@ When both define the same plugin name, the credential store wins.
 
 Plugin base URLs cannot include userinfo, query parameters, or fragments. Requests to plugins with local credentials bypass ambient `HTTP_PROXY` and `HTTPS_PROXY` settings. If an upstream response contains a complete local authorization representation or a supported encoded form of one, mkonnect returns a `502` instead of sending that response through the bridge.
 
-The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint). Define a small shell function once, so that the examples below read `mkonnect_exec connector ...`. For Docker (change `mkonnect` if your container has another name):
+The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint). Define a small shell function once, so that the examples below read `mkonnect_exec connector ...` (in Zsh, run `setopt interactivecomments` first so that the `#` comments are ignored). For Docker (change `mkonnect` if your container has another name):
 
 ```bash
 mkonnect_exec() { docker exec -i mkonnect /mkonnect "$@"; }
@@ -127,7 +127,7 @@ mkonnect_exec() { docker exec -i mkonnect /mkonnect "$@"; }
 For Kubernetes, with `NAMESPACE` set to the release's namespace (the commands assume a release named `mkonnect`):
 
 ```bash
-NAMESPACE=mkonnect
+: "${NAMESPACE:=mkonnect}"
 mkonnect_exec() { kubectl exec -i --namespace "${NAMESPACE:?set NAMESPACE}" deploy/mkonnect -- /mkonnect "$@"; }
 ```
 
