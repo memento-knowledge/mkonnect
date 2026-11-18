@@ -78,6 +78,12 @@ jobs:
       - name: Run image tag reconcile tests
         run: bash scripts/reconcile-image-tags_test.sh
 
+      - name: Run latest tag move tests
+        run: bash scripts/move-latest-tag_test.sh
+
+      - name: Run published release digest tests
+        run: bash scripts/published-release-digests_test.sh
+
       - name: Run release-metadata.json tests
         run: bash scripts/validate-release-metadata_test.sh
 
@@ -601,5 +607,121 @@ jobs:
             wanted=${r##*:}
             if [ "$wanted" = true ] && { [ "$outcome" = failure ] || [ "$outcome" = skipped ]; }; then
               echo "::warning::$name did not complete ($outcome). The release itself is not affected; see RELEASING.md (Image signatures and provenance) for what this means for consumers."
+            fi
+          done
+
+  # `latest` is a convenience tag for first installs (see RELEASING.md, "Moving the latest tag"). It
+  # is moved forward only, after the release is published, and best effort like signing: the job is
+  # marked continue-on-error, so a failure shows as a warning annotation and never blocks or undoes
+  # a release. Which images move comes from the published release-metadata.json, the same file
+  # consumers read, not from job results: the connector image always has a digest there, and the
+  # git-sync image has one only if it was published, so a failed git-sync build never creates or
+  # moves its `latest` and never affects the connector's. Each repository moves in its own step.
+  #
+  # The job needs publish, not sign-images: signing is by digest and moving a tag does not change
+  # any digest, so the two are independent and neither waits for the other. Moves are serialised
+  # across releases so that a re-run of an older release cannot interleave with a newer one;
+  # scripts/move-latest-tag.sh additionally never moves `latest` backwards. The AWS role is the one the
+  # publish jobs use; it already holds the ECR Public permissions this needs (DescribeImages,
+  # PutImage and the layer-availability check on the two image repositories).
+  move-latest:
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.publish.result == 'success' }}
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 25
+    concurrency:
+      group: move-latest-tag
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_ID: ${{ needs.verify.outputs.release_id }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - id: digests
+        name: Read the digests of the published release
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ECR_PUBLIC_ALIAS" ]; then
+            echo "ECR_PUBLIC_ALIAS repository variable is required" >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/published-release-metadata"
+          mkdir "$dir"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern release-metadata.json --dir "$dir"
+          # Prints connector_digest= and gitsync_digest= (empty without a git-sync image), and nothing
+          # for a file that is invalid or belongs to another release.
+          digests=$(bash scripts/published-release-digests.sh --metadata "$dir/release-metadata.json" --release-id "$RELEASE_ID")
+          printf '%s\n' "$digests" >> "$GITHUB_OUTPUT"
+          gitsync_digest=$(sed -n 's/^gitsync_digest=//p' <<<"$digests")
+          if [ -z "$gitsync_digest" ]; then
+            echo "::notice::The git-sync image was not published for release $RELEASE_ID, so its latest tag is left as it is."
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
+        if: steps.digests.outputs.connector_digest != ''
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to Docker registry
+        if: steps.digests.outputs.connector_digest != ''
+        run: aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+
+      - id: move_connector
+        name: Move latest of the connector image
+        if: steps.digests.outputs.connector_digest != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          DIGEST: ${{ steps.digests.outputs.connector_digest }}
+        run: |
+          bash scripts/move-latest-tag.sh \
+            --registry "$ECR_REGISTRY/$ECR_PUBLIC_ALIAS" \
+            --repository memento-connector \
+            --release-id "$RELEASE_ID" \
+            --digest "$DIGEST"
+
+      - id: move_gitsync
+        name: Move latest of the git-sync image
+        if: steps.digests.outputs.gitsync_digest != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          DIGEST: ${{ steps.digests.outputs.gitsync_digest }}
+        run: |
+          bash scripts/move-latest-tag.sh \
+            --registry "$ECR_REGISTRY/$ECR_PUBLIC_ALIAS" \
+            --repository memento-gitsync \
+            --release-id "$RELEASE_ID" \
+            --digest "$DIGEST"
+
+      - name: Report latest tag failures
+        if: always()
+        env:
+          RESULTS: >-
+            release-metadata=${{ steps.digests.outcome }}:true
+            connector-latest=${{ steps.move_connector.outcome }}:${{ steps.digests.outputs.connector_digest != '' }}
+            gitsync-latest=${{ steps.move_gitsync.outcome }}:${{ steps.digests.outputs.gitsync_digest != '' }}
+        run: |
+          # Each entry is name=outcome:wanted. A move that was wanted and whose step failed, or was
+          # skipped because an earlier step failed, is reported.
+          for r in $RESULTS; do
+            name=${r%%=*}
+            outcome=${r#*=}; outcome=${outcome%%:*}
+            wanted=${r##*:}
+            if [ "$wanted" = true ] && { [ "$outcome" = failure ] || [ "$outcome" = skipped ]; }; then
+              echo "::warning::$name did not complete ($outcome). The release itself is not affected. To retry, re-run only the move-latest job; see RELEASING.md (Moving the latest tag)."
             fi
           done
