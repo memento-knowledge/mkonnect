@@ -231,10 +231,9 @@ the rest of a pasted block still runs after a failed guard. On Kubernetes, git-s
 you override it, so `GATEWAY_URL` is only needed with Docker. The variables last only for the
 current shell session: set them again in a new one, and always set `NAMESPACE` again, because a
 `helm` or `kubectl` command with an empty namespace silently uses your current context's
-namespace. The commands that only change a Helm
-value (such as adding the provider Secret or removing the token) also ask for `CHART_VERSION`, the
-chart version you run, so that they do not move the release to a newer chart as a side effect; the
-[Installation guide](installation.md#choosing-a-release) shows how to set it.
+namespace. The commands that only change a Helm value (such as adding the provider Secret or
+removing the token) read the chart version you run from `helm list` themselves (they need `jq`), so
+that they do not move the release to a newer chart as a side effect.
 
 ### Check that the release has a git-sync image
 
@@ -275,8 +274,8 @@ jq -r .chart_version release-metadata.json
 
 With Docker, use the digest (`@$GIT_SYNC_IMAGE_DIGEST`) as the image. With Helm, only if you pin,
 set `CHART_VERSION` to the chart version printed above and add both to the install command as shown
-in [Option B](#option-b-kubernetes-helm). Do not set `CHART_VERSION` otherwise: later commands that
-only change a value use it as the chart version you run, which `helm list` shows.
+in [Option B](#option-b-kubernetes-helm). Set it only to pin: `CHART_VERSION` is the release you
+want to install or move to, and an old value left over in a shell session must not be reused.
 
 If a pod or container fails to start with an "image not found" error, the release most likely has
 no git-sync image.
@@ -375,6 +374,11 @@ EOF
 docker volume create gitsync-secrets
 printf 'Paste registration token: ' >&2
 IFS= read -r -s GITSYNC_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$GITSYNC_TOKEN" | docker run --rm -i --entrypoint sh -v gitsync-secrets:/data "$gitsync_image" \
   -c 'umask 077; cat > /data/registration-token'
@@ -469,11 +473,16 @@ gitsync_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"
 )
 printf 'Paste registration token: ' >&2
 IFS= read -r -s GITSYNC_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$GITSYNC_TOKEN" > "$gitsync_dir/registration.token"
 unset GITSYNC_TOKEN
 
-kubectl create secret generic gitsync-registration-token --namespace "$NAMESPACE" \
+kubectl create secret generic gitsync-registration-token --namespace "${NAMESPACE:?set NAMESPACE}" \
   --from-file=registration-token="$gitsync_dir/registration.token"
 
 helm upgrade --install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
@@ -548,7 +557,7 @@ point the chart at it:
 Set `CA_BUNDLE_FILE` to the path of your PEM file, then create the Secret:
 
 ```bash
-kubectl create secret generic mkonnect-gitsync-ca --namespace "$NAMESPACE" \
+kubectl create secret generic mkonnect-gitsync-ca --namespace "${NAMESPACE:?set NAMESPACE}" \
   --from-file=ca-bundle.pem="${CA_BUNDLE_FILE:?set CA_BUNDLE_FILE to the path of your PEM bundle}"
 ```
 
@@ -729,6 +738,11 @@ requests carry no credential. Use a dedicated service account with read-only acc
 ```bash
 printf 'Paste git access token: ' >&2
 IFS= read -r -s GIT_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 ```
 
@@ -781,17 +795,18 @@ EOF
 )
 # Replace the placeholder in a local editor; do not paste a real token into this shell block.
 ${EDITOR:-vi} "$providers_file"
-kubectl create secret generic mkonnect-gitsync-providers --namespace "$NAMESPACE" \
+kubectl create secret generic mkonnect-gitsync-providers --namespace "${NAMESPACE:?set NAMESPACE}" \
   --from-file=git-sync.json="$providers_file" && rm -r "$secret_dir"
 ```
 
-Then point the chart at the Secret. This command only changes a value, so it asks for the chart
-version you run (`CHART_VERSION`) and keeps the release on it; without `--version`, Helm would also
-move the release to the newest chart:
+Then point the chart at the Secret. This command only changes a value, so it first reads the chart
+version you run into `CHART_VERSION` and keeps the release on it; without `--version`, Helm would
+also move the release to the newest chart:
 
 ```bash
+CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION to the chart version you run}" \
+  --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
   --reset-then-reuse-values \
   --set gitSync.providerConfig.secretName=mkonnect-gitsync-providers
 ```
@@ -875,6 +890,11 @@ volume read-only. Run it from Bash or Zsh, with `$gitsync_image` set as in
 docker volume create gitsync-git-credential
 printf 'Paste git access token: ' >&2
 IFS= read -r -s GIT_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$GIT_TOKEN" | docker run --rm -i --entrypoint sh -v gitsync-git-credential:/data "$gitsync_image" \
   -c 'umask 077; cat > /data/git-token'
@@ -1006,7 +1026,7 @@ changing.
   or, on Kubernetes:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect-gitsync --namespace "$NAMESPACE"
+  kubectl rollout restart deployment/mkonnect-gitsync --namespace "${NAMESPACE:?set NAMESPACE}"
   ```
 
 While syncing is suspended for a critical update, a rotation still stops the syncs that use the old
@@ -1132,18 +1152,19 @@ The first command reads the image reference from the running container, so the r
 same image (the same tag or digest), with no need to remember a `RELEASE_ID` from an earlier shell.
 
 **Kubernetes:** stop mounting it and delete the Secret. The `helm upgrade` only changes a value, so
-it asks for the chart version you run (`CHART_VERSION`); without `--version`, Helm would also move
-the release to the newest chart:
+it first reads the chart version you run into `CHART_VERSION`; without `--version`, Helm would also
+move the release to the newest chart:
 
 ```bash
 gitsync_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"
 rm "$gitsync_dir/registration.token"
+CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION to the chart version you run}" \
+  --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
   --reset-then-reuse-values \
   --set gitSync.config.registrationTokenSecret.name="" \
   --set gitSync.config.registrationToken=""
-kubectl delete secret gitsync-registration-token --namespace "$NAMESPACE"
+kubectl delete secret gitsync-registration-token --namespace "${NAMESPACE:?set NAMESPACE}"
 ```
 
 If you passed the token with `--set-file`, earlier Helm release revisions still contain it; see the
@@ -1430,8 +1451,8 @@ gitsync_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect-gitsync"
 gitsync_image=public.ecr.aws/h2a8k0r3/memento-gitsync:${RELEASE_ID:-latest}
 # To pin by digest instead (GIT_SYNC_IMAGE_DIGEST from the release check):
 # gitsync_image=public.ecr.aws/h2a8k0r3/memento-gitsync@${GIT_SYNC_IMAGE_DIGEST:?set GIT_SYNC_IMAGE_DIGEST}
-docker pull "$gitsync_image"
-docker rm -f mkonnect-gitsync
+docker pull "$gitsync_image" &&
+docker rm -f mkonnect-gitsync &&
 docker run -d --name mkonnect-gitsync --restart unless-stopped \
   --read-only --cap-drop ALL --security-opt no-new-privileges \
   -v gitsync-data:/data \
@@ -1440,22 +1461,35 @@ docker run -d --name mkonnect-gitsync --restart unless-stopped \
   "$gitsync_image"
 ```
 
-**Helm:** to move to the newest release, upgrade the chart with no pin:
+If the pull fails, nothing else runs and the container keeps running the version it has.
 
-```bash
-helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --reset-then-reuse-values
-```
+**Helm:** which command to run depends on whether you pinned a digest earlier. A pinned digest stays
+set (that is what `--reset-then-reuse-values` keeps), so it must be changed together with the chart
+version, or the image would not move while the chart does.
 
-If you pinned a digest earlier, it stays set (that is what `--reset-then-reuse-values` keeps), so
-the image would not move: set the new release's chart version and digest together, from the same
-release's metadata:
+- **No digest pinned**, newest release: no `--version`. The image tag follows the new chart's
+  `appVersion`.
 
-```bash
-helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION}" --reset-then-reuse-values \
-  --set gitSync.image.digest="${GIT_SYNC_IMAGE_DIGEST:?set GIT_SYNC_IMAGE_DIGEST}"
-```
+  ```bash
+  helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+    --namespace "$NAMESPACE" --reset-then-reuse-values
+  ```
+
+- **No digest pinned**, a specific release: set `CHART_VERSION` to its chart version first.
+
+  ```bash
+  helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+    --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION}" --reset-then-reuse-values
+  ```
+
+- **A digest pinned** (or you want to pin one now): set `CHART_VERSION` and `GIT_SYNC_IMAGE_DIGEST`
+  from the same release's metadata (see the release check above).
+
+  ```bash
+  helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
+    --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION}" --reset-then-reuse-values \
+    --set gitSync.image.digest="${GIT_SYNC_IMAGE_DIGEST:?set GIT_SYNC_IMAGE_DIGEST}"
+  ```
 
 Without a pinned digest, the image tag follows the chart's `appVersion`, so the upgrade fails to
 pull if that release has no git-sync image. If you pinned `gitSync.image.tag`, update that instead.
@@ -1522,8 +1556,10 @@ the replica count at 1, so the next `helm upgrade` or GitOps sync starts git-syn
    ```bash
    docker rm mkonnect-gitsync
    docker volume rm gitsync-data gitsync-tmp
-   docker volume rm gitsync-secrets          # only if you have not already removed the registration token
-   docker volume rm gitsync-git-credential   # only if you created it for a token_file
+   # Only if you have not already removed the registration token
+   docker volume rm gitsync-secrets
+   # Only if you created it for a token_file
+   docker volume rm gitsync-git-credential
    ```
 
 3. Delete the settings kept on the host, and the image if nothing else uses it:
@@ -1545,15 +1581,16 @@ the replica count at 1, so the next `helm upgrade` or GitOps sync starts git-syn
    only while nothing applies the chart:
 
    ```bash
-   kubectl scale deployment/mkonnect-gitsync --replicas=0 --namespace "$NAMESPACE"
+   kubectl scale deployment/mkonnect-gitsync --replicas=0 --namespace "${NAMESPACE:?set NAMESPACE}"
    ```
 
 2. To remove git-sync, disable it. Keep `--reset-then-reuse-values`, so the API connector's settings
    are kept:
 
    ```bash
+   CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
    helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-     --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION to the chart version you run}" \
+     --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
      --reset-then-reuse-values --set gitSync.enabled=false
    ```
 
@@ -1573,9 +1610,12 @@ the replica count at 1, so the next `helm upgrade` or GitOps sync starts git-syn
    ones used in the examples in this guide, so use yours if they differ:
 
    ```bash
-   kubectl delete secret gitsync-registration-token --namespace "$NAMESPACE"   # if you did not already remove it
-   kubectl delete secret mkonnect-gitsync-providers --namespace "$NAMESPACE"   # holds your git server credential
-   kubectl delete secret mkonnect-gitsync-ca --namespace "$NAMESPACE"          # if you mounted a CA bundle
+   # If you did not already remove it
+   kubectl delete secret gitsync-registration-token --namespace "${NAMESPACE:?set NAMESPACE}"
+   # Holds your git server credential
+   kubectl delete secret mkonnect-gitsync-providers --namespace "${NAMESPACE:?set NAMESPACE}"
+   # If you mounted a CA bundle
+   kubectl delete secret mkonnect-gitsync-ca --namespace "${NAMESPACE:?set NAMESPACE}"
    ```
 
    Then delete the files kept on your workstation (`registration.token`, and any other local copy of
@@ -1642,7 +1682,7 @@ clears the error.
 | `connector preflight`, or the portal before the first configuration, says `PASS`/`reachable`, yet a repository fails `origin_access_denied`, or a private one does not sync | Those checks only ask the server's base URL, and any answer other than 401, 403 or 407, including a redirect to a sign-in page, counts as reachable, whatever the credential. Once the platform has sent repositories, the portal's check uses one of them and a refused credential reads `access_denied`. Check the credential against the repository itself, and the authentication mode: some servers ignore `bearer` and need `basic` with a username (see [Configure your git server credential](#configure-your-git-server-credential)). |
 | The portal says `reachable`, with the error type `origin_access_denied` | The check reached the server, but a repository it asked for answered 403 or 404 (and so did the one other it tried): the credential may lack access to the repositories, or they were deleted or renamed. Each repository's own status says which. This is not a refused credential, so nothing is held back. |
 | A **public** repository syncs, but a private one on the same server fails `origin_access_denied` | Likely the credential is not being accepted at all (for example `bearer` against a server that accepts only HTTP Basic): a public repository needs no credential, so it syncs anyway. Try `basic` with a username. |
-| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out before it was made (a connection that stalls after it was made runs into the push time limit and is `push_timeout`), so check the two requirements on your side: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from a machine on the same network path (the same egress address and proxy settings; the git-sync image has no `openssl` or `curl`), for example `openssl s_client -connect "$REPLICA_HOST:${REPLICA_PORT:-443}" -servername "$REPLICA_HOST" -tls1_3 </dev/null` with `REPLICA_HOST` and `REPLICA_PORT` set from your replica host (a working connection prints `New, TLSv1.3`; it does not use `HTTPS_PROXY`), and see what `connector preflight` reports for `replica-https`. |
+| `replica_unreachable` | git-sync could not connect to the Memento replica. Allow outbound HTTPS to the replica host (and port) from the installation instructions. If you set a CA bundle for git, it must also contain the public root(s) for the replica. This type also covers a failed TLS negotiation and a connection that was refused, dropped or timed out before it was made (a connection that stalls after it was made runs into the push time limit and is `push_timeout`), so check the two requirements on your side: **TLS 1.3** (a proxy or firewall that inspects TLS and offers the replica only an older version fails here) and a **source address that Memento has allowed** (see [Requirements](#requirements)): if your outbound address changed, for example a new NAT gateway or proxy, send the new one to Memento. The report and the log carry only the type, not git's message, so reproduce the connection from a machine on the same network path (the same egress address and proxy settings; the git-sync image has no `openssl` or `curl`), for example `openssl s_client -connect "$REPLICA_HOST:${REPLICA_PORT:-443}" -servername "$REPLICA_HOST" -tls1_3 </dev/null` with `REPLICA_HOST` and `REPLICA_PORT` set from your `GIT_SYNC_REPLICA_HOST` (its host part and its port, 443 if none) (a working connection prints `New, TLSv1.3`; it does not use `HTTPS_PROXY`), and see what `connector preflight` reports for `replica-https`. |
 | `replica_rate_limited` | The replica answered a push with HTTP 429: it is rate limiting pushes. The detail is a fixed hint. Nothing needs fixing on your side; git-sync retries later with the ordinary delay (see [Failures and backoff](#failures-and-backoff)). If it persists, contact Memento with the repository ID. |
 | `replica_repository_not_found` | The replica answered a push with HTTP 404 or "repository not found": the repository has not been created on the replica yet (it may still be being provisioned). The detail is a fixed hint. git-sync retries with the ordinary delay (see [Failures and backoff](#failures-and-backoff)) and succeeds once the repository exists. If it persists, contact Memento with the repository ID. |
 | `credential_rejected` | The **replica** rejected the push token (not your git credential). Tokens are issued by the platform and refreshed while the connector is connected. If it persists, check that the connector is connected and its host clock is correct, then contact Memento. git-sync reports any HTTP 401 or 403 that git receives from the replica as this type (or as `push_token_expired` when the token was already past its expiry), whatever produced it, so it cannot tell a refused token from another kind of refusal; a 403 can also come from a firewall in front of the replica, which git-sync cannot tell from a refused token. A rate limit is reported as `replica_rate_limited` (HTTP 429), a missing repository as `replica_repository_not_found` (HTTP 404), and an unavailable replica as `replica_unreachable` (HTTP 503). A status with no type of its own (a redirect, for example) appears as `unclassified` with a detail line. If the connector is connected and the clock is right, also confirm with Memento that the source addresses they allowed include the one the replica sees. After Memento has allowed an address, an immediate sync or a restart retries now instead of waiting out the delay. Scheduled retries wait at least an hour; a configuration refresh or an immediate sync still tries once at once. |
@@ -1713,11 +1753,11 @@ use the same image as the Deployment, which the first command reads from it:
 
 ```bash
 gitsync_image=$(kubectl get deployment mkonnect-gitsync --namespace "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}')
-kubectl -n "$NAMESPACE" scale deployment/mkonnect-gitsync --replicas=0
-kubectl -n "$NAMESPACE" run gitsync-fixperms --rm -i --restart=Never \
+kubectl --namespace "${NAMESPACE:?set NAMESPACE}" scale deployment/mkonnect-gitsync --replicas=0
+kubectl --namespace "${NAMESPACE:?set NAMESPACE}" run gitsync-fixperms --rm -i --restart=Never \
   --image="$gitsync_image" \
   --overrides='{"spec":{"securityContext":{"runAsUser":65532,"runAsGroup":65532},"containers":[{"name":"gitsync-fixperms","image":"'"$gitsync_image"'","command":["sh","-c","ls -ln /data/gitsync-key && chmod 600 /data/gitsync-key && ls -ln /data/gitsync-key"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"mkonnect-gitsync-data"}}]}}'
-kubectl -n "$NAMESPACE" scale deployment/mkonnect-gitsync --replicas=1
+kubectl --namespace "${NAMESPACE:?set NAMESPACE}" scale deployment/mkonnect-gitsync --replicas=1
 ```
 
 The first `ls` shows the current mode and the second confirms `-rw-------`. This pod sets no

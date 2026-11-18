@@ -21,9 +21,9 @@ commands are ignored as they are in Bash.)
 NAMESPACE=mkonnect
 ```
 
-The commands that change a Helm value also use `CHART_VERSION`, the chart version you run, so
-that they do not move the release to a newer chart as a side effect; see
-[Choosing a release](installation.md#choosing-a-release) for how to set it. The connector CLI
+The commands that change a Helm value read the chart version you run from `helm list` (they need
+`jq`; see [Choosing a release](installation.md#choosing-a-release)), so that they do not move the
+release to a newer chart as a side effect. The connector CLI
 commands use a small `mkonnect_exec` function, defined under
 [Running the connector CLI](#running-the-connector-cli).
 
@@ -149,14 +149,15 @@ plugins:
 ```
 
 Put the same setting in the install command, or add it to a running release. This command only
-changes a value, so it asks for the chart version you run (`CHART_VERSION`) and keeps the release
-on it; without `--version`, Helm would also move the release to the newest chart. If the release
+changes a value, so it first reads the chart version you run into `CHART_VERSION` and keeps the
+release on it; without `--version`, Helm would also move the release to the newest chart. If the release
 has [git-sync](git-sync.md) enabled, use `--reset-then-reuse-values` instead of `--reuse-values`
 (see the [git-sync Helm notes](git-sync.md#option-b-kubernetes-helm)):
 
 ```bash
+CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION to the chart version you run}" \
+  --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
   --reuse-values \
   --set plugins.jenkins=http://jenkins.internal:8080
 ```
@@ -189,7 +190,7 @@ Neither path needs `exec` to take effect:
   nothing that restarts the pod when the Secret changes. Restart the workload:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"
+  kubectl rollout restart deployment/mkonnect --namespace "${NAMESPACE:?set NAMESPACE}"
   ```
 
   This needs permission to patch Deployments, not `pods/exec`.
@@ -246,7 +247,7 @@ restrictive permissions outside your checkout and remove it after the Secret has
    EOF
    # Replace the REPLACE_WITH_* placeholders in a local editor; do not paste a real token into this shell block.
    ${EDITOR:-vi} "$credentials_file"
-   kubectl create secret generic mkonnect-tool-creds --namespace "$NAMESPACE" \
+   kubectl create secret generic mkonnect-tool-creds --namespace "${NAMESPACE:?set NAMESPACE}" \
      --from-file=credentials.json="$credentials_file" \
      && rm "$credentials_file"
    ```
@@ -304,6 +305,8 @@ Configure it one of two ways:
   `ca_bundle` field in the credentials file. A per-tool bundle overrides the global one
   for that tool.
 
+(Define `mkonnect_exec` first, as described in [Running the connector CLI](#running-the-connector-cli).)
+
 ```bash
 mkonnect_exec connector config set gitscm \
   --base-url https://gitscm.internal \
@@ -335,7 +338,7 @@ wiring consistent with the credential mount. Create a Secret holding the PEM bun
 point the chart at it:
 
 ```bash
-kubectl create secret generic mkonnect-ca --namespace "$NAMESPACE" \
+kubectl create secret generic mkonnect-ca --namespace "${NAMESPACE:?set NAMESPACE}" \
   --from-file=ca-bundle.pem=/path/to/internal-ca-bundle.pem
 ```
 
@@ -429,6 +432,11 @@ only as an example of such a tool:
 ```bash
 printf 'Paste the Grafana token: ' >&2
 IFS= read -r -s GRAFANA_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$GRAFANA_TOKEN" | \
   mkonnect_exec connector config set grafana \
@@ -449,11 +457,23 @@ REST API authenticates with HTTP Basic — your Jenkins username plus an API tok
 password — and does **not** accept `Authorization: Bearer`. Configuring Jenkins as a bearer tool
 makes every request fail with `401`/`403` even though the connector shows as connected.
 
+Set your Jenkins username first:
+
 ```bash
-# Your Jenkins username.
 JENKINS_USERNAME=''
+: "${JENKINS_USERNAME:?put your Jenkins username between the quotes on the line above}"
+```
+
+Then read the API token:
+
+```bash
 printf 'Paste the Jenkins API token: ' >&2
 IFS= read -r -s JENKINS_API_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$JENKINS_API_TOKEN" | \
   mkonnect_exec connector config set jenkins \
@@ -502,7 +522,7 @@ own — you must tell it to reload:
   the private key persists on the volume, so it reconnects immediately:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"
+  kubectl rollout restart deployment/mkonnect --namespace "${NAMESPACE:?set NAMESPACE}"
   ```
 
 Either way the connector then pushes a fresh status report to the portal. Restarting the Docker

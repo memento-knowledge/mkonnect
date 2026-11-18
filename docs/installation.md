@@ -127,7 +127,7 @@ curl -fsSL -o release-metadata.json \
   https://github.com/memento-knowledge/mkonnect/releases/latest/download/release-metadata.json
 # or, for the release in RELEASE_ID instead of the newest:
 # curl -fsSL -o release-metadata.json "https://github.com/memento-knowledge/mkonnect/releases/download/${RELEASE_ID:?set RELEASE_ID}/release-metadata.json"
-IMAGE_DIGEST=$(jq -r .connector_image_digest release-metadata.json)
+IMAGE_DIGEST=$(jq -r '.connector_image_digest // empty' release-metadata.json)
 printf '%s\n' "$IMAGE_DIGEST"
 ```
 
@@ -139,15 +139,9 @@ chart version, `CHART_VERSION`.
 To see which release is running: with Docker, the `docker logs mkonnect` start line shows
 `version=…`; with Helm, `helm list --namespace "$NAMESPACE"` shows the chart version and the
 release ID (`APP VERSION`). Helm commands that only change a value (removing the token, adding a
-tool) must not move the release to a newer chart by accident, so they ask for the chart version you
-run. Set it from the installed release (needs `jq`; otherwise read it from the **CHART** column of
-`helm list`, where `mkonnect-0.3.3` means `0.3.3`):
-
-```bash
-CHART_VERSION=$(helm list --namespace "$NAMESPACE" --filter '^mkonnect$' --output json | jq -r '.[0].chart | sub("^mkonnect-"; "")')
-printf '%s\n' "$CHART_VERSION"
-```
-
+tool) read the installed chart version from `helm list` themselves, so that they do not move the
+release to a newer chart by accident; do not rely on an old `CHART_VERSION` from earlier in a shell
+session, which is only for the release you want to install or move to.
 ## Option A — Docker
 
 Create a named volume for the key, then start the connector. Without `RELEASE_ID` it uses the
@@ -160,6 +154,9 @@ umask 077
 mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 mkdir -p "$mkonnect_config_dir"
 chmod 700 "$mkonnect_config_dir"
+mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+# To pin by digest instead (IMAGE_DIGEST from "Choosing a release"):
+# mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector@${IMAGE_DIGEST:?set IMAGE_DIGEST}
 
 # The guard comes first: if a value is empty, the env file is not written at all.
 : "${GATEWAY_URL:?set GATEWAY_URL from the portal}" "${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" &&
@@ -175,6 +172,11 @@ EOF
 chmod 600 "$mkonnect_config_dir/registration.env"
 printf 'Paste registration token: ' >&2
 IFS= read -r -s REGISTRATION_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf 'REGISTRATION_TOKEN=%s\n' "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.env"
 unset REGISTRATION_TOKEN
@@ -185,7 +187,7 @@ docker run -d --name mkonnect --restart unless-stopped --pull always \
   -v mkonnect-data:/data \
   --env-file "$mkonnect_config_dir/mkonnect.env" \
   --env-file "$mkonnect_config_dir/registration.env" \
-  public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+  "$mkonnect_image"
 ```
 
 If mkonnect must reach a service running on the Docker host, see [Reaching a tool from
@@ -217,6 +219,11 @@ chmod 700 "$mkonnect_config_dir"
 chmod 600 "$mkonnect_config_dir/registration.token"
 printf 'Paste registration token: ' >&2
 IFS= read -r -s REGISTRATION_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
 unset REGISTRATION_TOKEN
@@ -229,7 +236,7 @@ helm upgrade --install mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
   --set config.connectorId="${CONNECTOR_ID:?set CONNECTOR_ID from the portal}"
 ```
 
-To install a specific release instead, add `--version "$CHART_VERSION"` to this command, for
+To install a specific release instead, add `--version "${CHART_VERSION:?set CHART_VERSION}"` to this command, for
 example after the `--namespace` line. The image tag then follows that chart's `appVersion`; do not
 also set `image.tag`.
 
@@ -338,17 +345,19 @@ docker network connect "${TOOL_NETWORK:?set TOOL_NETWORK to the network name}" m
 ```
 
 **Kubernetes:** remove the local token file, then clear the active Helm value. This command only
-changes a value, so it asks for the chart version you run: set `CHART_VERSION` as shown in
-[Choosing a release](#choosing-a-release) first. Without `--version`, Helm would move the release
-to the newest chart as well. If the release has [git-sync](git-sync.md) enabled, use
+changes a value, so it first reads the chart version you run from `helm list` into `CHART_VERSION`
+and passes it with `--version`; without `--version`, Helm would move the release to the newest chart
+as well (needs `jq`; if you do not have it, set `CHART_VERSION` by hand from the **CHART** column of
+`helm list`, where `mkonnect-0.3.3` means `0.3.3`). If the release has [git-sync](git-sync.md) enabled, use
 `--reset-then-reuse-values` instead of `--reuse-values` (see the
 [git-sync Helm notes](git-sync.md#option-b-kubernetes-helm)):
 
 ```bash
 mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 rm "$mkonnect_config_dir/registration.token"
+CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace "$NAMESPACE" --version "${CHART_VERSION:?set CHART_VERSION to the chart version you run}" \
+  --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
   --reuse-values \
   --set config.registrationToken=""
 ```
@@ -376,13 +385,16 @@ mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
 mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
 # To pin by digest instead (IMAGE_DIGEST from "Choosing a release"):
 # mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector@${IMAGE_DIGEST:?set IMAGE_DIGEST}
-docker pull "$mkonnect_image"
-docker rm -f mkonnect
+docker pull "$mkonnect_image" &&
+docker rm -f mkonnect &&
 docker run -d --name mkonnect --restart unless-stopped \
   -v mkonnect-data:/data \
   --env-file "$mkonnect_config_dir/mkonnect.env" \
   "$mkonnect_image"
 ```
+
+If the pull fails (for example without network access), nothing else runs and the container keeps
+running the version it has.
 
 Because the key and credential store live on the `mkonnect-data` volume, the connector reconnects
 with its existing key — no re-registration and no credential re-entry. Include the same Linux
@@ -424,7 +436,8 @@ file, run from the directory that holds both files.
 
 ```bash
 docker rm -f mkonnect
-docker volume rm mkonnect-data     # also removes the private key and local credentials
+# Also removes the private key and local credentials
+docker volume rm mkonnect-data
 ```
 
 **Helm:**
@@ -433,7 +446,7 @@ docker volume rm mkonnect-data     # also removes the private key and local cred
 helm uninstall mkonnect --namespace "$NAMESPACE"
 # the PersistentVolumeClaim may be retained by your storage class; delete it explicitly
 # if you want to discard the key:
-kubectl delete pvc mkonnect-data --namespace "$NAMESPACE"
+kubectl delete pvc mkonnect-data --namespace "${NAMESPACE:?set NAMESPACE}"
 ```
 
 Because credentials for your internal tools are stored on the connector's local volume

@@ -124,10 +124,9 @@ The `connector` command is a subcommand of the `/mkonnect` binary, so you run it
 mkonnect_exec() { docker exec -i mkonnect /mkonnect "$@"; }
 ```
 
-For Kubernetes, with `NAMESPACE` set to the release's namespace (the commands assume a release named `mkonnect`):
+For Kubernetes, after you set `NAMESPACE` to the release's namespace (the commands assume a release named `mkonnect`):
 
 ```bash
-: "${NAMESPACE:=mkonnect}"
 mkonnect_exec() { kubectl exec -i --namespace "${NAMESPACE:?set NAMESPACE}" deploy/mkonnect -- /mkonnect "$@"; }
 ```
 
@@ -151,9 +150,11 @@ printf %s "$JENKINS_API_TOKEN" | \
 # Unauthenticated tool:
 mkonnect_exec connector config set prometheus --base-url http://prometheus.internal:9090
 
-mkonnect_exec connector config list      # base URLs; credentials shown masked
+# Base URLs; credentials shown masked
+mkonnect_exec connector config list
 mkonnect_exec connector config remove jenkins
-mkonnect_exec connector status           # configured plugins on this connector
+# Configured plugins on this connector
+mkonnect_exec connector status
 ```
 
 If your cluster does not allow `kubectl exec`, see [Configuring tools without `kubectl exec`](docs/setup.md#configuring-tools-without-kubectl-exec). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
@@ -195,6 +196,7 @@ for all options.
 ```bash
 # Bash or Zsh; this path is intended for local development.
 # Set GATEWAY_URL and CONNECTOR_ID to the values from the portal before you run it.
+: "${GATEWAY_URL:?set GATEWAY_URL from the portal}" "${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" &&
 go build -o mkonnect ./cmd/mkonnect
 
 umask 077
@@ -205,6 +207,11 @@ chmod 700 "$mkonnect_config_dir"
 chmod 600 "$mkonnect_config_dir/registration.token"
 printf 'Paste registration token: ' >&2
 IFS= read -r -s REGISTRATION_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
 printf '\n' >&2
 printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
 unset REGISTRATION_TOKEN
@@ -216,7 +223,8 @@ GATEWAY_URL="${GATEWAY_URL:?set GATEWAY_URL from the portal}" CONNECTOR_ID="${CO
 The file is owner-only (`0600`), which `REGISTRATION_TOKEN_FILE` requires. After it has registered, stop the process, then restart without the token. Remove the variable together with the file: with `REGISTRATION_TOKEN_FILE` still set, a missing file makes startup fail.
 
 ```bash
-unset REGISTRATION_TOKEN_FILE
+: "${GATEWAY_URL:?set GATEWAY_URL from the portal}" "${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" &&
+unset REGISTRATION_TOKEN_FILE &&
 rm "$mkonnect_config_dir/registration.token"
 GATEWAY_URL="${GATEWAY_URL:?set GATEWAY_URL from the portal}" CONNECTOR_ID="${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" ./mkonnect
 ```
@@ -226,10 +234,14 @@ For production, use the Docker or Helm instructions above.
 ## Development
 
 ```bash
-go test ./... -race        # run tests
-go vet ./...               # vet
-gofmt -l .                 # formatting (should print nothing)
-helm lint charts/mkonnect  # lint the chart
+# Run tests
+go test ./... -race
+# Vet
+go vet ./...
+# Formatting (should print nothing)
+gofmt -l .
+# Lint the chart
+helm lint charts/mkonnect
 ```
 
 CI (see [.github/workflows/ci.yml](.github/workflows/ci.yml)) runs tests, a lint gate (`gofmt`, `go vet`, `staticcheck`, `govulncheck`, `actionlint`), and Helm lint on every push and pull request. Versioned artifacts are published only by the [release workflow](.github/workflows/release.yml) when an annotated stable release tag is pushed.
