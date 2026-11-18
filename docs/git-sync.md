@@ -258,7 +258,9 @@ fetch its file as shown above), and use that release's `chart_version` and `git_
 in the commands below, so the chart and the image come from the same release. Do not choose a
 release older than the chart you already run (`helm list`): wait for a later release instead.
 
-Without a pin, the Docker image tag `latest` is the newest published git-sync image, and the
+Without a pin, the Docker image tag `latest` is the newest published git-sync image (it stays at an
+earlier release when a release has none; see
+[Moving the latest tag](../RELEASING.md#moving-the-latest-tag)), and the
 chart's default image tag (its `appVersion`) is the newest chart's release ID, which has a git-sync
 image only if this check says so. **For production, pin the image by
 digest**, because a tag such as `latest` moves with every release. The pin is optional. Read the

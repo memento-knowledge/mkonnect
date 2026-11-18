@@ -99,7 +99,9 @@ namespace.
 You do not need to choose one. Without a pin, the commands below install the newest published
 release:
 
-- **Docker** uses the image tag `latest`, which is the newest published release.
+- **Docker** uses the image tag `latest`, which is the newest published release (see
+  [Moving the latest tag](../RELEASING.md#moving-the-latest-tag) for how it is kept current and
+  how to check it).
 - **Helm** installs the newest chart, whose default image tag is its own `appVersion` (the release
   ID), so the chart version selects the matching image.
 
