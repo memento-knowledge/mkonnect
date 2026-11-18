@@ -2,8 +2,8 @@
 
 Guides for administrators deploying and operating the mkonnect on-prem connector.
 
-- **[Installation guide](installation.md)** — deploy the connector with Docker or Helm, verify it
-  connected, and upgrade or uninstall it.
+- **[Installation guide](installation.md)** — deploy the connector with Docker or Helm (the newest
+  release by default, with an optional pin), verify it connected, and upgrade or uninstall it.
 - **[Setup guide](setup.md)** — make your internal tools reachable through the connector and attach
   credentials safely, including on Kubernetes clusters that do not allow `kubectl exec`.
 - **[git-sync guide](git-sync.md)** — optional add-on, installed after the API connector, that

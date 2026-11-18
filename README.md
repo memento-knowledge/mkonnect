@@ -118,43 +118,56 @@ When both define the same plugin name, the credential store wins.
 
 Plugin base URLs cannot include userinfo, query parameters, or fragments. Requests to plugins with local credentials bypass ambient `HTTP_PROXY` and `HTTPS_PROXY` settings. If an upstream response contains a complete local authorization representation or a supported encoded form of one, mkonnect returns a `502` instead of sending that response through the bridge.
 
-The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint):
+The `connector` command is a subcommand of the `/mkonnect` binary, so you run it inside the container by the binary's path (`docker exec`/`kubectl exec` bypass the image entrypoint). Define a small shell function once, so that the examples below read `mkonnect_exec connector ...`. For Docker (change `mkonnect` if your container has another name):
+
+```bash
+mkonnect_exec() { docker exec -i mkonnect /mkonnect "$@"; }
+```
+
+For Kubernetes, with `NAMESPACE` set to the release's namespace (the commands assume a release named `mkonnect`):
+
+```bash
+NAMESPACE=mkonnect
+mkonnect_exec() { kubectl exec -i --namespace "${NAMESPACE:?set NAMESPACE}" deploy/mkonnect -- /mkonnect "$@"; }
+```
+
+Then:
 
 ```bash
 # Bearer-authenticated tool (e.g. Grafana) — tokens must be piped via stdin so
 # they never land in the process list or shell history:
 printf %s "$GRAFANA_TOKEN" | \
-  <exec> connector config set grafana \
+  mkonnect_exec connector config set grafana \
     --base-url http://grafana.internal:3000 --auth bearer --token-stdin
 
 # Basic-authenticated tool — e.g. Jenkins, whose REST API uses HTTP Basic with the
 # API token as the password (it does not accept Bearer). The username and token
 # stay in the local credential store; only the token is passed through stdin:
 printf %s "$JENKINS_API_TOKEN" | \
-  <exec> connector config set jenkins \
+  mkonnect_exec connector config set jenkins \
     --base-url http://jenkins.internal:8080 --auth basic \
     --username "$JENKINS_USERNAME" --token-stdin
 
 # Unauthenticated tool:
-<exec> connector config set prometheus --base-url http://prometheus.internal:9090
+mkonnect_exec connector config set prometheus --base-url http://prometheus.internal:9090
 
-<exec> connector config list      # base URLs; credentials shown masked
-<exec> connector config remove jenkins
-<exec> connector status           # configured plugins on this connector
+mkonnect_exec connector config list      # base URLs; credentials shown masked
+mkonnect_exec connector config remove jenkins
+mkonnect_exec connector status           # configured plugins on this connector
 ```
 
-`<exec>` is `docker exec -i mkonnect /mkonnect` for Docker, or `kubectl exec -i --namespace <namespace> <pod> -- /mkonnect` for Kubernetes (replace `mkonnect`/`<pod>` with your container name or pod, and `<namespace>` with the release's namespace). If your cluster does not allow `kubectl exec`, see [Configuring tools without `kubectl exec`](docs/setup.md#configuring-tools-without-kubectl-exec). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace <namespace>` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
+If your cluster does not allow `kubectl exec`, see [Configuring tools without `kubectl exec`](docs/setup.md#configuring-tools-without-kubectl-exec). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
 
 ## Releases
 
-Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. Releases use calendar identifiers in the form `YYYYMMDD.n`: the first release on a date is `.0`, then the index increases without gaps. Pin deployments to an explicit release; never use a moving image tag.
+Each stable release has a [GitHub Release](https://github.com/memento-knowledge/mkonnect/releases) with release notes, a downloadable Helm chart, and its SHA-256 checksum. Releases use calendar identifiers in the form `YYYYMMDD.n`: the first release on a date is `.0`, then the index increases without gaps. You do not have to choose a release to install: the Docker image tag `latest` is the newest published release, and Helm installs the newest chart when you give no `--version`. `latest` moves with every release, so for production pin a release, ideally by image digest, which each release records in its `release-metadata.json` (see [Choosing a release](docs/installation.md#choosing-a-release)).
 
 The container image uses the calendar release identifier. Helm requires its own SemVer chart version, and each chart's `appVersion` records the calendar release identifier that supplies its default image tag.
 
 The published artifacts are:
 
-- Container image: `public.ecr.aws/h2a8k0r3/memento-connector:<release-id>`
-- Helm chart: `oci://public.ecr.aws/h2a8k0r3/mkonnect` at Helm chart version `<chart-version>`
+- Container image: `public.ecr.aws/h2a8k0r3/memento-connector`, tagged with the release ID (`YYYYMMDD.n`) and `latest`
+- Helm chart: `oci://public.ecr.aws/h2a8k0r3/mkonnect`, versioned with SemVer (the newest is used when you give no `--version`)
 
 OCI Helm installation is recommended. If you download the chart from a GitHub Release instead, download its `.sha256` asset too and verify it with `sha256sum -c` before installing the local `.tgz` file.
 
@@ -181,6 +194,7 @@ for all options.
 
 ```bash
 # Bash or Zsh; this path is intended for local development.
+# Set GATEWAY_URL and CONNECTOR_ID to the values from the portal before you run it.
 go build -o mkonnect ./cmd/mkonnect
 
 umask 077
@@ -196,7 +210,7 @@ printf %s "$REGISTRATION_TOKEN" > "$mkonnect_config_dir/registration.token"
 unset REGISTRATION_TOKEN
 
 REGISTRATION_TOKEN_FILE="$mkonnect_config_dir/registration.token" \
-GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
+GATEWAY_URL="${GATEWAY_URL:?set GATEWAY_URL from the portal}" CONNECTOR_ID="${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" ./mkonnect
 ```
 
 The file is owner-only (`0600`), which `REGISTRATION_TOKEN_FILE` requires. After it has registered, stop the process, then restart without the token. Remove the variable together with the file: with `REGISTRATION_TOKEN_FILE` still set, a missing file makes startup fail.
@@ -204,7 +218,7 @@ The file is owner-only (`0600`), which `REGISTRATION_TOKEN_FILE` requires. After
 ```bash
 unset REGISTRATION_TOKEN_FILE
 rm "$mkonnect_config_dir/registration.token"
-GATEWAY_URL=<gateway-url-from-portal> CONNECTOR_ID=<connector-id-from-portal> ./mkonnect
+GATEWAY_URL="${GATEWAY_URL:?set GATEWAY_URL from the portal}" CONNECTOR_ID="${CONNECTOR_ID:?set CONNECTOR_ID from the portal}" ./mkonnect
 ```
 
 For production, use the Docker or Helm instructions above.

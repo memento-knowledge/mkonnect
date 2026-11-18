@@ -338,8 +338,10 @@ Limits to be aware of:
   builder stage, which does not ship in the image, is pinned by tag only); `git` and
   `ca-certificates` are resolved from Alpine's package index at build time, so the image as a whole
   is not bit-for-bit reproducible, and the build fails if `git` is older than 2.31.
-- **Pin by digest.** Each release records the image digests in `release-metadata.json`. Use the
-  digest, not a tag, when you install (`gitSync.image.digest` in the chart; `repository@sha256:...` with
+- **Pin by digest for production.** Without a pin, an install uses the newest published release (the
+  Docker tag `latest`, or the chart's default image tag), which is convenient for a first install but
+  moves with every release. Each release records the image digests in `release-metadata.json`. For
+  production, use the digest, not a tag (`gitSync.image.digest` in the chart; `repository@sha256:...` with
   Docker). A release can exist without a git-sync image; check as described in
   [Check that the release has a git-sync image](git-sync.md#check-that-the-release-has-a-git-sync-image).
 - **Signatures and provenance.** The release workflow is set up to sign each released image
