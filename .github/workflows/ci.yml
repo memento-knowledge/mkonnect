@@ -38,6 +38,9 @@ jobs:
       - name: Run latest tag move tests
         run: bash scripts/move-latest-tag_test.sh
 
+      - name: Run published release digest tests
+        run: bash scripts/published-release-digests_test.sh
+
       - name: Run release-metadata.json tests
         run: bash scripts/validate-release-metadata_test.sh
 

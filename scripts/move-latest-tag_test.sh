@@ -195,9 +195,11 @@ expect_moves() {
   log_has '^buildx imagetools create '
   unset RELEASE_ID_ARG
 }
+# The newer `latest` is a real release: its release tag exists with the same digest.
 expect_stays() {
   new_case "$1"
   seed latest "$old_digest" "$2"
+  seed "$2" "$old_digest" "$2"
   RELEASE_ID_ARG=${3:-$release_id}
   seed "$RELEASE_ID_ARG" "$new_digest" "$RELEASE_ID_ARG"
   expect_success
@@ -262,9 +264,43 @@ output_has 'not a calendar release ID'
 
 # 7. Never backwards: re-running an older release leaves a newer `latest` alone and succeeds.
 expect_stays rerun-older 20261201.0 20261114.0
+output_has '::notice::'
 output_has 'not moving it backwards'
 expect_stays rerun-earlier-same-day 20261114.3 20261114.1
 expect_stays rerun-earlier-year 20270101.0 20261231.7
+
+# A `latest` labelled newer than every real release (no release tag with that digest) would block
+# every later move silently, so it fails loudly instead, and nothing is written.
+new_case newer-than-any-release
+seed_release
+seed latest "$old_digest" 29991231.0
+expect_failure
+no_write
+test "$(registry_digest latest)" = "$old_digest"
+output_has '::warning::'
+output_has 'not a release tag'
+
+new_case newer-label-tag-has-other-digest
+seed_release
+seed latest "$old_digest" 20261201.0
+seed 20261201.0 "$other_digest" 20261201.0
+expect_failure
+no_write
+output_has '::warning::'
+
+new_case newer-label-tag-lookup-denied
+seed_release
+seed latest "$old_digest" 20261201.0
+seed 20261201.0 "$old_digest" 20261201.0
+FAKE_AWS_DENY_TAG=20261201.0 expect_failure
+no_write
+output_has AccessDenied
+# A lookup error is reported as such, not as a `latest` that is ahead of every release.
+if output_has '::warning::'; then
+  printf 'a registry error was reported as an unknown newer latest\n' >&2
+  exit 1
+fi
+unset FAKE_AWS_DENY_TAG
 
 # 8. `latest` that carries this release ID under a different digest is a conflict.
 new_case same-id-other-digest

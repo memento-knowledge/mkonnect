@@ -5,21 +5,30 @@
 # tags are never touched by this script.
 #
 # The release is identified by its release ID (YYYYMMDD.n) and the digest the release workflow
-# recorded for it. Nothing is written unless all of these hold:
-#   - the release tag <release-id> resolves to --digest, and the image at that digest carries
-#     the version label <release-id> (so only a consistently published release can become `latest`);
-#     the label check is made only when a write is about to happen;
-#   - `latest` does not exist, or it already is --digest, or the image it points to is older than
-#     this release. "Older" compares the calendar release IDs numerically (date, then index) using
-#     the org.opencontainers.image.version label of the image currently tagged `latest`. A `latest`
+# recorded for it. The script moves `latest` only when all of these hold:
+#   - the release tag <release-id> resolves to --digest;
+#   - `latest` does not exist, or the image it points to is older than this release. "Older"
+#     compares the calendar release IDs numerically (date, then index) using the
+#     org.opencontainers.image.version label of the image currently tagged `latest`. A `latest`
 #     whose version label is missing or is not a calendar release ID is treated as older and is
-#     replaced; the log says so.
+#     replaced; the log says so;
+#   - just before the write, the image at --digest carries the version label <release-id>.
 #
-# Outcomes: `latest` already points at --digest (no write); `latest` is newer than this release
-# (no write, exit 0, so re-running an old release cannot move it backwards); `latest` is moved and
-# re-read to confirm it resolves to --digest. A registry error, an image that cannot be inspected,
-# a `latest` that carries this very release ID but another digest, or a final digest that is not
-# --digest fails the script; the first three change nothing.
+# Outcomes. Exit 0, nothing written:
+#   - `latest` already is --digest;
+#   - `latest` is a newer release (a notice is logged), so re-running an old release cannot move
+#     it backwards.
+# Exit 0, `latest` written: it was missing or older, and it was re-read and resolves to --digest.
+# Exit 1, nothing written:
+#   - the release tag is missing, or does not resolve to --digest;
+#   - a registry lookup, pull or inspect fails (a failure is never read as "missing" or "older");
+#   - `latest` carries this very release ID under another digest;
+#   - `latest` carries a calendar ID newer than this release that is not a release tag of this
+#     repository (or is one with another digest): it is ahead of every real release, so it would
+#     block every later move and needs a maintainer's attention;
+#   - the image at --digest does not carry the version label <release-id>.
+# Exit 1, after the write attempt: the copy failed, or `latest` cannot be read back or does not
+# resolve to --digest.
 #
 # The tag is written by copying the manifest (an image or an image index, as published) by digest,
 # so `latest` has exactly the digest of the release tag. That is why signatures and provenance,
@@ -96,8 +105,6 @@ image_version() {
   docker pull "$1" >/dev/null || return 1
   local version
   version=$(docker inspect "$1" --format '{{ with .Config.Labels }}{{ index . "org.opencontainers.image.version" }}{{ end }}') || return 1
-  # Some Docker versions print this for a missing key.
-  [ "$version" != '<no value>' ] || version=
   printf '%s\n' "$version"
 }
 
@@ -106,6 +113,17 @@ parse_calendar_id() {
   [[ $1 =~ $calendar_re ]] || return 1
   id_date=$((10#${BASH_REMATCH[1]}))
   id_seq=$((10#${BASH_REMATCH[2]}))
+}
+
+# Refuses an image whose version label is not this release; called just before the write.
+check_candidate() {
+  local version
+  version=$(image_version "$image@$digest") || exit 1
+  if [ "$version" != "$release_id" ]; then
+    printf 'image %s@%s has version label "%s", not %s; refusing to move %s\n' \
+      "$image" "$digest" "$version" "$release_id" "$latest_tag" >&2
+    exit 1
+  fi
 }
 
 # The release must already be published, consistently, under its release tag.
@@ -124,17 +142,6 @@ if [ "$release_digest" != "$digest" ]; then
     "$image" "$release_id" "$release_digest" "$digest" "$latest_tag" >&2
   exit 1
 fi
-# Refuses an image whose version label is not this release; called just before the write.
-check_candidate() {
-  local version
-  version=$(image_version "$image@$digest") || exit 1
-  if [ "$version" != "$release_id" ]; then
-    printf 'image %s@%s has version label "%s", not %s; refusing to move %s\n' \
-      "$image" "$digest" "$version" "$release_id" "$latest_tag" >&2
-    exit 1
-  fi
-}
-
 parse_calendar_id "$release_id"
 release_date=$id_date
 release_seq=$id_seq
@@ -146,15 +153,28 @@ if current_digest=$(lookup_digest "$latest_tag"); then
   fi
   current_version=$(image_version "$image@$current_digest") || exit 1
   if parse_calendar_id "$current_version"; then
+    current_date=$id_date
+    current_seq=$id_seq
     if [ "$current_version" = "$release_id" ]; then
       printf '%s:%s is %s and carries release ID %s, but this release is %s; leaving it alone\n' \
         "$image" "$latest_tag" "$current_digest" "$current_version" "$digest" >&2
       exit 1
     fi
-    if [ "$id_date" -gt "$release_date" ] || { [ "$id_date" -eq "$release_date" ] && [ "$id_seq" -gt "$release_seq" ]; }; then
-      printf '::notice::%s:%s is release %s, newer than %s; not moving it backwards\n' \
-        "$image" "$latest_tag" "$current_version" "$release_id"
-      exit 0
+    if [ "$current_date" -gt "$release_date" ] || { [ "$current_date" -eq "$release_date" ] && [ "$current_seq" -gt "$release_seq" ]; }; then
+      # Newer is normal when an older release's job is re-run, but only if it is a real release.
+      if newer_digest=$(lookup_digest "$current_version"); then
+        if [ "$newer_digest" = "$current_digest" ]; then
+          printf '::notice::%s:%s is release %s, newer than %s; not moving it backwards\n' \
+            "$image" "$latest_tag" "$current_version" "$release_id"
+          exit 0
+        fi
+      else
+        status=$?
+        [ "$status" -eq 3 ] || exit "$status"
+      fi
+      printf '::warning::%s:%s (%s) is labelled %s, newer than %s, but %s is not a release tag of %s with that digest. It would block every later move; a maintainer must look at it (see RELEASING.md, Moving the latest tag).\n' \
+        "$image" "$latest_tag" "$current_digest" "$current_version" "$release_id" "$current_version" "$image" >&2
+      exit 1
     fi
     printf '%s:%s is release %s (%s); moving it forward to %s (%s)\n' \
       "$image" "$latest_tag" "$current_version" "$current_digest" "$release_id" "$digest"

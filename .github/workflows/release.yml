@@ -81,6 +81,9 @@ jobs:
       - name: Run latest tag move tests
         run: bash scripts/move-latest-tag_test.sh
 
+      - name: Run published release digest tests
+        run: bash scripts/published-release-digests_test.sh
+
       - name: Run release-metadata.json tests
         run: bash scripts/validate-release-metadata_test.sh
 
@@ -657,14 +660,11 @@ jobs:
           dir="$RUNNER_TEMP/published-release-metadata"
           mkdir "$dir"
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern release-metadata.json --dir "$dir"
-          bash scripts/validate-release-metadata.sh "$dir/release-metadata.json"
-          if [ "$(jq -r .release_id "$dir/release-metadata.json")" != "$RELEASE_ID" ]; then
-            echo "release-metadata.json is for another release than $RELEASE_ID" >&2
-            exit 1
-          fi
-          printf 'connector_digest=%s\n' "$(jq -r .connector_image_digest "$dir/release-metadata.json")" >> "$GITHUB_OUTPUT"
-          gitsync_digest=$(jq -r '.git_sync_image_digest // empty' "$dir/release-metadata.json")
-          printf 'gitsync_digest=%s\n' "$gitsync_digest" >> "$GITHUB_OUTPUT"
+          # Prints connector_digest= and gitsync_digest= (empty without a git-sync image), and nothing
+          # for a file that is invalid or belongs to another release.
+          digests=$(bash scripts/published-release-digests.sh --metadata "$dir/release-metadata.json" --release-id "$RELEASE_ID")
+          printf '%s\n' "$digests" >> "$GITHUB_OUTPUT"
+          gitsync_digest=$(sed -n 's/^gitsync_digest=//p' <<<"$digests")
           if [ -z "$gitsync_digest" ]; then
             echo "::notice::The git-sync image was not published for release $RELEASE_ID, so its latest tag is left as it is."
           fi
