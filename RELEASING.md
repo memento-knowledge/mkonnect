@@ -14,7 +14,7 @@ Create these public ECR repositories in `us-east-1` before the first release:
 
 Without `memento-gitsync` the git-sync job fails, which is tolerated (see below) but means no git-sync image is published.
 
-Amazon ECR Public does not offer a repository tag-immutability setting. The workflow protects release tags by reconciling existing artifacts only when their version, revision label, and digest agree. Do not manually overwrite a published release tag.
+Amazon ECR Public does not offer a repository tag-immutability setting. The workflow protects release tags by reconciling existing artifacts only when their version, revision label, and digest agree. Do not manually overwrite a published release tag. The one tag that moves, by design and only forward, is `latest` (see [Moving the latest tag](#moving-the-latest-tag)).
 
 Set the public registry alias as a GitHub Actions repository variable:
 
@@ -57,7 +57,7 @@ Whether the git-sync image counts as published is decided by the digest the git-
 - Two edges remain, and neither affects the connector release. The release-ID tag is pushed first, so if the `sha-` tag push fails after it, the release-ID tag stays in the registry. While the GitHub Release is still a draft, a re-run completes the partial git-sync release from that tag. After the release is published, do not re-run the workflow: the stray release-ID tag stays, and the next release publishes git-sync again. If both pushes succeed but the job then fails (for example the final digest lookup fails or the timeout hits), the metadata records the git-sync image as not published while a tag exists. Installers key off `release-metadata.json`, so the stray tag is unused.
 - The connector image, the Helm chart, and the GitHub Release are published as usual. The release notes state that the git-sync image was not published, and the git-sync fields in `release-metadata.json` are `null`.
 - Both images use the same reconcile rules: an existing tag is accepted only when its version and revision labels match the release and its digest agrees with the other tag. The logic lives in `scripts/reconcile-image-tags.sh` and is tested by `scripts/reconcile-image-tags_test.sh`.
-- A published GitHub Release cannot be re-run. A release published without a git-sync image stays that way; the next release publishes it again. Do not create git-sync tags by hand.
+- A published GitHub Release cannot be re-run (the one exception is the `move-latest` job, see [Moving the latest tag](#moving-the-latest-tag)). A release published without a git-sync image stays that way; the next release publishes it again. Do not create git-sync tags by hand.
 - Re-running is only for a release that is still a draft. Use "Re-run failed jobs" by default. "Re-run all jobs" is also accepted, but it re-runs the git-sync job too: if that job hits a transient error on the re-run, the regenerated metadata has `null` git-sync fields, and on a draft that replaces metadata which had recorded a published git-sync image (the image tags stay in the registry). See [Release metadata](#release-metadata).
 - Do not publish the draft GitHub Release by hand while a workflow run is in progress: the workflow checks that the release is still a draft before it changes anything, and a manual publish between that check and its next step is not detected.
 
@@ -91,6 +91,41 @@ gh attestation verify "oci://public.ecr.aws/h2a8k0r3/memento-gitsync@$digest" \
 ```
 
 A release published without signatures stays that way, as with the git-sync image: the next release is signed. Re-running a published release's workflow is not supported (see above). `scripts/sign-image.sh` is idempotent, though: it first checks whether a signature by the expected identity already verifies and signs only if not, so a future signing-only workflow can call it safely.
+
+## Moving the latest tag
+
+Tag policy:
+
+- **Release-ID tags are never moved.** `YYYYMMDD.n` and `sha-<release commit>` tags, on both images, are written once and never overwritten, retagged, or deleted.
+- **`latest` is the one moving tag, and a convenience for first installs.** After each release is published, the release workflow moves `latest` on both `memento-connector` and `memento-gitsync` forward to that release's image. It is never moved backwards.
+- **Production installs should not use `latest`.** Pin by digest (from `release-metadata.json`) or by release ID, so that a new release is something you choose to take.
+- **Signatures and provenance are by digest.** Verify by digest, never by tag (see [Image signatures and provenance](#image-signatures-and-provenance)). Moving `latest` copies the release's manifest under another name, so the digest, its signature, and its provenance are unchanged. `latest` is independent of signing: the `move-latest` job does not wait for `sign-images`, so for a while, or for good if signing failed, `latest` can point at an image that has no signature yet.
+
+The `move-latest` job runs after the `publish` job, which means after the GitHub Release is published and `release-metadata.json` is final. It reads that published file and takes the digests only from it, so the connector image always moves, and the git-sync image moves only when its digests in the file are not `null`. A failed or skipped git-sync build never creates or moves `memento-gitsync:latest`, and never affects the connector's. Each image moves in its own step. `scripts/move-latest-tag.sh` moves one repository and changes nothing unless all of these hold:
+
+- the release-ID tag resolves to the recorded digest, and the image at that digest carries the matching version label;
+- `latest` is missing, or points at an older release. Releases compare as calendar IDs, numerically (`20261114.10` is newer than `20261114.9`), using the `org.opencontainers.image.version` label of the image `latest` points at. A `latest` whose label is missing or is not a calendar ID (an unrelated, older push) counts as older and is replaced; the log says so;
+- `latest` does not already carry the same release ID under a different digest (that is reported as a conflict and left alone).
+
+The label is read by pulling the image on the runner, so a `latest` that cannot be pulled there (for example one without a `linux/amd64` manifest) fails the step instead of being replaced; fix it by hand only with the maintainers' agreement, or let the failure stand until it is resolved. A `latest` that already is the release's digest is left alone, and a `latest` that is newer is left alone and the step succeeds, so re-running an older release's job cannot move it backwards. The script writes the tag by copying the manifest by digest, then re-reads `latest` and fails unless it resolves to the release's digest. Moves are serialised across releases (job-level `concurrency`), so a newer and an older release cannot interleave their read and write. GitHub keeps one running and one queued job per group, so if a third job is queued, the queued one is cancelled and its release does not move `latest`, with no warning from the cancelled job. A `move-latest` job shown as cancelled therefore needs a re-run; re-run the newest release's job, since an older one is refused once `latest` is newer. A `latest` carrying a calendar ID newer than any release (for example one pushed by hand) makes every move a no-op that logs a notice, so do not push such a tag.
+
+The job is best effort, like signing: it is marked `continue-on-error`, so a failure shows as a warning annotation and never blocks or undoes a release. It does not hold a matched pair: if the git-sync image was not published for a release, `memento-gitsync:latest` stays at an earlier release (or does not exist yet) while `memento-connector:latest` has moved. To retry after a failure, re-run only the `move-latest` job ("Re-run this job"; GitHub allows re-runs for 30 days after a run, and after that the next release moves `latest`). This is the one exception to the rule against re-running a published release's workflow: do not re-run the whole workflow or its other jobs (see above); the job reads the published release, so it does not need them.
+
+Verify `latest` against a release's `release-metadata.json` (the release ID and the digests are the ones the file records; the git-sync part applies when its digest is not `null`):
+
+```bash
+registry=public.ecr.aws/h2a8k0r3
+connector_digest=$(jq -r .connector_image_digest release-metadata.json)
+git_sync_digest=$(jq -r '.git_sync_image_digest // empty' release-metadata.json)
+docker buildx imagetools inspect "$registry/memento-connector:latest" | awk '/^Digest:/ { print $2 }'
+echo "$connector_digest"
+if [ -n "$git_sync_digest" ]; then
+  docker buildx imagetools inspect "$registry/memento-gitsync:latest" | awk '/^Digest:/ { print $2 }'
+  echo "$git_sync_digest"
+fi
+```
+
+For the newest release each pair of lines must be identical. If `latest` shows an older digest, the job failed (look for its warning) or the release is not the newest; the version label tells which: pull `"$registry/memento-connector:latest"` and read `org.opencontainers.image.version` with `docker inspect`, as in [Verify a release](#verify-a-release).
 
 ## Release metadata
 
@@ -220,4 +255,4 @@ The change takes effect for the next release tag. Images that were already publi
 
 ## Recover safely
 
-The workflow can safely complete a partial release only when an existing artifact matches the release version, source revision, and digest. This covers both container images, the chart, and `release-metadata.json`. If it reports a conflict, do not overwrite, delete, or retag an artifact. Fix the cause in a PR, increment the patch version, and create a new annotated tag.
+The workflow can safely complete a partial release only when an existing artifact matches the release version, source revision, and digest. This covers both container images, the chart, and `release-metadata.json`. If it reports a conflict, do not overwrite, delete, or retag an artifact (`latest` is moved only by the workflow, as described in [Moving the latest tag](#moving-the-latest-tag)). Fix the cause in a PR, increment the patch version, and create a new annotated tag.
