@@ -4,6 +4,29 @@ Once the connector is [installed and connected](installation.md), this guide sho
 your internal tools (Jenkins, Prometheus, a build service, …) reachable through it, including how
 to attach credentials safely.
 
+## Set your values once
+
+The Kubernetes commands in this guide read the namespace of your connector's release from the
+shell variable `NAMESPACE`, so you can copy them as written. Set it in the Bash or Zsh session you
+run them from, to the namespace you used when you [installed the
+connector](installation.md#use-one-namespace-for-every-command). It lasts only for the current
+session, so set it again in a new one: a `helm` or `kubectl` command with an empty namespace
+silently uses your current context's namespace.
+
+(If you use Zsh, run `setopt interactivecomments` once first, so that the `#` comments in the
+commands are ignored as they are in Bash.)
+
+```bash
+# Kubernetes only: the namespace of the connector's release.
+NAMESPACE=mkonnect
+```
+
+The commands that change a Helm value read the chart version you run from `helm list` (they need
+`jq`; see [Choosing a release](installation.md#choosing-a-release)), so that they do not move the
+release to a newer chart as a side effect. The connector CLI
+commands use a small `mkonnect_exec` function, defined under
+[Running the connector CLI](#running-the-connector-cli).
+
 ## How the connector reaches a tool
 
 The platform addresses each tool by a **plugin name** (an opaque label like `jenkins` or
@@ -105,10 +128,11 @@ no `exec` is involved. The file can hold credentialed and anonymous entries side
 
 The Secret must exist in the release's namespace before the pod starts: the volume is not
 optional, so a missing Secret leaves the pod in `ContainerCreating`, which has no logs;
-`kubectl describe pod --namespace <namespace> <pod>` shows the reason. A file that is not valid
+`kubectl describe pods --namespace "$NAMESPACE" --selector app.kubernetes.io/name=mkonnect` shows
+the reason. A file that is not valid
 JSON, or that holds an entry with an invalid credential or option, stops the connector at startup
 with a `creds store load failed` error and the pod restarts repeatedly; read
-`kubectl logs --previous deployment/mkonnect --namespace <namespace>` to see which entry is
+`kubectl logs --previous deployment/mkonnect --namespace "$NAMESPACE"` to see which entry is
 rejected. A malformed `base_url` is not checked at startup: requests and **Test connection** for
 that tool fail with an `invalid base URL` error instead.
 
@@ -124,18 +148,24 @@ plugins:
   jenkins: http://jenkins.internal:8080
 ```
 
-Put the same setting in the install command, or add it to a running release:
+Put the same setting in the install command, or add it to a running release. This command only
+changes a value, so it first reads the chart version you run into `CHART_VERSION` and keeps the
+release on it; without `--version`, Helm would also move the release to the newest chart. If the release
+has [git-sync](git-sync.md) enabled, use `--reset-then-reuse-values` instead of `--reuse-values`
+(see the [git-sync Helm notes](git-sync.md#option-b-kubernetes-helm)):
 
 ```bash
+CHART_VERSION=$(helm list --namespace "${NAMESPACE:?set NAMESPACE}" --filter '^mkonnect$' --output json | jq -r '.[0].chart // empty | sub("^mkonnect-"; "")')
 helm upgrade mkonnect oci://public.ecr.aws/h2a8k0r3/mkonnect \
-  --namespace <namespace> --version <chart-version> --reuse-values \
+  --namespace "$NAMESPACE" --version "${CHART_VERSION:?could not read the installed chart version; check NAMESPACE}" \
+  --reuse-values \
   --set plugins.jenkins=http://jenkins.internal:8080
 ```
 
 The value must be an absolute `http` or `https` URL with no userinfo, query parameters or
 fragment. The connector validates every `PLUGIN_*` value at startup and exits with a
 `plugin registry load failed` error if one is malformed, so if the pod restarts repeatedly after a
-change, read `kubectl logs --previous deployment/mkonnect --namespace <namespace>`.
+change, read `kubectl logs --previous deployment/mkonnect --namespace "$NAMESPACE"`.
 
 ### If a name is defined in more than one place
 
@@ -160,13 +190,13 @@ Neither path needs `exec` to take effect:
   nothing that restarts the pod when the Secret changes. Restart the workload:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect --namespace <namespace>
+  kubectl rollout restart deployment/mkonnect --namespace "${NAMESPACE:?set NAMESPACE}"
   ```
 
   This needs permission to patch Deployments, not `pods/exec`.
 
 To check the result without `exec`, read the connector's logs
-(`kubectl logs deployment/mkonnect --namespace <namespace>`, which needs `pods/log`) and use
+(`kubectl logs deployment/mkonnect --namespace "$NAMESPACE"`, which needs `pods/log`) and use
 **Test connection**, as described in [Verify a tool from the portal](#verify-a-tool-from-the-portal).
 
 ## How your credentials are stored
@@ -217,7 +247,7 @@ restrictive permissions outside your checkout and remove it after the Secret has
    EOF
    # Replace the REPLACE_WITH_* placeholders in a local editor; do not paste a real token into this shell block.
    ${EDITOR:-vi} "$credentials_file"
-   kubectl create secret generic mkonnect-tool-creds --namespace <namespace> \
+   kubectl create secret generic mkonnect-tool-creds --namespace "${NAMESPACE:?set NAMESPACE}" \
      --from-file=credentials.json="$credentials_file" \
      && rm "$credentials_file"
    ```
@@ -248,7 +278,7 @@ The chart then mounts the Secret **read-only** at `/etc/mkonnect/credentials.jso
 the non-root connector can read it via its `fsGroup`) and sets `CREDS_FILE` accordingly. Because the
 mount is read-only, `connector config set` cannot write there — manage credentials by updating the
 Secret and restarting the workload
-(`kubectl rollout restart deployment/mkonnect --namespace <namespace>`). Leaving
+(`kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"`). Leaving
 `credentials.secretName` empty keeps the default behavior (a writable `/data/credentials.json` you
 manage with the CLI).
 
@@ -271,12 +301,14 @@ Configure it one of two ways:
 - **Globally** — set `CA_BUNDLE` to the absolute path of the PEM file (the Helm chart
   does this for you when you mount a bundle, below). It applies to every tool that does
   not set its own.
-- **Per tool** — set `--ca-bundle <absolute-path>` on `connector config set`, or the
+- **Per tool** — set `--ca-bundle` (to an absolute path) on `connector config set`, or the
   `ca_bundle` field in the credentials file. A per-tool bundle overrides the global one
   for that tool.
 
+(Define `mkonnect_exec` first, as described in [Running the connector CLI](#running-the-connector-cli).)
+
 ```bash
-<exec> connector config set gitscm \
+mkonnect_exec connector config set gitscm \
   --base-url https://gitscm.internal \
   --auth bearer --token-stdin \
   --ca-bundle /etc/mkonnect-ca/ca-bundle.pem
@@ -284,8 +316,8 @@ Configure it one of two ways:
 
 The path must be **absolute** (the long-running connector resolves it with its own
 working directory). As with other credential changes, a running connector caches this in
-memory: reload it (`docker kill -s HUP <container>` or
-`kubectl rollout restart deployment/mkonnect --namespace <namespace>`) to apply a new or rotated
+memory: reload it (`docker kill -s HUP mkonnect` or
+`kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"`) to apply a new or rotated
 bundle — see
 [Applying changes](#applying-changes).
 
@@ -306,7 +338,7 @@ wiring consistent with the credential mount. Create a Secret holding the PEM bun
 point the chart at it:
 
 ```bash
-kubectl create secret generic mkonnect-ca --namespace <namespace> \
+kubectl create secret generic mkonnect-ca --namespace "${NAMESPACE:?set NAMESPACE}" \
   --from-file=ca-bundle.pem=/path/to/internal-ca-bundle.pem
 ```
 
@@ -330,18 +362,29 @@ executable. Because `docker exec` and `kubectl exec` bypass the image's entrypoi
 invoke the binary by its path — `/mkonnect connector ...`. Running `connector` on its own fails
 with `executable file not found in $PATH`.
 
-Run it inside the already-running container:
+Run it inside the already-running container. Define a small shell function once, so that the
+examples below read `mkonnect_exec connector ...`. Run only the definition that matches how you
+installed the connector (the Bash or Zsh session keeps it until you close it, so define it again in
+a new one).
 
-- **Docker:** `docker exec -i mkonnect /mkonnect connector ...`
-- **Kubernetes:** `kubectl exec -i --namespace <namespace> <pod> -- /mkonnect connector ...`
+**Docker** (change `mkonnect` if your container has another name):
+
+```bash
+mkonnect_exec() { docker exec -i mkonnect /mkonnect "$@"; }
+```
+
+**Kubernetes** (`kubectl exec` picks a pod of the `mkonnect` Deployment, for a release named
+`mkonnect`; `NAMESPACE` is set as in [Set your values once](#set-your-values-once)):
+
+```bash
+mkonnect_exec() { kubectl exec -i --namespace "${NAMESPACE:?set NAMESPACE}" deploy/mkonnect -- /mkonnect "$@"; }
+```
 
 If your cluster does not allow `pods/exec`, see
 [Configuring tools without `kubectl exec`](#configuring-tools-without-kubectl-exec).
 
-Replace `mkonnect` / `<pod>` with your container name or pod, and `<namespace>` with the
-namespace of the release. The examples below use `<exec>`
-for whichever prefix above applies to you, so each command reads `<exec> connector ...`. The `-i`
-(interactive) flag matters: tokens are read from **stdin**, never from a command-line flag.
+The `-i` (interactive) flag in both definitions matters: tokens are read from **stdin**, never
+from a command-line flag.
 
 ## Configure an unauthenticated tool
 
@@ -349,7 +392,7 @@ For an open endpoint like a Prometheus with no auth, either set a `PLUGIN_<NAME>
 install time, or register it with the CLI (base URL only):
 
 ```bash
-<exec> connector config set prometheus --base-url http://prometheus.internal:9090
+mkonnect_exec connector config set prometheus --base-url http://prometheus.internal:9090
 ```
 
 ### Reaching a tool from Docker
@@ -358,12 +401,12 @@ With Docker's normal bridge networking, the base URL is resolved from mkonnect's
 In particular, `localhost` means the mkonnect container itself, not the Docker host where you ran
 the command.
 
-- For a tool running on the Docker host, use `http://host.docker.internal:<port>` on Docker
+- For a tool running on the Docker host, use `http://host.docker.internal:8080` (with your tool's port) on Docker
   Desktop (macOS or Windows). On Linux, add
   `--add-host host.docker.internal:host-gateway` to the `docker run` command that starts mkonnect,
   then use the same URL.
 - On Linux, `--network host` is an alternative when your deployment policy permits it. In that mode
-  `http://localhost:<port>` reaches the Docker host. Use the same network option whenever you
+  `http://localhost:8080` (with your tool's port) reaches the Docker host. Use the same network option whenever you
   recreate mkonnect, including when removing the registration token.
 - For a tool in another container, attach both containers to the same user-defined Docker network
   and use that container's network alias in the base URL. For example:
@@ -371,8 +414,10 @@ the command.
   ```bash
   docker network create mkonnect-tools
   docker network connect mkonnect-tools mkonnect
-  docker network connect --alias jenkins mkonnect-tools <jenkins-container>
+  docker network connect --alias jenkins mkonnect-tools "${TOOL_CONTAINER:?set TOOL_CONTAINER to the name of the tool container}"
   ```
+
+  Set `TOOL_CONTAINER` to the name of the tool's container first (it is the name `docker ps` shows).
 
   The tool is then reachable at `http://jenkins:8080` if it listens on port 8080. Do not rely on
   Docker's default bridge network for container-name DNS. Reattach mkonnect to this network after
@@ -385,10 +430,19 @@ appears in the process list or your shell history. Grafana (service-account toke
 only as an example of such a tool:
 
 ```bash
+printf 'Paste the Grafana token: ' >&2
+IFS= read -r -s GRAFANA_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
+printf '\n' >&2
 printf %s "$GRAFANA_TOKEN" | \
-  <exec> connector config set grafana \
+  mkonnect_exec connector config set grafana \
     --base-url http://grafana.internal:3000 \
     --auth bearer --token-stdin
+unset GRAFANA_TOKEN
 ```
 
 The connector will add `Authorization: Bearer <token>` to each request it forwards to `grafana`.
@@ -403,11 +457,29 @@ REST API authenticates with HTTP Basic — your Jenkins username plus an API tok
 password — and does **not** accept `Authorization: Bearer`. Configuring Jenkins as a bearer tool
 makes every request fail with `401`/`403` even though the connector shows as connected.
 
+Set your Jenkins username first:
+
 ```bash
+JENKINS_USERNAME=''
+: "${JENKINS_USERNAME:?put your Jenkins username between the quotes on the line above}"
+```
+
+Then read the API token:
+
+```bash
+printf 'Paste the Jenkins API token: ' >&2
+IFS= read -r -s JENKINS_API_TOKEN
+```
+
+Enter the token at the prompt, then run the rest (a separate block, so that pasting cannot feed it to the prompt):
+
+```bash
+printf '\n' >&2
 printf %s "$JENKINS_API_TOKEN" | \
-  <exec> connector config set jenkins \
+  mkonnect_exec connector config set jenkins \
     --base-url http://jenkins.internal:8080 \
-    --auth basic --username "$JENKINS_USERNAME" --token-stdin
+    --auth basic --username "${JENKINS_USERNAME:?set JENKINS_USERNAME}" --token-stdin
+unset JENKINS_API_TOKEN
 ```
 
 The connector adds the `Authorization: Basic …` header, encoding `username:token` locally — here
@@ -425,9 +497,11 @@ the Jenkins API token is the `token` and is sent as the password.
 ## Manage configured tools
 
 ```bash
-<exec> connector config list      # base URLs; credentials shown masked
-<exec> connector status           # this connector's configured plugins
-<exec> connector config remove jenkins
+# Base URLs; credentials are shown masked:
+mkonnect_exec connector config list
+# This connector's configured plugins:
+mkonnect_exec connector status
+mkonnect_exec connector config remove jenkins
 ```
 
 Credentials are never printed back — `list` shows the auth mode and masks the secret.
@@ -448,7 +522,7 @@ own — you must tell it to reload:
   the private key persists on the volume, so it reconnects immediately:
 
   ```bash
-  kubectl rollout restart deployment/mkonnect --namespace <namespace>
+  kubectl rollout restart deployment/mkonnect --namespace "${NAMESPACE:?set NAMESPACE}"
   ```
 
 Either way the connector then pushes a fresh status report to the portal. Restarting the Docker
@@ -481,7 +555,7 @@ or search endpoint on a slow self-managed instance). Raise the timeout **per too
 `--upstream-timeout`, a Go duration with a unit between `1s` and `10m`:
 
 ```bash
-<exec> connector config set gitscm \
+mkonnect_exec connector config set gitscm \
   --base-url https://scm.internal \
   --auth bearer --token-stdin \
   --upstream-timeout 2m
@@ -491,7 +565,7 @@ For an unauthenticated (`PLUGIN_<NAME>`) tool, register a credential entry with 
 and the timeout — it needs no `--auth`:
 
 ```bash
-<exec> connector config set reports --base-url http://reports.internal:8080 --upstream-timeout 45s
+mkonnect_exec connector config set reports --base-url http://reports.internal:8080 --upstream-timeout 45s
 ```
 
 Omitting the flag keeps the 10 s default; the equivalent in a mounted Secret is the
@@ -522,7 +596,7 @@ See the [project README's Limits section](../README.md#limits) for the connector
 | `auth_failure` (401/403) | The tool rejected the credential. Re-check the token/username and re-run `connector config set` (or update the mounted Secret and restart the workload). For bearer tools, confirm the token has the needed scopes. |
 | `unreachable` | The connector couldn't open a connection to the base URL. Confirm the URL and port are correct and reachable from the connector's network location, and that DNS resolves. For Docker, remember that `localhost` is the connector container; see [Reaching a tool from Docker](#reaching-a-tool-from-docker). Diagnostics are intentionally coarse (no internal addresses are sent to the platform). |
 | `timeout` | The tool accepted the connection but didn't respond in time. Check the tool's health and any intermediate proxy. If the tool is simply slow (large commits, a slow self-managed instance), raise its request timeout — see [Tuning the upstream timeout](#tuning-the-upstream-timeout). (The **Test connection** probe itself uses a fixed timeout and is not affected by that setting.) |
-| Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace <namespace>` (Kubernetes). See [Applying changes](#applying-changes). |
+| Credential change didn't take effect | The running connector caches credentials in memory. Reload it after a change: `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"` (Kubernetes). See [Applying changes](#applying-changes). |
 | A credentialed tool is unreachable but a proxy is set | Requests that carry a **local credential** deliberately bypass ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`, so the token goes straight to the tool rather than to a proxy. Ensure the connector has *direct* network access to the tool's host. (Unauthenticated `PLUGIN_<NAME>` requests still honor the ambient proxy settings.) |
 
 For connector-level connection problems (the bridge itself showing degraded), see the
