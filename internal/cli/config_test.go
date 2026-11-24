@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/memento-knowledge/mkonnect/internal/cli"
+	"github.com/memento-knowledge/mkonnect/internal/creds"
 )
 
 // noStdin is the stdin reader for tests that don't use --token-stdin.
@@ -218,16 +219,22 @@ func TestConfigSetTokenStdinEmpty(t *testing.T) {
 
 func TestConfigSetRejectsShortTokenWithoutLeakingIt(t *testing.T) {
 	tests := []struct {
-		name string
-		args []string
+		name    string
+		args    []string
+		token   string
+		wantErr string
 	}{
 		{
-			name: "bearer",
-			args: []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "bearer", "--token-stdin"},
+			name:    "bearer",
+			args:    []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "bearer", "--token-stdin"},
+			token:   "fifteen-chars-x",
+			wantErr: "token must be at least 16",
 		},
 		{
-			name: "basic",
-			args: []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "basic", "--username", "local-user", "--token-stdin"},
+			name:    "basic",
+			args:    []string{"config", "set", "service", "--base-url", "https://service.internal", "--auth", "basic", "--username", "local-user", "--token-stdin"},
+			token:   "nine-char",
+			wantErr: "password must be at least 10",
 		},
 	}
 
@@ -235,20 +242,36 @@ func TestConfigSetRejectsShortTokenWithoutLeakingIt(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			credsPath := filepath.Join(t.TempDir(), "credentials.json")
 			t.Setenv("CREDS_FILE", credsPath)
-			const token = "short-token"
 
 			var stdout bytes.Buffer
-			err := cli.Run(tt.args, strings.NewReader(token), &stdout)
-			if err == nil || !strings.Contains(err.Error(), "at least 16") {
-				t.Fatalf("expected minimum-token-length error, got %v", err)
+			err := cli.Run(tt.args, strings.NewReader(tt.token), &stdout)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected %q error, got %v", tt.wantErr, err)
 			}
-			if strings.Contains(err.Error(), token) || strings.Contains(stdout.String(), token) {
+			if strings.Contains(err.Error(), tt.token) || strings.Contains(stdout.String(), tt.token) {
 				t.Fatal("short token must not be repeated in an error or output")
 			}
 			if _, err := os.Stat(credsPath); !os.IsNotExist(err) {
 				t.Fatalf("credential file was created after rejected token: %v", err)
 			}
 		})
+	}
+}
+
+func TestConfigSetAcceptsBasicPasswordAtMinimumLength(t *testing.T) {
+	credsPath := filepath.Join(t.TempDir(), "credentials.json")
+	t.Setenv("CREDS_FILE", credsPath)
+	password := strings.Repeat("p", creds.MinBasicPasswordLength)
+
+	var stdout bytes.Buffer
+	if err := cli.Run([]string{"config", "set", "service",
+		"--base-url", "https://service.internal",
+		"--auth", "basic", "--username", "local-user", "--token-stdin"},
+		strings.NewReader(password), &stdout); err != nil {
+		t.Fatalf("config set basic with a %d-character password: %v", creds.MinBasicPasswordLength, err)
+	}
+	if strings.Contains(stdout.String(), password) {
+		t.Fatal("password must not appear in output")
 	}
 }
 

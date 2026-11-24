@@ -157,7 +157,7 @@ mkonnect_exec connector config remove jenkins
 mkonnect_exec connector status
 ```
 
-If your cluster does not allow `kubectl exec`, see [Configuring tools without `kubectl exec`](docs/setup.md#configuring-tools-without-kubectl-exec). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"` (Kubernetes; the distroless image has no shell to signal PID 1). Tokens must be at least 16 characters and are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
+If your cluster does not allow `kubectl exec`, see [Configuring tools without `kubectl exec`](docs/setup.md#configuring-tools-without-kubectl-exec). Invoking a bare `connector` fails with `executable file not found in $PATH`. The running connector caches credentials in memory, so reload it after a change — `docker kill -s HUP mkonnect` (Docker) or `kubectl rollout restart deployment/mkonnect --namespace "$NAMESPACE"` (Kubernetes; the distroless image has no shell to signal PID 1). Bearer tokens must be at least 16 characters and basic-auth passwords at least 10; both are accepted only through `--token-stdin`; `--token` is rejected to prevent exposure through command arguments and shell history. See the [Setup guide](docs/setup.md) for the full walkthrough.
 
 ## Releases
 

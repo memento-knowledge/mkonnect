@@ -258,7 +258,7 @@ restrictive permissions outside your checkout and remove it after the Secret has
    [Use one namespace for every command](installation.md#use-one-namespace-for-every-command)).
 
    Each entry's fields are the same as the CLI options: `base_url` (required), `auth` (`bearer`,
-   `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters), an
+   `basic`, or omit for none), `username` (basic auth only), `token` (at least 16 characters for bearer, 10 for basic), an
    optional `strip_headers` (a list of extra inbound headers to drop — see below), an optional
    `strip_query_params` (a list of extra inbound query-parameter names to drop — see below), an
    optional `ca_bundle` (an absolute path to a PEM bundle of extra root CA(s) to trust for this tool's
@@ -286,8 +286,9 @@ manage with the CLI).
 
 An on-prem tool often presents a TLS certificate signed by an **internal certificate
 authority** rather than a public one. By default the connector verifies upstream TLS
-against the host's system trust store, so such a certificate fails verification and the
-tool is unreachable. Point the connector at a PEM bundle of your internal CA(s) and it
+against the system trust store **built into its container image**, so such a certificate fails
+verification and the tool is unreachable. The container does not read the trust store of the host it
+runs on: installing your CA on the host has no effect on the connector. Point the connector at a PEM bundle of your internal CA(s) and it
 trusts them **in addition to** the system roots.
 
 The connector **never disables TLS verification.** There is deliberately no
@@ -330,6 +331,33 @@ and the CA bundle is applied there too — including to the TLS connection to an
 CA must also be in the bundle (or the system store). The connection test shown in the
 portal verifies the same way, so a tool reachable at runtime reports `connected` rather
 than a TLS failure.
+
+### Mounting the CA bundle (Docker)
+
+Save the bundle as a PEM file on the host. Include the root certificate and any intermediate
+certificates your servers do not send, and the CA of every tool that uses the bundle: tools on
+different networks are often signed by different internal CAs. Then recreate the container with
+the file mounted read-only. Add the `-v` line to the command you use for upgrades (see
+[Upgrading](installation.md#upgrading)), keeping any networking option you used at installation:
+
+```bash
+mkonnect_config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mkonnect"
+mkonnect_ca_file=/path/to/internal-ca-bundle.pem
+mkonnect_image=public.ecr.aws/h2a8k0r3/memento-connector:${RELEASE_ID:-latest}
+docker pull "$mkonnect_image" &&
+docker rm -f mkonnect &&
+docker run -d --name mkonnect --restart unless-stopped \
+  -v mkonnect-data:/data \
+  -v "${mkonnect_ca_file:?set mkonnect_ca_file}:/etc/mkonnect-ca/ca-bundle.pem:ro" \
+  --env-file "$mkonnect_config_dir/mkonnect.env" \
+  "$mkonnect_image"
+```
+
+Then set `--ca-bundle /etc/mkonnect-ca/ca-bundle.pem` on each tool that needs it. Prefer the
+per-tool option to a global `CA_BUNDLE` entry in `mkonnect.env` when other tools already work: an
+unreadable bundle fails every tool that uses it, so a global setting would put working tools at risk
+of a bad mount. The file must stay readable by the container user (uid `65532`), so keep it
+world-readable (`chmod 0644`); a CA certificate is not secret.
 
 ### Mounting the CA bundle (Kubernetes)
 
@@ -489,7 +517,14 @@ the Jenkins API token is the `token` and is sent as the password.
 
 - **Stdin only.** Tokens must be supplied through `--token-stdin`. A `--token <value>` flag is
   rejected with an error, so a secret can't leak into shell history or `ps` output.
-- **Minimum length.** Tokens must be at least 16 characters.
+- **Minimum length.** A bearer token must be at least 16 characters. A basic-auth password must be
+  at least 10 characters, because it is often a directory-service password whose length the
+  directory's policy sets. Shorter values are rejected without being echoed.
+- **Do not downgrade below the release that introduced the 10-character basic-auth minimum** once
+  a basic-auth password of 10 to 15 characters is stored. An older connector rejects the whole
+  credential file when it loads it and does not start, so every tool stops, not only that one. Its
+  CLI cannot read the file either. To downgrade, first remove that tool while the current release
+  is still running (`connector config remove <plugin>`).
 - **Trailing newline is trimmed**, so `printf %s` and `echo` both work; prefer `printf %s` to avoid
   a stray newline in the first place.
 - A username (basic auth) must not contain a `:`.
