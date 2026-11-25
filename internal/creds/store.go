@@ -15,8 +15,44 @@ import (
 )
 
 // MinTokenLength prevents ambiguous, short strings from being used as local
-// credentials or mistaken for ordinary response content.
+// credentials or mistaken for ordinary response content. It applies to bearer
+// tokens, which are machine-generated and have no reason to be short.
 const MinTokenLength = 16
+
+// MinBasicPasswordLength is the minimum for the secret of a basic-auth tool. That
+// secret is often a password for a service account in a directory service, whose
+// length is set by the directory's own password policy rather than chosen freely,
+// so the floor is lower than for bearer tokens. It stays high enough that the
+// secret is not mistaken for ordinary response content (a response that reflects
+// the local credential is refused).
+const MinBasicPasswordLength = 10
+
+// MinSecretLength returns the minimum length, in characters, of the local secret for
+// the given authentication mode.
+func MinSecretLength(auth string) int {
+	if auth == "basic" {
+		return MinBasicPasswordLength
+	}
+	return MinTokenLength
+}
+
+// secretLengthError is the error for a secret shorter than its mode allows. It never
+// includes the secret.
+func secretLengthError(auth string) error {
+	if auth == "basic" {
+		return fmt.Errorf("basic-auth password must be at least %d characters", MinBasicPasswordLength)
+	}
+	return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+}
+
+// ValidateSecretLength checks the local secret against the minimum for its
+// authentication mode without including the secret in the returned error.
+func ValidateSecretLength(auth, secret string) error {
+	if utf8.RuneCountInString(secret) < MinSecretLength(auth) {
+		return secretLengthError(auth)
+	}
+	return nil
+}
 
 // MinUpstreamTimeout and MaxUpstreamTimeout bound a per-plugin upstream timeout
 // (Credential.UpstreamTimeout). The feature exists to RAISE the timeout for
@@ -90,8 +126,8 @@ func (c Credential) Validate() error {
 		if c.Username != "" {
 			return errors.New("bearer authentication must not include a username")
 		}
-		if utf8.RuneCountInString(c.Token) < MinTokenLength {
-			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		if err := ValidateSecretLength(c.Auth, c.Token); err != nil {
+			return err
 		}
 	case "basic":
 		if c.Username == "" {
@@ -100,8 +136,8 @@ func (c Credential) Validate() error {
 		if strings.ContainsRune(c.Username, ':') {
 			return errors.New("basic authentication username must not contain ':'")
 		}
-		if utf8.RuneCountInString(c.Token) < MinTokenLength {
-			return fmt.Errorf("token must be at least %d characters", MinTokenLength)
+		if err := ValidateSecretLength(c.Auth, c.Token); err != nil {
+			return err
 		}
 	default:
 		return errors.New("unsupported authentication mode")

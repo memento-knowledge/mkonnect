@@ -19,11 +19,11 @@ func TestStoreRejectsShortPersistedTokensWithoutLeakingThem(t *testing.T) {
 	}{
 		{
 			name:       "bearer",
-			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "bearer", Token: "short-token"},
+			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "bearer", Token: "fifteen-chars-x"},
 		},
 		{
 			name:       "basic",
-			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "basic", Username: "local-user", Token: "short-token"},
+			credential: creds.Credential{BaseURL: "https://service.internal", Auth: "basic", Username: "local-user", Token: "short-tok"},
 		},
 	}
 
@@ -42,8 +42,41 @@ func TestStoreRejectsShortPersistedTokensWithoutLeakingThem(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected persisted short token to be rejected")
 			}
-			if strings.Contains(err.Error(), "short-token") {
+			if strings.Contains(err.Error(), tt.credential.Token) {
 				t.Fatal("persisted token must not be repeated in an error")
+			}
+		})
+	}
+}
+
+func TestSecretMinimumDependsOnAuthMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		auth    string
+		secret  string
+		wantErr bool
+	}{
+		{name: "bearer at 16", auth: "bearer", secret: strings.Repeat("t", 16)},
+		{name: "bearer at 15", auth: "bearer", secret: strings.Repeat("t", 15), wantErr: true},
+		{name: "basic at 10", auth: "basic", secret: strings.Repeat("p", 10)},
+		{name: "basic at 9", auth: "basic", secret: strings.Repeat("p", 9), wantErr: true},
+		{name: "basic counts characters, not bytes", auth: "basic", secret: strings.Repeat("界", 9), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := creds.Credential{BaseURL: "https://service.internal", Auth: tt.auth, Token: tt.secret}
+			if tt.auth == "basic" {
+				c.Username = "local-user"
+			}
+			err := c.Validate()
+			if tt.wantErr && err == nil {
+				t.Fatal("expected a minimum-length error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err != nil && strings.Contains(err.Error(), tt.secret) {
+				t.Fatal("secret must not be repeated in an error")
 			}
 		})
 	}
